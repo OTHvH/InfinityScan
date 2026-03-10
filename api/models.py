@@ -7,7 +7,6 @@ import uuid
 from datetime import datetime
 
 from sqlalchemy import (
-    BigInteger,
     Boolean,
     DateTime,
     Enum,
@@ -19,8 +18,11 @@ from sqlalchemy import (
     UniqueConstraint,
     func,
 )
-from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
+
+# Use String(36) for UUID storage - works with both SQLite and PostgreSQL
+# This stores UUIDs as strings (e.g., "550e8400-e29b-41d4-a716-446655440000")
+UUID = String(36)
 
 
 # ---------------------------------------------------------------------------
@@ -53,6 +55,11 @@ class SeriesStatus(str, enum.Enum):
     cancelled = "cancelled"
 
 
+class UserRole(str, enum.Enum):
+    admin = "admin"
+    user = "user"
+
+
 # ---------------------------------------------------------------------------
 # Association tables (many-to-many)
 # ---------------------------------------------------------------------------
@@ -62,22 +69,22 @@ from sqlalchemy import Table, Column  # noqa: E402 – kept together for clarity
 series_authors = Table(
     "series_authors",
     Base.metadata,
-    Column("series_id", UUID(as_uuid=True), ForeignKey("series.id", ondelete="CASCADE"), primary_key=True),
-    Column("author_id", UUID(as_uuid=True), ForeignKey("authors.id", ondelete="CASCADE"), primary_key=True),
+    Column("series_id", String(36), ForeignKey("series.id", ondelete="CASCADE"), primary_key=True),
+    Column("author_id", String(36), ForeignKey("authors.id", ondelete="CASCADE"), primary_key=True),
 )
 
 series_artists = Table(
     "series_artists",
     Base.metadata,
-    Column("series_id", UUID(as_uuid=True), ForeignKey("series.id", ondelete="CASCADE"), primary_key=True),
-    Column("artist_id", UUID(as_uuid=True), ForeignKey("artists.id", ondelete="CASCADE"), primary_key=True),
+    Column("series_id", String(36), ForeignKey("series.id", ondelete="CASCADE"), primary_key=True),
+    Column("artist_id", String(36), ForeignKey("artists.id", ondelete="CASCADE"), primary_key=True),
 )
 
 series_tags = Table(
     "series_tags",
     Base.metadata,
-    Column("series_id", UUID(as_uuid=True), ForeignKey("series.id", ondelete="CASCADE"), primary_key=True),
-    Column("tag_id", UUID(as_uuid=True), ForeignKey("tags.id", ondelete="CASCADE"), primary_key=True),
+    Column("series_id", String(36), ForeignKey("series.id", ondelete="CASCADE"), primary_key=True),
+    Column("tag_id", String(36), ForeignKey("tags.id", ondelete="CASCADE"), primary_key=True),
 )
 
 
@@ -88,7 +95,7 @@ series_tags = Table(
 class Author(Base):
     __tablename__ = "authors"
 
-    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    id: Mapped[str] = mapped_column(UUID, primary_key=True, default=lambda: str(uuid.uuid4()))
     name: Mapped[str] = mapped_column(String(255), nullable=False, unique=True)
     bio: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
@@ -99,7 +106,7 @@ class Author(Base):
 class Artist(Base):
     __tablename__ = "artists"
 
-    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    id: Mapped[str] = mapped_column(UUID, primary_key=True, default=lambda: str(uuid.uuid4()))
     name: Mapped[str] = mapped_column(String(255), nullable=False, unique=True)
     bio: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
@@ -110,7 +117,7 @@ class Artist(Base):
 class Tag(Base):
     __tablename__ = "tags"
 
-    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    id: Mapped[str] = mapped_column(UUID, primary_key=True, default=lambda: str(uuid.uuid4()))
     name: Mapped[str] = mapped_column(String(100), nullable=False, unique=True)
     slug: Mapped[str] = mapped_column(String(100), nullable=False, unique=True)
 
@@ -126,7 +133,7 @@ class Series(Base):
 
     __tablename__ = "series"
 
-    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    id: Mapped[str] = mapped_column(UUID, primary_key=True, default=lambda: str(uuid.uuid4()))
     slug: Mapped[str] = mapped_column(String(255), nullable=False, unique=True, index=True)
     title: Mapped[str] = mapped_column(String(512), nullable=False)
     alternative_titles: Mapped[str | None] = mapped_column(Text)  # JSON array stored as text
@@ -169,9 +176,9 @@ class Chapter(Base):
     __tablename__ = "chapters"
     __table_args__ = (UniqueConstraint("series_id", "number", "language", name="uq_chapter_series_number_lang"),)
 
-    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    series_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("series.id", ondelete="CASCADE"), nullable=False, index=True
+    id: Mapped[str] = mapped_column(UUID, primary_key=True, default=lambda: str(uuid.uuid4()))
+    series_id: Mapped[str] = mapped_column(
+        UUID, ForeignKey("series.id", ondelete="CASCADE"), nullable=False, index=True
     )
     number: Mapped[float] = mapped_column(nullable=False)  # e.g. 1.0, 1.5 for half-chapters
     volume: Mapped[int | None] = mapped_column(SmallInteger)
@@ -200,15 +207,15 @@ class Page(Base):
     __tablename__ = "pages"
     __table_args__ = (UniqueConstraint("chapter_id", "page_number", name="uq_page_chapter_number"),)
 
-    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    chapter_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("chapters.id", ondelete="CASCADE"), nullable=False, index=True
+    id: Mapped[str] = mapped_column(UUID, primary_key=True, default=lambda: str(uuid.uuid4()))
+    chapter_id: Mapped[str] = mapped_column(
+        UUID, ForeignKey("chapters.id", ondelete="CASCADE"), nullable=False, index=True
     )
     page_number: Mapped[int] = mapped_column(Integer, nullable=False)  # 1-based
     object_key: Mapped[str] = mapped_column(String(1024), nullable=False)  # S3-compatible object key
     width: Mapped[int | None] = mapped_column(Integer)   # pixels
     height: Mapped[int | None] = mapped_column(Integer)  # pixels
-    file_size: Mapped[int | None] = mapped_column(BigInteger)  # bytes
+    file_size: Mapped[int | None] = mapped_column(Integer)  # bytes
 
     chapter: Mapped[Chapter] = relationship("Chapter", back_populates="pages")
 
@@ -223,14 +230,15 @@ class Bookmark(Base):
     __tablename__ = "bookmarks"
     __table_args__ = (UniqueConstraint("user_id", "series_id", name="uq_bookmark_user_series"),)
 
-    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    user_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False, index=True)
-    series_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("series.id", ondelete="CASCADE"), nullable=False, index=True
+    id: Mapped[str] = mapped_column(UUID, primary_key=True, default=lambda: str(uuid.uuid4()))
+    user_id: Mapped[str] = mapped_column(UUID, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    series_id: Mapped[str] = mapped_column(
+        UUID, ForeignKey("series.id", ondelete="CASCADE"), nullable=False, index=True
     )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
     series: Mapped[Series] = relationship("Series", back_populates="bookmarks")
+    user: Mapped[User] = relationship("User", back_populates="bookmarks")
 
 
 class ReadingProgress(Base):
@@ -245,10 +253,10 @@ class ReadingProgress(Base):
     __tablename__ = "reading_progress"
     __table_args__ = (UniqueConstraint("user_id", "chapter_id", name="uq_progress_user_chapter"),)
 
-    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    user_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False, index=True)
-    chapter_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("chapters.id", ondelete="CASCADE"), nullable=False, index=True
+    id: Mapped[str] = mapped_column(UUID, primary_key=True, default=lambda: str(uuid.uuid4()))
+    user_id: Mapped[str] = mapped_column(UUID, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    chapter_id: Mapped[str] = mapped_column(
+        UUID, ForeignKey("chapters.id", ondelete="CASCADE"), nullable=False, index=True
     )
     last_page: Mapped[int | None] = mapped_column(Integer)          # paged mode
     scroll_position: Mapped[float | None] = mapped_column()         # continuous mode (0.0–1.0)
@@ -258,3 +266,33 @@ class ReadingProgress(Base):
     )
 
     chapter: Mapped[Chapter] = relationship("Chapter", back_populates="reading_progress")
+    user: Mapped[User] = relationship("User", back_populates="reading_progress")
+
+
+# ---------------------------------------------------------------------------
+# User accounts
+# ----------------------------------------------------------------------------
+
+
+class User(Base):
+    """User accounts for authentication."""
+
+    __tablename__ = "users"
+
+    id: Mapped[str] = mapped_column(UUID, primary_key=True, default=lambda: str(uuid.uuid4()))
+    username: Mapped[str] = mapped_column(String(50), nullable=False, unique=True, index=True)
+    email: Mapped[str | None] = mapped_column(String(255), unique=True, index=True)
+    hashed_password: Mapped[str] = mapped_column(String(255), nullable=False)
+    role: Mapped[UserRole] = mapped_column(
+        Enum(UserRole, name="user_role_enum"), nullable=False, default=UserRole.user
+    )
+    is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+    bookmarks: Mapped[list[Bookmark]] = relationship("Bookmark", back_populates="user", cascade="all, delete-orphan")
+    reading_progress: Mapped[list[ReadingProgress]] = relationship(
+        "ReadingProgress", back_populates="user", cascade="all, delete-orphan"
+    )

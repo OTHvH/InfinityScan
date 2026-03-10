@@ -19,9 +19,32 @@ interface Series {
   is_nsfw: boolean;
 }
 
+interface User {
+  id: string;
+  username: string;
+  email: string;
+  role: string;
+  is_active: boolean;
+}
+
+interface Token {
+  access_token: string;
+  token_type: string;
+  user: User;
+}
+
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
 const API = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
+
+function getAuthHeaders(): HeadersInit {
+  const headers: HeadersInit = { "Content-Type": "application/json" };
+  const token = localStorage.getItem("token");
+  if (token) {
+    headers["Authorization"] = `Bearer ${token}`;
+  }
+  return headers;
+}
 
 const STATUS_LABELS: Record<string, string> = {
   ongoing: "Ongoing",
@@ -41,9 +64,15 @@ const CONTENT_EMOJI: Record<string, string> = {
 function Header({
   onSearchToggle,
   searchOpen,
+  user,
+  onLoginClick,
+  onLogout,
 }: {
   onSearchToggle: () => void;
   searchOpen: boolean;
+  user: User | null;
+  onLoginClick: () => void;
+  onLogout: () => void;
 }) {
   return (
     <header className="header">
@@ -60,6 +89,20 @@ function Header({
         >
           🔍 Browse
         </button>
+        {user ? (
+          <div style={{ display: "flex", alignItems: "center", gap: 8, marginLeft: 8 }}>
+            <span style={{ fontSize: "0.875rem", color: "var(--text2)" }}>
+              👤 {user.username}
+            </span>
+            <button className="btn ghost small" onClick={onLogout} aria-label="Logout">
+              Logout
+            </button>
+          </div>
+        ) : (
+          <button className="btn small" onClick={onLoginClick} style={{ marginLeft: 8 }}>
+            Login
+          </button>
+        )}
       </div>
     </header>
   );
@@ -158,6 +201,104 @@ function EmptyState({ searching }: { searching: boolean }) {
   );
 }
 
+function LoginModal({
+  open,
+  onClose,
+  onLogin,
+}: {
+  open: boolean;
+  onClose: () => void;
+  onLogin: (token: Token) => void;
+}) {
+  const [username, setUsername] = useState("");
+  const [password, setPassword] = useState("");
+  const [error, setError] = useState("");
+  const [loading, setLoading] = useState(false);
+
+  if (!open) return null;
+
+  const handleSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setError("");
+    setLoading(true);
+
+    try {
+      const formData = new URLSearchParams();
+      formData.append("username", username);
+      formData.append("password", password);
+
+      const res = await fetch(`${API}/token`, {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body: formData,
+      });
+
+      if (!res.ok) {
+        const err = await res.json();
+        throw new Error(err.detail || "Login failed");
+      }
+
+      const token: Token = await res.json();
+      localStorage.setItem("token", token.access_token);
+      localStorage.setItem("user", JSON.stringify(token.user));
+      onLogin(token);
+      onClose();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Login failed");
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  return (
+    <div className="modal-overlay" onClick={onClose}>
+      <div className="modal" onClick={(e) => e.stopPropagation()}>
+        <h2 style={{ marginBottom: 16 }}>Login</h2>
+        <form onSubmit={handleSubmit}>
+          <div style={{ marginBottom: 12 }}>
+            <label style={{ display: "block", marginBottom: 4, fontSize: "0.875rem" }}>
+              Username
+            </label>
+            <input
+              type="text"
+              value={username}
+              onChange={(e) => setUsername(e.target.value)}
+              className="search-input"
+              required
+              autoFocus
+            />
+          </div>
+          <div style={{ marginBottom: 16 }}>
+            <label style={{ display: "block", marginBottom: 4, fontSize: "0.875rem" }}>
+              Password
+            </label>
+            <input
+              type="password"
+              value={password}
+              onChange={(e) => setPassword(e.target.value)}
+              className="search-input"
+              required
+            />
+          </div>
+          {error && (
+            <p style={{ color: "var(--accent3)", marginBottom: 12, fontSize: "0.875rem" }}>
+              ⚠ {error}
+            </p>
+          )}
+          <div style={{ display: "flex", gap: 8, justifyContent: "flex-end" }}>
+            <button type="button" className="btn ghost" onClick={onClose}>
+              Cancel
+            </button>
+            <button type="submit" className="btn" disabled={loading}>
+              {loading ? "Logging in..." : "Login"}
+            </button>
+          </div>
+        </form>
+      </div>
+    </div>
+  );
+}
+
 // ─── Page ─────────────────────────────────────────────────────────────────────
 
 export default function HomePage() {
@@ -166,6 +307,28 @@ export default function HomePage() {
   const [error, setError] = useState<string | null>(null);
   const [query, setQuery] = useState("");
   const [searchOpen, setSearchOpen] = useState(false);
+  const [user, setUser] = useState<User | null>(null);
+  const [loginOpen, setLoginOpen] = useState(false);
+
+  // Load user from localStorage on mount
+  useEffect(() => {
+    const storedUser = localStorage.getItem("user");
+    if (storedUser) {
+      try {
+        setUser(JSON.parse(storedUser));
+      } catch {}
+    }
+  }, []);
+
+  const handleLogin = (token: Token) => {
+    setUser(token.user);
+  };
+
+  const handleLogout = () => {
+    localStorage.removeItem("token");
+    localStorage.removeItem("user");
+    setUser(null);
+  };
 
   // Fetch series list from the API
   useEffect(() => {
@@ -199,8 +362,16 @@ export default function HomePage() {
       <Header
         searchOpen={searchOpen}
         onSearchToggle={() => setSearchOpen((v) => !v)}
+        user={user}
+        onLoginClick={() => setLoginOpen(true)}
+        onLogout={handleLogout}
       />
       <SearchBar open={searchOpen} query={query} onQuery={setQuery} />
+      <LoginModal
+        open={loginOpen}
+        onClose={() => setLoginOpen(false)}
+        onLogin={handleLogin}
+      />
 
       <main className="wrap">
         {/* Status summary */}
@@ -262,12 +433,49 @@ export default function HomePage() {
         {!loading && filtered.length === 0 && (
           <EmptyState searching={!!query} />
         )}
+        
+        {/* Most Popular Section */}
+        {!loading && filtered.length > 0 && !query && (
+          <section style={{ marginBottom: 32 }}>
+            <h2 style={{ 
+              fontSize: "1.5rem", 
+              fontWeight: 700, 
+              marginBottom: 16,
+              display: "flex",
+              alignItems: "center",
+              gap: 8 
+            }}>
+              <span style={{ fontSize: "1.25rem" }}>🔥</span> Most Popular
+            </h2>
+            <div className="grid-cards" style={{ gridTemplateColumns: "repeat(auto-fill, minmax(180px, 1fr))" }}>
+              {filtered.slice(0, 4).map((s) => (
+                <SeriesCard key={s.id} series={s} />
+              ))}
+            </div>
+          </section>
+        )}
+
+        {/* All Series Section */}
         {!loading && filtered.length > 0 && (
-          <div className="grid-cards">
-            {filtered.map((s) => (
-              <SeriesCard key={s.id} series={s} />
-            ))}
-          </div>
+          <section>
+            <h2 style={{ 
+              fontSize: "1.25rem", 
+              fontWeight: 600, 
+              marginBottom: 16,
+              marginTop: query ? 0 : 16,
+              display: "flex",
+              alignItems: "center",
+              gap: 8 
+            }}>
+              <span style={{ fontSize: "1rem" }}>📚</span> 
+              {query ? `Search Results (${filtered.length})` : "All Series"}
+            </h2>
+            <div className="grid-cards">
+              {(query ? filtered : filtered.slice(4)).map((s) => (
+                <SeriesCard key={s.id} series={s} />
+              ))}
+            </div>
+          </section>
         )}
       </main>
 

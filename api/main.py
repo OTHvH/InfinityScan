@@ -41,7 +41,50 @@ from models import (
     ReadingProgress,
     Series,
     SeriesStatus,
+    User,
+    UserRole,
 )
+
+# Auth imports
+from datetime import datetime, timedelta
+import jwt
+from passlib.context import CryptContext
+from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
+from slowapi import Limiter
+from slowapi.util import get_remote_address
+
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="api/token")
+
+# JWT configuration
+SECRET_KEY = os.environ.get("SECRET_KEY")
+if not SECRET_KEY:
+    raise ValueError("SECRET_KEY environment variable must be set in production")
+ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_HOURS = 24
+
+# Rate limiter for auth endpoints
+limiter = Limiter(key_func=get_remote_address)
+app.state.limiter = limiter
+
+
+def create_access_token(user_id: uuid.UUID) -> str:
+    """Create a JWT access token with expiration."""
+    expire = datetime.utcnow() + timedelta(hours=ACCESS_TOKEN_EXPIRE_HOURS)
+    to_encode = {"sub": str(user_id), "exp": expire}
+    return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+
+
+def verify_token(token: str) -> uuid.UUID | None:
+    """Verify a JWT token and return the user ID if valid."""
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        user_id = payload.get("sub")
+        if user_id is None:
+            return None
+        return uuid.UUID(user_id)
+    except (jwt.PyJWTError, ValueError, AttributeError):
+        return None
 
 # ---------------------------------------------------------------------------
 # Config
@@ -171,6 +214,22 @@ class LocalSeriesOut(BaseModel):
     is_nsfw: bool
 
 
+class LocalChapterOut(BaseModel):
+    """Local-library chapter row."""
+
+    id: str
+    number: float
+    title: str | None
+    page_count: int
+    published_at: str | None
+
+
+class LocalSeriesDetailOut(LocalSeriesOut):
+    """Local-library series with chapters."""
+
+    chapters: list[LocalChapterOut] = []
+
+
 class ChapterItem(BaseModel):
     uuid: str
     name: str
@@ -229,6 +288,28 @@ class ProgressOut(BaseModel):
     last_page: Optional[int]
     scroll_position: Optional[float]
     completed: bool
+
+
+# ---------------------------------------------------------------------------# Auth schemas# ---------------------------------------------------------------------------
+
+class UserCreate(BaseModel):
+    username: str
+    email: Optional[str] = None
+    password: str
+
+
+class UserOut(BaseModel):
+    id: str
+    username: str
+    email: Optional[str]
+    role: str
+    is_active: bool
+
+
+class Token(BaseModel):
+    access_token: str
+    token_type: str
+    user: UserOut
 
 
 # ---------------------------------------------------------------------------
@@ -292,6 +373,109 @@ async def _fetch_chapter_pages(path_word: str, chapter_uuid: str) -> ChapterPage
 @app.get("/health")
 def health() -> dict:
     return {"status": "ok"}
+
+
+# ---------------------------------------------------------------------------# Routes — authentication# ---------------------------------------------------------------------------
+
+
+@app.post("/register", response_model=UserOut, summary="Register new user")
+@limiter.limit("5/minute")
+def register(
+    user_data: UserCreate,
+    db: Session = Depends(get_db),
+) -> UserOut:
+    # Validate password
+    if len(user_data.password) < 6:
+        raise HTTPException(status_code=400, detail="Password must be at least 6 characters")
+    
+    # Check if username exists
+    existing = db.scalar(select(User).where(User.username == user_data.username))
+    if existing:
+        raise HTTPException(status_code=400, detail="Username already registered")
+    
+    # Check if email exists
+    if user_data.email:
+        existing_email = db.scalar(select(User).where(User.email == user_data.email))
+        if existing_email:
+            raise HTTPException(status_code=400, detail="Email already registered")
+    
+    # Create user
+    hashed_password = pwd_context.hash(user_data.password)
+    user = User(
+        username=user_data.username,
+        email=user_data.email,
+        hashed_password=hashed_password,
+        role=UserRole.user,
+    )
+    db.add(user)
+    db.commit()
+    db.refresh(user)
+    
+    return UserOut(
+        id=str(user.id),
+        username=user.username,
+        email=user.email,
+        role=user.role.value,
+        is_active=user.is_active,
+    )
+
+
+@app.post("/token", response_model=Token, summary="Login and get token")
+@limiter.limit("10/minute")
+def login(
+    form_data: OAuth2PasswordRequestForm = Depends(),
+    db: Session = Depends(get_db),
+) -> Token:
+    user = db.scalar(select(User).where(User.username == form_data.username))
+    if not user or not pwd_context.verify(form_data.password, user.hashed_password):
+        raise HTTPException(status_code=401, detail="Incorrect username or password")
+    
+    if not user.is_active:
+        raise HTTPException(status_code=403, detail="User account is disabled")
+    
+    # Generate JWT token with expiration
+    access_token = create_access_token(user.id)
+    
+    return Token(
+        access_token=access_token,
+        token_type="bearer",
+        user=UserOut(
+            id=str(user.id),
+            username=user.username,
+            email=user.email,
+            role=user.role.value,
+            is_active=user.is_active,
+        ),
+    )
+
+
+@app.get("/me", response_model=UserOut, summary="Get current user")
+def get_current_user(
+    authorization: Optional[str] = Header(None),
+    db: Session = Depends(get_db),
+) -> UserOut:
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    
+    token = authorization.replace("Bearer ", "")
+    
+    # Verify JWT token
+    user_id = verify_token(token)
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Invalid or expired token")
+    
+    # Query using string representation (UUIDs are stored as strings in SQLite)
+    user = db.scalar(select(User).where(User.id == str(user_id)))
+    if not user:
+        raise HTTPException(status_code=401, detail="User not found")
+    
+    return UserOut(
+        id=str(user.id),
+        username=user.username,
+        email=user.email,
+        role=user.role.value,
+        is_active=user.is_active,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -359,6 +543,159 @@ async def search_series(
             for s in rows
         ],
     }
+
+
+@app.get("/library/{slug}", response_model=LocalSeriesDetailOut, summary="Get local series by slug")
+def get_local_series(
+    slug: str,
+    db: Session = Depends(get_db),
+) -> LocalSeriesDetailOut:
+    """Get a local series by slug with its chapters."""
+    series = db.scalar(select(Series).where(Series.slug == slug))
+    if not series:
+        raise HTTPException(status_code=404, detail="Series not found")
+    
+    chapters = list(db.scalars(
+        select(Chapter).where(Chapter.series_id == series.id).order_by(Chapter.number)
+    ).all())
+    
+    return LocalSeriesDetailOut(
+        id=str(series.id),
+        slug=series.slug,
+        title=series.title,
+        synopsis=series.synopsis,
+        cover_url=_ensure_absolute_cover(series.cover_object_key),
+        content_type=series.content_type.value if hasattr(series.content_type, "value") else series.content_type,
+        status=series.status.value if hasattr(series.status, "value") else series.status,
+        year=series.year,
+        is_nsfw=series.is_nsfw,
+        chapters=[
+            LocalChapterOut(
+                id=str(c.id),
+                number=c.number,
+                title=c.title,
+                page_count=c.page_count,
+                published_at=c.published_at.isoformat() if c.published_at else None,
+            )
+            for c in chapters
+        ],
+    )
+
+
+@app.get(
+    "/library/{slug}/chapter/{number}",
+    response_model=ChapterPagesOut,
+    summary="Get local chapter pages",
+)
+def get_local_chapter_pages(
+    slug: str,
+    number: float,
+    db: Session = Depends(get_db),
+) -> ChapterPagesOut:
+    """Get pages for a local chapter by series slug and chapter number."""
+    from pathlib import Path
+    from fastapi.responses import FileResponse
+    
+    API_BASE = os.environ.get("NEXT_PUBLIC_API_URL", "http://localhost:8000")
+    
+    series = db.scalar(select(Series).where(Series.slug == slug))
+    if not series:
+        raise HTTPException(status_code=404, detail="Series not found")
+    
+    chapter = db.scalar(
+        select(Chapter).where(
+            Chapter.series_id == series.id,
+            Chapter.number == number
+        )
+    )
+    if not chapter:
+        raise HTTPException(status_code=404, detail="Chapter not found")
+    
+    pages = list(db.scalars(
+        select(Page).where(Page.chapter_id == chapter.id).order_by(Page.page_number)
+    ).all())
+    
+    # Get prev/next chapters
+    prev_chapter = db.scalar(
+        select(Chapter).where(
+            Chapter.series_id == series.id,
+            Chapter.number < number
+        ).order_by(Chapter.number.desc()).limit(1)
+    )
+    next_chapter = db.scalar(
+        select(Chapter).where(
+            Chapter.series_id == series.id,
+            Chapter.number > number
+        ).order_by(Chapter.number).limit(1)
+    )
+    
+    return ChapterPagesOut(
+        chapter_uuid=str(chapter.id),
+        chapter_name=chapter.title or f"Chapter {chapter.number}",
+        comic_path_word=slug,
+        pages=[
+            PageMeta(
+                page_number=p.page_number,
+                url=f"{API_BASE}/library/{slug}/page/{p.id}",
+            )
+            for p in pages
+        ],
+        prev_chapter_uuid=str(prev_chapter.id) if prev_chapter else None,
+        next_chapter_uuid=str(next_chapter.id) if next_chapter else None,
+    )
+
+
+@app.get(
+    "/library/{slug}/page/{page_id}",
+    summary="Get local page image",
+)
+def get_local_page(
+    slug: str,
+    page_id: str,
+    db: Session = Depends(get_db),
+):
+    """Redirect to local page image."""
+    from pathlib import Path
+    from fastapi.responses import FileResponse
+    
+    try:
+        page_uuid = uuid.UUID(page_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid page ID")
+    
+    page = db.scalar(select(Page).where(Page.id == page_uuid))
+    if not page:
+        raise HTTPException(status_code=404, detail="Page not found")
+    
+    # For local files, we serve from the filesystem
+    # The object_key contains the path relative to the manga folder
+    # Configure via MANGA_LOCAL_PATH environment variable
+    manga_base = Path(os.environ.get("MANGA_LOCAL_PATH", ""))
+    if not manga_base:
+        raise HTTPException(status_code=500, detail="MANGA_LOCAL_PATH not configured")
+    object_key = page.object_key
+    
+    # Parse the object key to get the actual file path
+    # Format: "the-regressor-can-make-them-all/{chapter_num}/{filename}"
+    parts = object_key.split("/")
+    if len(parts) >= 3:
+        # The filename contains the full path structure
+        file_path = manga_base / parts[0] / parts[1] / parts[2]
+    else:
+        # Try to find the file directly
+        file_path = manga_base / object_key
+    
+    if not file_path.exists():
+        raise HTTPException(status_code=404, detail="Image file not found")
+    
+    # Determine content type
+    content_type = "image/jpeg"
+    if file_path.suffix.lower() == ".png":
+        content_type = "image/png"
+    elif file_path.suffix.lower() == ".webp":
+        content_type = "image/webp"
+    
+    return FileResponse(file_path, media_type=content_type)
 
 
 @app.get("/series/{path_word}", response_model=ComicOut, summary="Series detail")
