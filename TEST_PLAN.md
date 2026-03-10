@@ -1,0 +1,230 @@
+# InfinityScan Test Plan
+
+## Overview
+This test plan covers functional testing for the InfinityScan manga reader application, including import pipeline, reader functionality, user state, and deployment verification.
+
+---
+
+## 1. Import Correctness
+
+### Test Cases
+
+| ID | Description | Steps | Expected Result |
+|----|------------|-------|-----------------|
+| IMP-01 | Import single series with chapters | 1. Create folder structure: `Series/Chapter 1/001.jpg`<br>2. Run `python importer.py /path/to/root`<br>3. Query API `/series` | Series appears in API with correct chapter count |
+| IMP-02 | Import flat series (no chapter folders) | 1. Create: `Manga/001.jpg`, `002.jpg`<br>2. Run importer | Auto-created as Chapter 1 |
+| IMP-03 | Import series with half-chapters | 1. Create: `Manga/ch1/`, `Manga/ch1.5/`<br>2. Run importer | Chapters sorted as 1.0, 1.5 |
+| IMP-04 | Skip empty chapter folders | 1. Create: `Manga/ch1/001.jpg`, `Manga/ch2/` (empty)<br>2. Run importer | Empty folder skipped |
+| IMP-05 | Idempotent import (re-run) | 1. Import series<br>2. Re-run importer with same data | No duplicate chapters created |
+| IMP-06 | Cover image detection | 1. Create series with cover in root<br>2. Run importer | Cover object key populated |
+| IMP-07 | Dry-run mode | 1. Run with `--dry-run`<br>2. Check database | No records inserted |
+
+### Test Data Structure
+```
+/tmp/test_library/
+├── One Piece/
+│   ├── cover.jpg
+│   ├── Chapter 1/
+│   │   ├── 001.jpg
+│   │   └── 002.jpg
+│   ├── Chapter 1.5/
+│   │   └── 001.jpg
+│   └── Chapter 2/
+│       └── 001.jpg
+├── Attack on Titan (flat)/
+│   ├── 001.jpg
+│   └── 002.jpg
+└── Empty Folder/
+```
+
+---
+
+## 2. Chapter Ordering
+
+### Test Cases
+
+| ID | Description | Steps | Expected Result |
+|----|------------|-------|-----------------|
+| CH-01 | Natural sort ordering | Import chapters: ch1, ch2, ch10, ch11, ch2.5 | Order: 1, 2, 2.5, 10, 11 |
+| CH-02 | Mixed naming conventions | Import: ch1, Chapter_02, chap-3, vol4 | All detected and sorted |
+| CH-03 | Chapter title extraction | Chapter folder named "Chapter 5: The Battle" | Title extracted as "The Battle" |
+| CH-04 | Reverse chapter order | Import chapters in descending order | Ascending order in API |
+| CH-05 | Volume and chapter | Import with volumes: vol1/ch1, vol1/ch2, vol2/ch1 | Sorted by chapter number |
+
+### Verification Query
+```bash
+curl http://localhost:8000/series/{slug}/chapters | jq '.list[].name, .number'
+```
+
+---
+
+## 3. Continuous Scroll Stability
+
+### Test Cases
+
+| ID | Description | Steps | Expected Result |
+|----|------------|-------|-----------------|
+| SCR-01 | Vertical scroll rendering | 1. Open chapter in vertical mode<br>2. Scroll rapidly | Pages render without layout shift |
+| SCR-02 | Horizontal scroll rendering | 1. Open chapter in horizontal mode<br>2. Scroll horizontally | Smooth horizontal navigation |
+| SCR-03 | Large chapter (100+ pages) | 1. Load chapter with 150 pages<br>2. Scroll through all | No memory leaks, consistent FPS |
+| SCR-04 | Scroll position restoration | 1. Scroll to middle of chapter<br>2. Navigate away<br>3. Return to chapter | Position restored |
+| SCR-05 | Image preloading | 1. Set preload threshold to 3<br>2. Reach page 47 of 50 | Next chapter preloads |
+
+### Performance Metrics
+- Initial render: < 500ms for 20 pages
+- Scroll FPS: > 30fps
+- Memory: < 200MB for 100-page chapter
+
+---
+
+## 4. Resume Progress
+
+### Test Cases
+
+| ID | Description | Steps | Expected Result |
+|----|------------|-------|-----------------|
+| RES-01 | Save progress locally | 1. Read to page 15<br>2. Wait 3 seconds<br>3. Check localStorage | Progress saved with timestamp |
+| RES-02 | Resume from localStorage | 1. Close browser at page 10<br>2. Reopen chapter | Jump to page 10 |
+| RES-03 | Progress persists across refresh | 1. Read to page 5<br>2. Refresh page | Still at page 5 |
+| RES-04 | Save on chapter change | 1. Read to page 10/20<br>2. Navigate to next chapter | Page 10 saved before navigation |
+| RES-05 | API progress sync (if implemented) | 1. Set X-User-ID header<br>2. Read chapter<br>3. Check /progress endpoint | Progress saved to database |
+
+### Verification
+```javascript
+// Check localStorage
+localStorage.getItem('infinityscan_progress_{slug}_{chapter}')
+// Returns: {"page": 15, "updatedAt": 1234567890}
+```
+
+---
+
+## 5. Broken Image Handling
+
+### Test Cases
+
+| ID | Description | Steps | Expected Result |
+|----|------------|-------|-----------------|
+| IMG-01 | 404 image URL | 1. Mock API to return invalid page URL<br>2. Load chapter | Placeholder shown, no crash |
+| IMG-02 | Timeout on image load | 1. Slow network simulation<br>2. Load pages | Loading spinner, then error placeholder |
+| IMG-03 | Corrupt image file | 1. Return invalid JPEG data<br>2. Load page | Broken image icon displayed |
+| IMG-04 | Empty page URL | 1. API returns page with empty url<br>2. Load chapter | Page skipped or placeholder |
+| IMG-05 | Redirect URL handling | 1. Image URL redirects (302)<br>2. Load page | Follows redirect successfully |
+
+### Expected UI Behavior
+- Loading: Spinner overlay on image
+- Error: Gray placeholder with reload icon
+- Empty: Skip rendering or show placeholder
+
+---
+
+## 6. Auth-Protected Routes
+
+### Test Cases
+
+| ID | Description | Steps | Expected Result |
+|----|------------|-------|-----------------|
+| AUTH-01 | Access bookmarks without header | 1. GET /bookmarks (no X-User-ID)<br>2. Check response | 200 OK with anonymous UUID created |
+| AUTH-02 | Consistent user identity | 1. POST bookmark with X-User-ID<br>2. GET bookmarks with same header | Same bookmarks returned |
+| AUTH-03 | Different users isolated | 1. User A adds bookmark<br>2. User B queries bookmarks | User B sees only their bookmarks |
+| AUTH-04 | Invalid UUID format | 1. GET /bookmarks with X-User-ID: invalid | 400 Bad Request |
+| AUTH-05 | Progress user isolation | 1. User A reads to page 5<br>2. User B reads same chapter | Each has independent progress |
+
+### Test Commands
+```bash
+# With user ID
+curl -H "X-User-ID: 550e8400-e29b-41d4-a716-446655440000" http://localhost:8000/bookmarks
+
+# Without user ID (anonymous)
+curl http://localhost:8000/bookmarks
+```
+
+---
+
+## 7. Staging to Production Checklist
+
+### Pre-Deployment
+
+- [ ] All tests passing in CI
+- [ ] Database migrations tested on staging DB
+- [ ] No hardcoded localhost URLs in production
+- [ ] Environment variables documented
+- [ ] SSL/TLS certificate configured
+
+### Infrastructure
+
+| Check | Command |
+|-------|---------|
+| PostgreSQL connection | `docker compose exec db pg_isready` |
+| API health | `curl http://localhost:8000/health` |
+| Web builds | `cd web && npm run build` |
+| No build warnings | `npm run lint` passes |
+
+### Security
+
+| Check | Verification |
+|-------|--------------|
+| CORS origins set | Check `CORS_ORIGINS` env var |
+| Database credentials | Not committed to git |
+| API rate limiting | Enabled in production |
+| Image URL validation | SSRF protection in place |
+
+### Smoke Tests (Post-Deploy)
+
+```bash
+# 1. API health
+curl https://api.example.com/health
+# Expected: {"status": "ok"}
+
+# 2. Web loads
+curl -I https://example.com
+# Expected: 200 OK
+
+# 3. Series list
+curl https://api.example.com/series
+# Expected: JSON array (may be empty)
+
+# 4. Search (if using CopyManga)
+curl "https://api.example.com/series?q=onepiece"
+# Expected: Search results
+
+# 5. Chapter pages
+curl "https://api.example.com/series/onepiece/chapter/uuid"
+# Expected: Page URLs returned
+```
+
+### Rollback Plan
+
+1. Check Docker Compose logs: `docker compose -f infra/docker-compose.yml logs`
+2. Revert to previous image tag
+3. Restore database from backup if needed
+4. Verify with smoke tests
+
+---
+
+## Running Tests
+
+### Unit Tests
+```bash
+# API tests
+cd api && python -m pytest tests/ -v
+
+# Web tests
+cd web && npm test
+```
+
+### Integration Tests
+```bash
+# Start services
+docker compose -f infra/docker-compose.yml up -d
+
+# Run import test
+python api/importer.py /tmp/test_library --dry-run
+
+# Verify import
+curl http://localhost:8000/series | jq
+```
+
+### E2E Tests (Playwright)
+```bash
+cd web && npx playwright test
+```
