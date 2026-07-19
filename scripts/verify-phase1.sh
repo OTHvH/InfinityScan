@@ -162,11 +162,11 @@ fi
 # ===========================================================================
 echo "--- Requirement 1: API import test ---"
 if [ -n "$API_PYTHON" ]; then
-  IMPORT_OUT=$(cd api && "$API_PYTHON" -c "from main import app; print(app.title)" 2>&1) || true
-  if echo "$IMPORT_OUT" | grep -q "InfinityScan API"; then
+  if IMPORT_OUT=$(cd api && "$API_PYTHON" -c "from main import app; print(app.title)" 2>&1); then
     pass "REQ-01: api/main.py imports successfully (app.title = InfinityScan API)"
   else
-    fail "REQ-01: api/main.py import failed: $(echo "$IMPORT_OUT" | tail -5)"
+    STATUS=$?
+    fail "REQ-01: api/main.py import failed — exit code $STATUS: $(printf '%s\n' "$IMPORT_OUT" | tail -5)"
   fi
 else
   skip "REQ-01: No Python venv available"
@@ -177,7 +177,7 @@ fi
 # ===========================================================================
 echo "--- Requirement 2: SlowAPI + rate limiting ---"
 if [ -n "$API_PYTHON" ]; then
-  SLOW_OUT=$(cd api && "$API_PYTHON" -c "
+  if SLOW_OUT=$(cd api && "$API_PYTHON" -c "
 from main import limiter, register, login
 from slowapi import Limiter
 import inspect
@@ -187,11 +187,11 @@ sig_login = inspect.signature(login)
 assert list(sig_reg.parameters.keys())[0] == 'request'
 assert list(sig_login.parameters.keys())[0] == 'request'
 print('OK')
-" 2>&1) || true
-  if echo "$SLOW_OUT" | grep -q "OK"; then
+" 2>&1); then
     pass "REQ-02: SlowAPI limiter installed; register/login accept Request"
   else
-    fail "REQ-02: SlowAPI check failed: $(echo "$SLOW_OUT" | tail -3)"
+    STATUS=$?
+    fail "REQ-02: SlowAPI check failed — exit code $STATUS: $(printf '%s\n' "$SLOW_OUT" | tail -5)"
   fi
 else
   skip "REQ-02: No Python venv available"
@@ -203,24 +203,87 @@ fi
 echo "--- Requirement 3: Alembic migration on empty DB ---"
 if [ "$SKIP_DOCKER" = true ]; then
   skip "REQ-03: Requires Docker (skipped)"
-elif docker info &>/dev/null 2>&1; then
+elif ! docker info &>/dev/null 2>&1; then
+  fail "REQ-03: Docker daemon not accessible"
+else
   docker compose -f infra/docker-compose.yml down -v --remove-orphans 2>/dev/null || true
+
   docker compose -f infra/docker-compose.yml up -d db
   echo "  Waiting for PostgreSQL to be healthy..."
+  DB_HEALTHY=false
   for i in $(seq 1 30); do
     if docker compose -f infra/docker-compose.yml exec -T db pg_isready -U infinityscan -d infinityscan &>/dev/null 2>&1; then
+      DB_HEALTHY=true
       break
     fi
     sleep 1
   done
-  MIGRATE_OUT=$(docker compose -f infra/docker-compose.yml run --rm migrate 2>&1) || true
-  if echo "$MIGRATE_OUT" | grep -qiE "running|upgrade|head|success|no change"; then
-    pass "REQ-03: alembic upgrade head ran successfully on empty DB"
+
+  if [ "$DB_HEALTHY" != true ]; then
+    fail "REQ-03: PostgreSQL did not become healthy within 30 s"
   else
-    fail "REQ-03: Migration failed: $MIGRATE_OUT"
+    if MIGRATE_OUT=$(docker compose -f infra/docker-compose.yml run --rm migrate 2>&1); then
+      echo "  Migration succeeded — verifying schema..."
+      DB_CONTAINER=$(docker compose -f infra/docker-compose.yml ps -q db)
+      DB_NAME=$(grep -E '^POSTGRES_DB=' infra/.env | head -1 | cut -d= -f2)
+      DB_USER=$(grep -E '^POSTGRES_USER=' infra/.env | head -1 | cut -d= -f2)
+      DB_PASS=$(grep -E '^POSTGRES_PASSWORD=' infra/.env | head -1 | cut -d= -f2)
+      DB_NAME="${DB_NAME:-infinityscan}"
+      DB_USER="${DB_USER:-infinityscan}"
+      DB_PASS="${DB_PASS:-}"
+
+      VERIFY_OUT=$(docker exec -e "PGPASSWORD=${DB_PASS}" "$DB_CONTAINER" psql -h localhost -U "$DB_USER" -d "$DB_NAME" -t -A -c "
+        SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'alembic_version');
+      " 2>&1) || true
+      ALEMBIC_EXISTS=$(printf '%s\n' "$VERIFY_OUT" | tr -d '[:space:]')
+
+      REVISION_OUT=$(docker exec -e "PGPASSWORD=${DB_PASS}" "$DB_CONTAINER" psql -h localhost -U "$DB_USER" -d "$DB_NAME" -t -A -c "
+        SELECT version_num FROM alembic_version;
+      " 2>&1) || true
+      REVISION=$(printf '%s\n' "$REVISION_OUT" | tr -d '[:space:]')
+
+      USERS_OUT=$(docker exec -e "PGPASSWORD=${DB_PASS}" "$DB_CONTAINER" psql -h localhost -U "$DB_USER" -d "$DB_NAME" -t -A -c "
+        SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'users');
+      " 2>&1) || true
+      USERS_EXISTS=$(printf '%s\n' "$USERS_OUT" | tr -d '[:space:]')
+
+      BOOKMARKS_OUT=$(docker exec -e "PGPASSWORD=${DB_PASS}" "$DB_CONTAINER" psql -h localhost -U "$DB_USER" -d "$DB_NAME" -t -A -c "
+        SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'bookmarks');
+      " 2>&1) || true
+      BOOKMARKS_EXISTS=$(printf '%s\n' "$BOOKMARKS_OUT" | tr -d '[:space:]')
+
+      READING_OUT=$(docker exec -e "PGPASSWORD=${DB_PASS}" "$DB_CONTAINER" psql -h localhost -U "$DB_USER" -d "$DB_NAME" -t -A -c "
+        SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'reading_progress');
+      " 2>&1) || true
+      READING_EXISTS=$(printf '%s\n' "$READING_OUT" | tr -d '[:space:]')
+
+      ERRORS=""
+      if [ "$ALEMBIC_EXISTS" != "t" ]; then
+        ERRORS="${ERRORS} alembic_version table missing;"
+      fi
+      if [ "$REVISION" != "0001" ]; then
+        ERRORS="${ERRORS} expected revision 0001, got '${REVISION}';"
+      fi
+      if [ "$USERS_EXISTS" != "t" ]; then
+        ERRORS="${ERRORS} users table missing;"
+      fi
+      if [ "$BOOKMARKS_EXISTS" != "t" ]; then
+        ERRORS="${ERRORS} bookmarks table missing;"
+      fi
+      if [ "$READING_EXISTS" != "t" ]; then
+        ERRORS="${ERRORS} reading_progress table missing;"
+      fi
+
+      if [ -z "$ERRORS" ]; then
+        pass "REQ-03: Alembic upgrade head succeeded; alembic_version=0001; users, bookmarks, reading_progress present"
+      else
+        fail "REQ-03: Migration ran but schema verification failed:${ERRORS}"
+      fi
+    else
+      STATUS=$?
+      fail "REQ-03: Migration failed — exit code $STATUS: $(printf '%s\n' "$MIGRATE_OUT" | tail -30)"
+    fi
   fi
-else
-  fail "REQ-03: Docker daemon not accessible"
 fi
 
 # ===========================================================================
@@ -228,7 +291,7 @@ fi
 # ===========================================================================
 echo "--- Requirement 4: Users table + FKs ---"
 if [ -n "$API_PYTHON" ]; then
-  FK_OUT=$("$API_PYTHON" -c "
+  if FK_OUT=$("$API_PYTHON" -c "
 from api.models import Base, User, Bookmark, ReadingProgress
 
 assert 'users' in Base.metadata.tables, 'users table missing'
@@ -246,11 +309,11 @@ rp_fks = [str(fk) for fk in ReadingProgress.__table__.foreign_keys]
 assert any('users.id' in fk for fk in rp_fks), f'ReadingProgress missing FK to users: {rp_fks}'
 
 print('OK')
-" 2>&1) || true
-  if echo "$FK_OUT" | grep -q "OK"; then
+" 2>&1); then
     pass "REQ-04: Users table exists; bookmark/progress FKs to users.id valid"
   else
-    fail "REQ-04: $(echo "$FK_OUT" | tail -3)"
+    STATUS=$?
+    fail "REQ-04: Exit code $STATUS: $(printf '%s\n' "$FK_OUT" | tail -5)"
   fi
 else
   skip "REQ-04: No Python venv available"
@@ -261,7 +324,7 @@ fi
 # ===========================================================================
 echo "--- Requirement 5: ORM/migration UUID agreement ---"
 if [ -n "$API_PYTHON" ]; then
-  UUID_OUT=$("$API_PYTHON" -c "
+  if UUID_OUT=$("$API_PYTHON" -c "
 from api.models import User, Bookmark, ReadingProgress, Chapter, Series, Page
 
 for model in [User, Bookmark, ReadingProgress, Chapter, Series, Page]:
@@ -277,11 +340,11 @@ for model, fk_name in [(Bookmark, 'user_id'), (Bookmark, 'series_id'),
     assert getattr(col.type, 'as_uuid', None) is True
 
 print('OK')
-" 2>&1) || true
-  if echo "$UUID_OUT" | grep -q "OK"; then
+" 2>&1); then
     pass "REQ-05: ORM and migration both use UUID(as_uuid=True) for all IDs and FKs"
   else
-    fail "REQ-05: $(echo "$UUID_OUT" | tail -3)"
+    STATUS=$?
+    fail "REQ-05: Exit code $STATUS: $(printf '%s\n' "$UUID_OUT" | tail -5)"
   fi
 else
   skip "REQ-05: No Python venv available"
@@ -292,19 +355,24 @@ fi
 # ===========================================================================
 echo "--- Requirement 10: Dependency audit ---"
 if [ -n "$API_PYTHON" ]; then
-  # Ensure pip-audit is installed in the venv
   "$API_PYTHON" -m pip install -q pip-audit 2>/dev/null || true
-  AUDIT_OUT=$("$API_PYTHON" -m pip_audit -r api/requirements.txt 2>&1) || true
-  if echo "$AUDIT_OUT" | grep -q "No known vulnerabilities"; then
-    pass "REQ-10a: pip-audit — zero Python vulnerabilities"
-  elif echo "$AUDIT_OUT" | grep -qi "high\|critical"; then
-    fail "REQ-10a: pip-audit found HIGH/CRITICAL"
-  else
-    MODERATE=$(echo "$AUDIT_OUT" | grep -c "moderate" || true)
-    if [ "$MODERATE" -gt 0 ]; then
-      pass "REQ-10a: pip-audit — zero high/critical (moderate build-only: documented)"
+  if AUDIT_OUT=$("$API_PYTHON" -m pip_audit -r api/requirements.txt 2>&1); then
+    if echo "$AUDIT_OUT" | grep -q "No known vulnerabilities"; then
+      pass "REQ-10a: pip-audit — zero Python vulnerabilities"
     else
-      fail "REQ-10a: pip-audit unclear: $(echo "$AUDIT_OUT" | tail -5)"
+      MODERATE=$(echo "$AUDIT_OUT" | grep -ci "moderate" || true)
+      if [ "$MODERATE" -gt 0 ]; then
+        pass "REQ-10a: pip-audit — zero high/critical (moderate build-only: documented)"
+      else
+        fail "REQ-10a: pip-audit unclear: $(printf '%s\n' "$AUDIT_OUT" | tail -5)"
+      fi
+    fi
+  else
+    STATUS=$?
+    if echo "$AUDIT_OUT" | grep -qiE "high|critical"; then
+      fail "REQ-10a: pip-audit found HIGH/CRITICAL — exit code $STATUS"
+    else
+      fail "REQ-10a: pip-audit failed — exit code $STATUS: $(printf '%s\n' "$AUDIT_OUT" | tail -5)"
     fi
   fi
 else
@@ -312,12 +380,16 @@ else
 fi
 
 if command -v npm &>/dev/null; then
-  NPM_OUT=$(cd web && npm audit 2>&1) || true
-  HIGH_CRIT=$(echo "$NPM_OUT" | grep -ciE "high|critical" || true)
-  if [ "$HIGH_CRIT" -eq 0 ]; then
+  if NPM_OUT=$(cd web && npm audit 2>&1); then
     pass "REQ-10b: npm audit — zero high/critical (moderate postcss: documented, build-time only)"
   else
-    fail "REQ-10b: npm audit found HIGH/CRITICAL"
+    STATUS=$?
+    HIGH_CRIT=$(echo "$NPM_OUT" | grep -ciE "high|critical" || true)
+    if [ "$HIGH_CRIT" -gt 0 ]; then
+      fail "REQ-10b: npm audit found HIGH/CRITICAL — exit code $STATUS"
+    else
+      pass "REQ-10b: npm audit — zero high/critical (moderate postcss: documented, build-time only)"
+    fi
   fi
 else
   skip "REQ-10b: npm not available"
@@ -368,34 +440,52 @@ if [ "$SKIP_DOCKER" = false ] && docker info &>/dev/null 2>&1; then
   # Requirement 11: Native Docker build
   echo ""
   echo "--- Requirement 11: Native Docker build ---"
-  BUILD_OUT=$(docker compose -f infra/docker-compose.yml build 2>&1) || true
-  if echo "$BUILD_OUT" | grep -qi "error\|failed" && ! echo "$BUILD_OUT" | grep -qi "warning"; then
-    fail "REQ-11: Native docker compose build failed"
-  else
+  if BUILD_OUT=$(docker compose -f infra/docker-compose.yml build 2>&1); then
     pass "REQ-11: Native docker compose build succeeded"
+  else
+    STATUS=$?
+    fail "REQ-11: Native docker compose build failed — exit code $STATUS: $(printf '%s\n' "$BUILD_OUT" | tail -30)"
   fi
 
   # Requirement 12: ARM64 buildx
   echo ""
   echo "--- Requirement 12: ARM64 buildx build ---"
-  docker buildx create --use --name multiarch --driver docker-container 2>/dev/null || true
-  if docker buildx inspect --bootstrap &>/dev/null 2>&1; then
-    ARM64_API=$(docker buildx build --platform linux/arm64 -f api/Dockerfile -t infinityscan-api:arm64 api 2>&1) || true
-    if echo "$ARM64_API" | grep -qi "error\|failed"; then
-      fail "REQ-12a: ARM64 API buildx failed"
-    else
-      pass "REQ-12a: ARM64 API buildx completed"
-    fi
-    ARM64_WEB=$(docker buildx build --platform linux/arm64 \
-      --build-arg NEXT_PUBLIC_API_URL=http://localhost:8000 \
-      -f web/Dockerfile -t infinityscan-web:arm64 web 2>&1) || true
-    if echo "$ARM64_WEB" | grep -qi "error\|failed"; then
-      fail "REQ-12b: ARM64 Web buildx failed"
-    else
-      pass "REQ-12b: ARM64 Web buildx completed"
-    fi
-  else
+
+  if ! docker buildx version &>/dev/null 2>&1; then
     skip "REQ-12: docker buildx not available"
+  else
+    echo "  Registering QEMU for cross-platform builds..."
+    docker run --rm --privileged multiarch/qemu-user-static --reset -p yes 2>/dev/null || true
+
+    docker buildx create --use --name multiarch --driver docker-container 2>/dev/null || true
+
+    if ! docker buildx inspect --bootstrap &>/dev/null 2>&1; then
+      fail "REQ-12: docker buildx inspect --bootstrap failed"
+    else
+      PLATFORMS_OUT=$(docker buildx inspect 2>&1 || true)
+      if ! echo "$PLATFORMS_OUT" | grep -q "linux/arm64"; then
+        fail "REQ-12: buildx builder does not support linux/arm64"
+      else
+        echo "  Building API for linux/arm64..."
+        if ARM64_API=$(docker buildx build --progress=plain --platform linux/arm64 \
+            -f api/Dockerfile -t infinityscan-api:arm64 api 2>&1); then
+          pass "REQ-12a: ARM64 API buildx completed"
+        else
+          STATUS=$?
+          fail "REQ-12a: ARM64 API buildx failed — exit code $STATUS: $(printf '%s\n' "$ARM64_API" | tail -30)"
+        fi
+
+        echo "  Building Web for linux/arm64..."
+        if ARM64_WEB=$(docker buildx build --progress=plain --platform linux/arm64 \
+            --build-arg NEXT_PUBLIC_API_URL=http://localhost:8000 \
+            -f web/Dockerfile -t infinityscan-web:arm64 web 2>&1); then
+          pass "REQ-12b: ARM64 Web buildx completed"
+        else
+          STATUS=$?
+          fail "REQ-12b: ARM64 Web buildx failed — exit code $STATUS: $(printf '%s\n' "$ARM64_WEB" | tail -30)"
+        fi
+      fi
+    fi
   fi
 
   # Full stack
@@ -425,11 +515,11 @@ if [ "$SKIP_DOCKER" = false ] && docker info &>/dev/null 2>&1; then
   fi
 
   echo "  Running migrations..."
-  MIGRATE_OUT=$(docker compose -f infra/docker-compose.yml run --rm migrate 2>&1) || true
-  if echo "$MIGRATE_OUT" | grep -qiE "running|upgrade|head|success|no change"; then
+  if MIGRATE_OUT=$(docker compose -f infra/docker-compose.yml run --rm migrate 2>&1); then
     pass "REQ-14b: Migrations ran successfully"
   else
-    fail "REQ-14b: Migration failed: $MIGRATE_OUT"
+    STATUS=$?
+    fail "REQ-14b: Migration failed — exit code $STATUS: $(printf '%s\n' "$MIGRATE_OUT" | tail -30)"
   fi
 
   docker compose -f infra/docker-compose.yml up -d api web
