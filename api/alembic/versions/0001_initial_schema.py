@@ -33,10 +33,14 @@ def upgrade() -> None:
     series_status_enum = postgresql.ENUM(
         "ongoing", "completed", "hiatus", "cancelled", name="series_status_enum", create_type=False
     )
+    user_role_enum = postgresql.ENUM(
+        "admin", "user", name="user_role_enum", create_type=False
+    )
 
     op.execute("CREATE TYPE content_type_enum AS ENUM ('manga', 'manhua', 'manhwa')")
     op.execute("CREATE TYPE reading_mode_enum AS ENUM ('paged', 'continuous')")
     op.execute("CREATE TYPE series_status_enum AS ENUM ('ongoing', 'completed', 'hiatus', 'cancelled')")
+    op.execute("CREATE TYPE user_role_enum AS ENUM ('admin', 'user')")
 
     # ------------------------------------------------------------------
     # authors
@@ -160,12 +164,31 @@ def upgrade() -> None:
     op.create_index("ix_pages_chapter_id", "pages", ["chapter_id"])
 
     # ------------------------------------------------------------------
+    # users (must exist before bookmarks / reading_progress)
+    # ------------------------------------------------------------------
+    op.create_table(
+        "users",
+        sa.Column("id", postgresql.UUID(as_uuid=True), primary_key=True),
+        sa.Column("username", sa.String(50), nullable=False),
+        sa.Column("email", sa.String(255), nullable=True),
+        sa.Column("hashed_password", sa.String(255), nullable=False),
+        sa.Column("role", user_role_enum, nullable=False, server_default="user"),
+        sa.Column("is_active", sa.Boolean(), nullable=False, server_default="true"),
+        sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.func.now(), nullable=False),
+        sa.Column("updated_at", sa.DateTime(timezone=True), server_default=sa.func.now(), nullable=False),
+        sa.UniqueConstraint("username", name="uq_users_username"),
+        sa.UniqueConstraint("email", name="uq_users_email"),
+    )
+    op.create_index("ix_users_username", "users", ["username"], unique=True)
+    op.create_index("ix_users_email", "users", ["email"], unique=True)
+
+    # ------------------------------------------------------------------
     # bookmarks
     # ------------------------------------------------------------------
     op.create_table(
         "bookmarks",
         sa.Column("id", postgresql.UUID(as_uuid=True), primary_key=True),
-        sa.Column("user_id", postgresql.UUID(as_uuid=True), nullable=False),
+        sa.Column("user_id", postgresql.UUID(as_uuid=True), sa.ForeignKey("users.id", ondelete="CASCADE"), nullable=False),
         sa.Column("series_id", postgresql.UUID(as_uuid=True), sa.ForeignKey("series.id", ondelete="CASCADE"), nullable=False),
         sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.func.now(), nullable=False),
         sa.UniqueConstraint("user_id", "series_id", name="uq_bookmark_user_series"),
@@ -179,7 +202,7 @@ def upgrade() -> None:
     op.create_table(
         "reading_progress",
         sa.Column("id", postgresql.UUID(as_uuid=True), primary_key=True),
-        sa.Column("user_id", postgresql.UUID(as_uuid=True), nullable=False),
+        sa.Column("user_id", postgresql.UUID(as_uuid=True), sa.ForeignKey("users.id", ondelete="CASCADE"), nullable=False),
         sa.Column("chapter_id", postgresql.UUID(as_uuid=True), sa.ForeignKey("chapters.id", ondelete="CASCADE"), nullable=False),
         sa.Column("last_page", sa.Integer(), nullable=True),
         sa.Column("scroll_position", sa.Float(), nullable=True),
@@ -194,6 +217,7 @@ def upgrade() -> None:
 def downgrade() -> None:
     op.drop_table("reading_progress")
     op.drop_table("bookmarks")
+    op.drop_table("users")
     op.drop_table("pages")
     op.drop_table("chapters")
     op.drop_table("series_tags")
@@ -204,6 +228,7 @@ def downgrade() -> None:
     op.drop_table("artists")
     op.drop_table("authors")
 
+    op.execute("DROP TYPE user_role_enum")
     op.execute("DROP TYPE series_status_enum")
     op.execute("DROP TYPE reading_mode_enum")
     op.execute("DROP TYPE content_type_enum")

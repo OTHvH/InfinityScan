@@ -487,8 +487,7 @@ def get_current_user(
     if not user_id:
         raise HTTPException(status_code=401, detail="Invalid or expired token")
     
-    # Query using string representation (UUIDs are stored as strings in SQLite)
-    user = db.scalar(select(User).where(User.id == str(user_id)))
+    user = db.scalar(select(User).where(User.id == user_id))
     if not user:
         raise HTTPException(status_code=401, detail="User not found")
     
