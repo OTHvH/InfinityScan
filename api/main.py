@@ -18,16 +18,17 @@ S3_PUBLIC_URL      https://cdn.example.com  (prefix used when building cover URL
 CORS_ORIGINS       comma-separated list of allowed origins (default: http://localhost:3000)
 """
 
-from __future__ import annotations
-
 import os
+import secrets
+import sys
 import uuid
 from contextlib import asynccontextmanager
 from typing import Any, Optional
 
 import httpx
-from fastapi import Depends, FastAPI, Header, HTTPException, Path, Query
+from fastapi import Depends, FastAPI, Header, HTTPException, Path, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from sqlalchemy import create_engine, func, select
 from sqlalchemy.orm import Session, joinedload, sessionmaker
@@ -51,6 +52,8 @@ import jwt
 from passlib.context import CryptContext
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from slowapi import Limiter
+from slowapi.errors import RateLimitExceeded
+from slowapi.middleware import SlowAPIMiddleware
 from slowapi.util import get_remote_address
 
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
@@ -59,13 +62,14 @@ oauth2_scheme = OAuth2PasswordBearer(tokenUrl="api/token")
 # JWT configuration
 SECRET_KEY = os.environ.get("SECRET_KEY")
 if not SECRET_KEY:
-    raise ValueError("SECRET_KEY environment variable must be set in production")
+    SECRET_KEY = secrets.token_hex(32)
+    print(
+        "WARNING: SECRET_KEY not set — generated ephemeral key for local dev. "
+        "Tokens will not survive restarts.",
+        file=sys.stderr,
+    )
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_HOURS = 24
-
-# Rate limiter for auth endpoints
-limiter = Limiter(key_func=get_remote_address)
-app.state.limiter = limiter
 
 
 def create_access_token(user_id: uuid.UUID) -> str:
@@ -175,6 +179,21 @@ async def copymanga(path: str, **params: Any) -> Any:
 # ---------------------------------------------------------------------------
 
 app = FastAPI(title="InfinityScan API", version="0.2.0", lifespan=lifespan)
+
+# Rate limiter
+limiter = Limiter(key_func=get_remote_address)
+app.state.limiter = limiter
+
+
+@app.exception_handler(RateLimitExceeded)
+async def _rate_limit_handler(request: Request, exc: RateLimitExceeded) -> JSONResponse:
+    return JSONResponse(
+        status_code=429,
+        content={"detail": f"Rate limit exceeded: {exc.detail}"},
+    )
+
+
+app.add_middleware(SlowAPIMiddleware)
 
 app.add_middleware(
     CORSMiddleware,
@@ -375,12 +394,15 @@ def health() -> dict:
     return {"status": "ok"}
 
 
-# ---------------------------------------------------------------------------# Routes — authentication# ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Routes — authentication
+# ---------------------------------------------------------------------------
 
 
 @app.post("/register", response_model=UserOut, summary="Register new user")
 @limiter.limit("5/minute")
 def register(
+    request: Request,
     user_data: UserCreate,
     db: Session = Depends(get_db),
 ) -> UserOut:
@@ -423,6 +445,7 @@ def register(
 @app.post("/token", response_model=Token, summary="Login and get token")
 @limiter.limit("10/minute")
 def login(
+    request: Request,
     form_data: OAuth2PasswordRequestForm = Depends(),
     db: Session = Depends(get_db),
 ) -> Token:
