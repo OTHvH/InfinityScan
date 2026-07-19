@@ -9,7 +9,7 @@ MANGA_PATH="${1:-}"
 if [ -z "$MANGA_PATH" ]; then
     echo "Usage: $0 /path/to/manga/folder"
     echo ""
-    echo "Example: $0 /home/OTH/Documents/Mangus"
+    echo "Example: $0 /path/to/your/manga/library"
     exit 1
 fi
 

@@ -93,8 +93,11 @@ comics/
 content/
 local_imports/
 
-# The-regressor sample data (local content, not source code)
-the-regressor-can-make-them-all-9e76b95d/
+# Numbered chapter directories (manga page images imported locally)
+[0-9]*/
+
+# Standalone legacy viewer state file
+.mangus_viewer_state.json
 
 # ---------------------------------------------------------------------------
 # Logs

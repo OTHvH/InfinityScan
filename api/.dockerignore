@@ -50,6 +50,7 @@ manga/
 comics/
 content/
 local_imports/
+[0-9]*/
 
 # Logs
 *.log

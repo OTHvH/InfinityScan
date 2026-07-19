@@ -698,7 +698,7 @@ def get_local_page(
     object_key = page.object_key
     
     # Parse the object key to get the actual file path
-    # Format: "the-regressor-can-make-them-all/{chapter_num}/{filename}"
+    # Format: "{series_slug}/{chapter_num}/{filename}"
     parts = object_key.split("/")
     if len(parts) >= 3:
         # The filename contains the full path structure
