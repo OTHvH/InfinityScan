@@ -34,7 +34,9 @@ from typing import Annotated, Any
 import httpx
 from fastapi import Body, Depends, FastAPI, HTTPException, Path, Query, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.responses import JSONResponse
+from starlette.middleware.base import BaseHTTPMiddleware
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session, joinedload
 from slowapi import Limiter
@@ -171,13 +173,24 @@ async def _rate_limit_handler(request: Request, exc: RateLimitExceeded) -> JSONR
 
 app.add_middleware(SlowAPIMiddleware)
 
+# Explicit CORS — no wildcard methods/headers, credentials allowed
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_cfg.cors_origins,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=_cfg.cors_allow_methods,
+    allow_headers=_cfg.cors_allow_headers,
     allow_credentials=True,
 )
+
+# Trusted hosts
+app.add_middleware(TrustedHostMiddleware, allowed_hosts=_cfg.trusted_hosts)
+
+# Custom security middleware
+from middleware import OriginValidationMiddleware, RequestBodyLimitMiddleware, NoCacheAuthMiddleware
+
+app.add_middleware(NoCacheAuthMiddleware)
+app.add_middleware(RequestBodyLimitMiddleware)
+app.add_middleware(OriginValidationMiddleware)
 
 
 # ---------------------------------------------------------------------------
@@ -386,6 +399,7 @@ def login(
     summary="[DEPRECATED] Use POST /auth/logout instead",
     include_in_schema=True,
 )
+@limiter.limit(_cfg.logout_rate_limit)
 def logout(
     request: Request,
     response: Response,
@@ -412,6 +426,7 @@ def logout(
     summary="[DEPRECATED] Use POST /auth/refresh instead",
     include_in_schema=True,
 )
+@limiter.limit(_cfg.refresh_rate_limit)
 def refresh_token(
     request: Request,
     response: Response,
@@ -765,7 +780,9 @@ def list_bookmarks(
 
 
 @app.post("/bookmarks", response_model=BookmarkOut, status_code=201, summary="Add bookmark")
+@limiter.limit(_cfg.bookmark_write_rate_limit)
 def add_bookmark(
+    request: Request,
     body: BookmarkIn = Body(...),
     user: User = Depends(get_current_user),
     _csrf: None = Depends(require_csrf),
@@ -808,7 +825,9 @@ def add_bookmark(
 
 
 @app.delete("/bookmarks/{path_word}", status_code=204, summary="Remove bookmark")
+@limiter.limit(_cfg.bookmark_write_rate_limit)
 def remove_bookmark(
+    request: Request,
     path_word: str = Path(...),
     user: User = Depends(get_current_user),
     _csrf: None = Depends(require_csrf),
@@ -904,7 +923,9 @@ def get_progress(
     response_model=ProgressOut,
     summary="Upsert reading progress for a chapter",
 )
+@limiter.limit(_cfg.progress_write_rate_limit)
 def upsert_progress(
+    request: Request,
     body: ProgressIn = Body(...),
     path_word: str = Path(...),
     chapter_uuid: str = Path(...),

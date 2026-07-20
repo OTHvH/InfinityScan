@@ -16,6 +16,7 @@ import logging
 import uuid
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Request, Response
+from slowapi import Limiter
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -44,6 +45,11 @@ from settings import get_settings
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/auth", tags=["auth"])
+
+
+# ── Rate limiter (shared with main.py) ──────────────────────────────────────
+# Import the limiter from main to avoid duplication
+from main import limiter  # noqa: E402
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
@@ -106,6 +112,7 @@ def _clear_auth_cookies(response: Response) -> None:
     status_code=201,
     summary="Register a new user account",
 )
+@limiter.limit("5/minute")
 def register(
     request: Request,
     body: RegisterIn = Body(...),
@@ -144,6 +151,7 @@ def register(
     response_model=LoginOut,
     summary="Authenticate and set session cookies",
 )
+@limiter.limit("10/minute")
 def login(
     request: Request,
     response: Response,
@@ -183,6 +191,7 @@ def login(
     "/refresh",
     summary="Rotate refresh token and issue new access token",
 )
+@limiter.limit("20/minute")
 def refresh(
     request: Request,
     response: Response,
@@ -226,6 +235,7 @@ def refresh(
     "/logout",
     summary="Revoke current session and clear cookies",
 )
+@limiter.limit("20/minute")
 def logout(
     request: Request,
     response: Response,
@@ -261,6 +271,7 @@ def logout(
     "/logout-all",
     summary="Revoke all sessions for the current user",
 )
+@limiter.limit("20/minute")
 def logout_all(
     request: Request,
     response: Response,
@@ -292,6 +303,7 @@ def me(user: User = Depends(get_current_user)) -> UserOut:
     "/csrf",
     summary="Issue a new CSRF token",
 )
+@limiter.limit("30/minute")
 def csrf(
     request: Request,
     response: Response,

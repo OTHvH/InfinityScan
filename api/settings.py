@@ -86,6 +86,21 @@ class Settings:
     login_rate_limit: str = field(
         default_factory=lambda: os.environ.get("LOGIN_RATE_LIMIT", "10/minute")
     )
+    csrf_rate_limit: str = field(
+        default_factory=lambda: os.environ.get("CSRF_RATE_LIMIT", "30/minute")
+    )
+    refresh_rate_limit: str = field(
+        default_factory=lambda: os.environ.get("REFRESH_RATE_LIMIT", "20/minute")
+    )
+    logout_rate_limit: str = field(
+        default_factory=lambda: os.environ.get("LOGOUT_RATE_LIMIT", "20/minute")
+    )
+    bookmark_write_rate_limit: str = field(
+        default_factory=lambda: os.environ.get("BOOKMARK_WRITE_RATE_LIMIT", "30/minute")
+    )
+    progress_write_rate_limit: str = field(
+        default_factory=lambda: os.environ.get("PROGRESS_WRITE_RATE_LIMIT", "60/minute")
+    )
 
     # ── Password policy ─────────────────────────────────────────────────
     min_password_length: int = int(os.environ.get("MIN_PASSWORD_LENGTH", "8"))
@@ -95,10 +110,27 @@ class Settings:
     cors_origins: list[str] = field(
         default_factory=lambda: _csv("CORS_ORIGINS", "http://localhost:3000")
     )
+    cors_allow_methods: list[str] = field(
+        default_factory=lambda: _csv("CORS_ALLOW_METHODS", "GET,POST,PUT,PATCH,DELETE,OPTIONS")
+    )
+    cors_allow_headers: list[str] = field(
+        default_factory=lambda: _csv(
+            "CORS_ALLOW_HEADERS",
+            "accept,accept-language,content-type,content-length,authorization,x-csrf-token",
+        )
+    )
 
     # ── Trusted hosts ───────────────────────────────────────────────────
     trusted_hosts: list[str] = field(
         default_factory=lambda: _csv("TRUSTED_HOSTS", "localhost,127.0.0.1")
+    )
+
+    # ── Request body limit ──────────────────────────────────────────────
+    max_body_bytes: int = int(os.environ.get("MAX_BODY_BYTES", str(1024 * 1024)))  # 1 MB default
+
+    # ── Origin validation ───────────────────────────────────────────────
+    allowed_origins: list[str] = field(
+        default_factory=lambda: _csv("ALLOWED_ORIGINS", "http://localhost:3000")
     )
 
     # ── CopyManga upstream ──────────────────────────────────────────────
@@ -145,6 +177,33 @@ def _validate_settings(s: Settings) -> None:
             raise ValueError(
                 "CSRF_SECRET_KEY must be explicitly set in production. "
                 "Auto-generated keys are not allowed in production."
+            )
+
+        # Production: reject weak JWT secret (< 32 bytes hex = 64 chars)
+        if len(s.secret_key) < 32:
+            raise ValueError(
+                "JWT secret key is too weak for production. "
+                "Use at least 32 bytes (64 hex characters)."
+            )
+
+        # Production: cookies MUST be Secure
+        if not s.cookie_secure:
+            raise ValueError(
+                "COOKIE_SECURE must be 'true' in production. "
+                "Browsers reject non-secure cookies in HTTPS contexts."
+            )
+
+        # Production: reject wildcard CORS origins with credentials
+        if "*" in s.cors_origins:
+            raise ValueError(
+                "Wildcard '*' CORS origins are not allowed in production with credentials. "
+                "Use explicit origin domains."
+            )
+
+        # Production: reject wildcard in allowed_origins
+        if "*" in s.allowed_origins:
+            raise ValueError(
+                "Wildcard '*' is not allowed in ALLOWED_ORIGINS in production."
             )
 
     if s.cookie_same_site not in ("lax", "strict", "none"):

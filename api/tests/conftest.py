@@ -18,6 +18,11 @@ os.environ["DATABASE_URL"] = "sqlite://"
 os.environ["COOKIE_SECURE"] = "false"
 os.environ["REGISTER_RATE_LIMIT"] = "999999/second"
 os.environ["LOGIN_RATE_LIMIT"] = "999999/second"
+os.environ["CSRF_RATE_LIMIT"] = "999999/second"
+os.environ["REFRESH_RATE_LIMIT"] = "999999/second"
+os.environ["LOGOUT_RATE_LIMIT"] = "999999/second"
+os.environ["BOOKMARK_WRITE_RATE_LIMIT"] = "999999/second"
+os.environ["PROGRESS_WRITE_RATE_LIMIT"] = "999999/second"
 
 import uuid
 from datetime import datetime, timezone
