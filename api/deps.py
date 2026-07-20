@@ -1,9 +1,10 @@
 """Reusable FastAPI dependencies for authentication and authorization.
 
 • ``get_db``         — yields a SQLAlchemy session
-• ``get_current_user`` — reads the access-token cookie, decodes JWT, returns User
+• ``get_current_user`` — reads the access-token cookie, decodes JWT, validates
+                         session hasn't been revoked, returns User
 • ``require_role``   — factory that returns a dependency enforcing a specific role
-• ``get_csrf_header`` — reads and validates the CSRF double-submit cookie
+• ``require_csrf``   — validates the CSRF double-submit cookie pattern
 """
 
 from __future__ import annotations
@@ -17,8 +18,8 @@ from sqlalchemy.orm import Session
 
 from auth import decode_access_token, validate_csrf
 from database import get_db
+from models import User, RefreshSession
 from settings import get_settings
-from models import User
 
 
 # ── Current user from cookie ────────────────────────────────────────────────
@@ -29,6 +30,12 @@ def get_current_user(
     db: Session = Depends(get_db),
 ) -> User:
     """Extract and validate the access token from the httpOnly cookie.
+
+    Validates:
+    1. Cookie exists
+    2. JWT signature, issuer, audience, expiration
+    3. ``sid`` claim references an active (non-revoked, non-expired) session
+    4. User exists and is active
 
     Raises 401 on any failure.  Never logs the token value.
     """
@@ -42,6 +49,7 @@ def get_current_user(
         raise HTTPException(status_code=401, detail="Invalid or expired token")
 
     user_id_str: str | None = payload.get("sub")
+    session_id_str: str | None = payload.get("sid")
     if not user_id_str:
         raise HTTPException(status_code=401, detail="Invalid token payload")
 
@@ -49,6 +57,18 @@ def get_current_user(
         user_id = uuid.UUID(user_id_str)
     except ValueError:
         raise HTTPException(status_code=401, detail="Invalid token subject")
+
+    # Validate session exists and is active (not revoked, not expired)
+    if session_id_str:
+        try:
+            session_id = uuid.UUID(session_id_str)
+        except ValueError:
+            raise HTTPException(status_code=401, detail="Invalid session ID in token")
+
+        from session import is_session_active
+
+        if not is_session_active(db, session_id):
+            raise HTTPException(status_code=401, detail="Session revoked or expired")
 
     user = db.scalar(select(User).where(User.id == user_id))
     if not user:
@@ -86,7 +106,6 @@ def require_csrf(
     """
     cfg = get_settings()
     csrf_cookie: str | None = request.cookies.get(cfg.csrf_cookie_name)
-    # FastAPI lowercases header names, so we read it dynamically
     header_val = x_csrf_token or request.headers.get(cfg.csrf_header_name)
     if not validate_csrf(csrf_cookie, header_val):
         raise HTTPException(status_code=403, detail="CSRF validation failed")

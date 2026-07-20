@@ -179,6 +179,15 @@ app.add_middleware(
 
 
 # ---------------------------------------------------------------------------
+# Mount canonical /auth/* router
+# ---------------------------------------------------------------------------
+
+from routes.auth import router as auth_router
+
+app.include_router(auth_router)
+
+
+# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
@@ -294,11 +303,16 @@ def health() -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Routes — authentication
+# Routes — deprecated legacy authentication (use /auth/* instead)
 # ---------------------------------------------------------------------------
 
 
-@app.post("/register", response_model=RegisterOut, summary="Register new user")
+@app.post(
+    "/register",
+    response_model=RegisterOut,
+    summary="[DEPRECATED] Use POST /auth/register instead",
+    include_in_schema=True,
+)
 @limiter.limit(_cfg.register_rate_limit)
 def register(
     request: Request,
@@ -329,7 +343,12 @@ def register(
     return RegisterOut(user=_user_to_out(user))
 
 
-@app.post("/token", response_model=LoginOut, summary="Login and set session cookies")
+@app.post(
+    "/token",
+    response_model=LoginOut,
+    summary="[DEPRECATED] Use POST /auth/login instead",
+    include_in_schema=True,
+)
 @limiter.limit(_cfg.login_rate_limit)
 def login(
     request: Request,
@@ -359,7 +378,11 @@ def login(
     return LoginOut(user=_user_to_out(user))
 
 
-@app.post("/logout", summary="Clear session cookies and revoke refresh token")
+@app.post(
+    "/logout",
+    summary="[DEPRECATED] Use POST /auth/logout instead",
+    include_in_schema=True,
+)
 def logout(
     request: Request,
     response: Response,
@@ -380,7 +403,11 @@ def logout(
     return {"detail": "Logged out"}
 
 
-@app.post("/refresh", summary="Rotate refresh token and issue new access token")
+@app.post(
+    "/refresh",
+    summary="[DEPRECATED] Use POST /auth/refresh instead",
+    include_in_schema=True,
+)
 def refresh_token(
     request: Request,
     response: Response,
@@ -395,7 +422,6 @@ def refresh_token(
     rt = db.scalar(select(RefreshToken).where(RefreshToken.token_hash == token_hash))
 
     if not rt or rt.revoked:
-        # Possible token reuse — revoke all tokens for this user
         if rt:
             _revoke_all_refresh_tokens(db, rt.user)
         raise HTTPException(status_code=401, detail="Invalid refresh token")
@@ -409,7 +435,6 @@ def refresh_token(
         db.commit()
         raise HTTPException(status_code=401, detail="Refresh token expired")
 
-    # Revoke the old token (rotation)
     rt.revoked = True
     db.commit()
 
@@ -425,7 +450,12 @@ def refresh_token(
     return {"detail": "Token refreshed"}
 
 
-@app.get("/me", response_model=UserOut, summary="Get current user from session cookie")
+@app.get(
+    "/me",
+    response_model=UserOut,
+    summary="[DEPRECATED] Use GET /auth/me instead",
+    include_in_schema=True,
+)
 def get_me(user: User = Depends(get_current_user)) -> UserOut:
     return _user_to_out(user)
 
