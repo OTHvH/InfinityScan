@@ -39,7 +39,7 @@ HTTP behaviour:
 
 Design rules:
   - Identity comes **only** from the access-cookie JWT.
-  - No Authorization header, no X-User-ID, no query params, no request body.
+  - No Authorization header, no query params, no request body.
   - The same user is never queried twice within one request.
 """
 

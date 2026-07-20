@@ -109,8 +109,8 @@ class BookmarkOut(_Strict):
 
 class ProgressIn(_Strict):
     chapter_uuid: str
-    last_page: Optional[int] = None
-    scroll_position: Optional[float] = None
+    last_page: Optional[int] = Field(default=None, ge=0)
+    scroll_position: Optional[float] = Field(default=None, ge=0.0, le=1.0)
     completed: bool = False
 
 

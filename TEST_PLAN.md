@@ -87,7 +87,7 @@ curl http://localhost:8000/series/{slug}/chapters | jq '.list[].name, .number'
 | RES-02 | Resume from localStorage | 1. Close browser at page 10<br>2. Reopen chapter | Jump to page 10 |
 | RES-03 | Progress persists across refresh | 1. Read to page 5<br>2. Refresh page | Still at page 5 |
 | RES-04 | Save on chapter change | 1. Read to page 10/20<br>2. Navigate to next chapter | Page 10 saved before navigation |
-| RES-05 | API progress sync (if implemented) | 1. Set X-User-ID header<br>2. Read chapter<br>3. Check /progress endpoint | Progress saved to database |
+| RES-05 | API progress sync (if implemented) | 1. Login as user<br>2. Read chapter<br>3. Check /progress endpoint | Progress saved to database |
 
 ### Verification
 ```javascript
@@ -123,18 +123,18 @@ localStorage.getItem('infinityscan_progress_{slug}_{chapter}')
 
 | ID | Description | Steps | Expected Result |
 |----|------------|-------|-----------------|
-| AUTH-01 | Access bookmarks without header | 1. GET /bookmarks (no X-User-ID)<br>2. Check response | 200 OK with anonymous UUID created |
-| AUTH-02 | Consistent user identity | 1. POST bookmark with X-User-ID<br>2. GET bookmarks with same header | Same bookmarks returned |
+| AUTH-01 | Access bookmarks without auth | 1. GET /bookmarks (no cookie) | 401 Unauthorized |
+| AUTH-02 | Consistent user identity | 1. Login as user A<br>2. GET bookmarks | Bookmarks for user A returned |
 | AUTH-03 | Different users isolated | 1. User A adds bookmark<br>2. User B queries bookmarks | User B sees only their bookmarks |
-| AUTH-04 | Invalid UUID format | 1. GET /bookmarks with X-User-ID: invalid | 400 Bad Request |
+| AUTH-04 | Identity header ignored | 1. Login as user A<br>2. GET /me with X-User-ID header | User A's identity returned (header ignored) |
 | AUTH-05 | Progress user isolation | 1. User A reads to page 5<br>2. User B reads same chapter | Each has independent progress |
 
 ### Test Commands
 ```bash
-# With user ID
-curl -H "X-User-ID: 550e8400-e29b-41d4-a716-446655440000" http://localhost:8000/bookmarks
+# Authenticated (cookie-based)
+curl -b "is_access=<token>" http://localhost:8000/bookmarks
 
-# Without user ID (anonymous)
+# Unauthenticated (should return 401)
 curl http://localhost:8000/bookmarks
 ```
 

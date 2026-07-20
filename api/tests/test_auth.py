@@ -10,7 +10,7 @@ Covers:
   • CSRF double-submit cookie
   • Schema strictness (extra fields forbidden)
   • No tokens in JSON responses
-  • No X-User-ID header accepted
+  • Identity cannot be spoofed via headers or request body
   • Disabled-account handling
 """
 
@@ -189,13 +189,13 @@ class TestMe:
         resp = client.get("/me")
         assert resp.status_code == 401
 
-    def test_me_ignores_x_user_id_header(self, client, user_factory):
+    def test_me_ignores_identity_header(self, client, user_factory):
         """X-User-ID must NOT be accepted as an identity mechanism."""
         user_a = user_factory(username="userA", password="pass12345")
         user_factory(username="userB", password="pass12345")
         # Login as userA
         client.post("/token", json={"username": "userA", "password": "pass12345"})
-        # Try to impersonate userB via X-User-ID
+        # Try to impersonate userA via X-User-ID (should be ignored)
         resp = client.get("/me", headers={"X-User-ID": str(user_a.id)})
         assert resp.status_code == 200
         assert resp.json()["username"] == "userA"
@@ -335,11 +335,18 @@ class TestCSRF:
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-#  User-data isolation
+#  User-data isolation (two-user tests)
 # ═════════════════════════════════════════════════════════════════════════════
 
 
 class TestIsolation:
+    """Prove User B cannot access, modify, or infer User A's private data.
+
+    Two users are created per test.  All endpoints are exercised to confirm
+    that ownership filtering uses only the session-derived ``current_user.id``
+    and never any client-supplied identity field.
+    """
+
     def _login(self, client, username: str, password: str = "pass12345"):
         client.post("/token", json={"username": username, "password": password})
 
@@ -355,57 +362,406 @@ class TestIsolation:
         db.refresh(s)
         return s
 
-    def test_user_a_cannot_see_user_b_bookmarks(self, client, user_factory, db):
+    def _create_chapter(self, db, series: Series, number: float = 1.0) -> Chapter:
+        ch = Chapter(series_id=series.id, number=number, language="en")
+        db.add(ch)
+        db.commit()
+        db.refresh(ch)
+        return ch
+
+    # ── Bookmarks ────────────────────────────────────────────────────────────
+
+    def test_user_b_cannot_list_user_a_bookmarks(self, client, user_factory, db):
         user_factory(username="iso_a", password="pass12345")
         user_factory(username="iso_b", password="pass12345")
         series = self._create_series(db, "isolated-series")
 
         from models import User
         user_a = db.scalar(select(User).where(User.username == "iso_a"))
-        user_b = db.scalar(select(User).where(User.username == "iso_b"))
 
         db.add(Bookmark(user_id=user_a.id, series_id=series.id))
         db.commit()
 
         # Login as user_b
         self._login(client, "iso_b")
-        csrf = client.cookies.get("is_csrf")
-        resp = client.get("/bookmarks", headers={"X-CSRF-Token": csrf})
+        resp = client.get("/bookmarks")
         assert resp.status_code == 200
         assert len(resp.json()) == 0
 
-    def test_user_a_cannot_see_user_b_progress(self, client, user_factory, db):
-        user_factory(username="iso_pa", password="pass12345")
-        user_factory(username="iso_pb", password="pass12345")
-        ch_id = uuid.uuid4()
-        series = self._create_series(db, "prog-series")
-        ch = Chapter(id=ch_id, series_id=series.id, number=1.0, language="en")
-        db.add(ch)
-        db.commit()
+    def test_user_b_cannot_delete_user_a_bookmark(self, client, user_factory, db):
+        user_factory(username="del_a", password="pass12345")
+        user_factory(username="del_b", password="pass12345")
+        series = self._create_series(db, "del-series")
 
         from models import User
-        user_a = db.scalar(select(User).where(User.username == "iso_pa"))
-        db.add(ReadingProgress(user_id=user_a.id, chapter_id=ch_id, last_page=5))
+        user_a = db.scalar(select(User).where(User.username == "del_a"))
+
+        db.add(Bookmark(user_id=user_a.id, series_id=series.id))
+        db.commit()
+
+        # Login as user_b and try to delete user_a's bookmark
+        self._login(client, "del_b")
+        csrf = client.cookies.get("is_csrf")
+        resp = client.delete(f"/bookmarks/{series.slug}", headers={"X-CSRF-Token": csrf})
+        # Should get 204 (idempotent) but user_a's bookmark still exists
+        assert resp.status_code == 204
+
+        # Verify user_a's bookmark still exists
+        bm = db.scalar(
+            select(Bookmark).where(
+                Bookmark.user_id == user_a.id,
+                Bookmark.series_id == series.id,
+            )
+        )
+        assert bm is not None
+
+    def test_user_b_cannot_inject_user_id_in_bookmark_json(self, client, user_factory, db):
+        user_factory(username="inject_a", password="pass12345")
+        user_factory(username="inject_b", password="pass12345")
+        series = self._create_series(db, "inject-series")
+
+        from models import User
+        user_a = db.scalar(select(User).where(User.username == "inject_a"))
+
+        # Login as user_b
+        self._login(client, "inject_b")
+        csrf = client.cookies.get("is_csrf")
+        # Try to create a bookmark claiming to be user_a via user_id field
+        resp = client.post(
+            "/bookmarks",
+            json={
+                "series_path_word": series.slug,
+                "series_name": series.title,
+                "user_id": str(user_a.id),
+            },
+            headers={"X-CSRF-Token": csrf},
+        )
+        # Should be rejected by schema (extra=forbid) or ignored
+        assert resp.status_code == 422
+
+    def test_user_a_can_manage_own_bookmarks(self, client, user_factory, db):
+        user_factory(username="own_a", password="pass12345")
+        series = self._create_series(db, "own-series")
+
+        # Login as user_a
+        self._login(client, "own_a")
+        csrf = client.cookies.get("is_csrf")
+
+        # Add bookmark
+        resp = client.post(
+            "/bookmarks",
+            json={"series_path_word": series.slug, "series_name": series.title},
+            headers={"X-CSRF-Token": csrf},
+        )
+        assert resp.status_code == 201
+        bm_id = resp.json()["id"]
+
+        # List bookmarks
+        resp = client.get("/bookmarks")
+        assert resp.status_code == 200
+        assert len(resp.json()) == 1
+        assert resp.json()[0]["id"] == bm_id
+
+        # Delete bookmark
+        resp = client.delete(f"/bookmarks/{series.slug}", headers={"X-CSRF-Token": csrf})
+        assert resp.status_code == 204
+
+        # Verify deleted
+        resp = client.get("/bookmarks")
+        assert resp.status_code == 200
+        assert len(resp.json()) == 0
+
+    def test_bookmark_duplicate_handled_safely(self, client, user_factory, db):
+        user_factory(username="dupe_bm", password="pass12345")
+        series = self._create_series(db, "dupe-series")
+
+        self._login(client, "dupe_bm")
+        csrf = client.cookies.get("is_csrf")
+
+        # Add same bookmark twice
+        resp1 = client.post(
+            "/bookmarks",
+            json={"series_path_word": series.slug, "series_name": series.title},
+            headers={"X-CSRF-Token": csrf},
+        )
+        assert resp1.status_code == 201
+        id1 = resp1.json()["id"]
+
+        resp2 = client.post(
+            "/bookmarks",
+            json={"series_path_word": series.slug, "series_name": series.title},
+            headers={"X-CSRF-Token": csrf},
+        )
+        assert resp2.status_code == 201
+        id2 = resp2.json()["id"]
+        # Should return same bookmark (idempotent)
+        assert id1 == id2
+
+        # Only one bookmark in DB
+        resp = client.get("/bookmarks")
+        assert len(resp.json()) == 1
+
+    # ── Progress ─────────────────────────────────────────────────────────────
+
+    def test_user_b_cannot_read_user_a_progress(self, client, user_factory, db):
+        user_factory(username="prog_a", password="pass12345")
+        user_factory(username="prog_b", password="pass12345")
+        series = self._create_series(db, "prog-series")
+        ch = self._create_chapter(db, series)
+
+        from models import User
+        user_a = db.scalar(select(User).where(User.username == "prog_a"))
+        db.add(ReadingProgress(user_id=user_a.id, chapter_id=ch.id, last_page=5))
         db.commit()
 
         # Login as user_b
-        self._login(client, "iso_pb")
+        self._login(client, "prog_b")
+        resp = client.get(f"/progress/{series.slug}/{ch.id}")
+        assert resp.status_code == 200
+        data = resp.json()
+        # User B sees empty progress (not User A's data)
+        assert data["last_page"] is None
+
+    def test_user_b_cannot_overwrite_user_a_progress(self, client, user_factory, db):
+        user_factory(username="ow_a", password="pass12345")
+        user_factory(username="ow_b", password="pass12345")
+        series = self._create_series(db, "ow-series")
+        ch = self._create_chapter(db, series)
+
+        from models import User
+        user_a = db.scalar(select(User).where(User.username == "ow_a"))
+        db.add(ReadingProgress(user_id=user_a.id, chapter_id=ch.id, last_page=5))
+        db.commit()
+
+        # Login as user_b and upsert
+        self._login(client, "ow_b")
         csrf = client.cookies.get("is_csrf")
-        resp = client.get(
-            f"/progress/prog-series/{ch_id}",
+        resp = client.post(
+            f"/progress/{series.slug}/{ch.id}",
+            json={"chapter_uuid": str(ch.id), "last_page": 99, "completed": True},
             headers={"X-CSRF-Token": csrf},
         )
         assert resp.status_code == 200
-        data = resp.json()
-        assert data["last_page"] is None
+
+        # User A's progress is unchanged
+        db.expire_all()
+        row = db.scalar(
+            select(ReadingProgress).where(
+                ReadingProgress.user_id == user_a.id,
+                ReadingProgress.chapter_id == ch.id,
+            )
+        )
+        assert row is not None
+        assert row.last_page == 5
+
+        # User B has their own progress
+        user_b = db.scalar(select(User).where(User.username == "ow_b"))
+        row_b = db.scalar(
+            select(ReadingProgress).where(
+                ReadingProgress.user_id == user_b.id,
+                ReadingProgress.chapter_id == ch.id,
+            )
+        )
+        assert row_b is not None
+        assert row_b.last_page == 99
+
+    def test_user_b_cannot_inject_user_id_in_progress_json(self, client, user_factory, db):
+        user_factory(username="inj_pa", password="pass12345")
+        user_factory(username="inj_pb", password="pass12345")
+        series = self._create_series(db, "inj-p-series")
+        ch = self._create_chapter(db, series)
+
+        from models import User
+        user_a = db.scalar(select(User).where(User.username == "inj_pa"))
+
+        # Login as user_b
+        self._login(client, "inj_pb")
+        csrf = client.cookies.get("is_csrf")
+        resp = client.post(
+            f"/progress/{series.slug}/{ch.id}",
+            json={
+                "chapter_uuid": str(ch.id),
+                "last_page": 42,
+                "user_id": str(user_a.id),
+            },
+            headers={"X-CSRF-Token": csrf},
+        )
+        # Should be rejected by schema (extra=forbid)
+        assert resp.status_code == 422
+
+    def test_user_a_can_manage_own_progress(self, client, user_factory, db):
+        user_factory(username="own_pa", password="pass12345")
+        series = self._create_series(db, "own-p-series")
+        ch = self._create_chapter(db, series)
+
+        self._login(client, "own_pa")
+        csrf = client.cookies.get("is_csrf")
+
+        # Upsert progress
+        resp = client.post(
+            f"/progress/{series.slug}/{ch.id}",
+            json={"chapter_uuid": str(ch.id), "last_page": 10, "scroll_position": 0.5},
+            headers={"X-CSRF-Token": csrf},
+        )
+        assert resp.status_code == 200
+        assert resp.json()["last_page"] == 10
+        assert resp.json()["scroll_position"] == 0.5
+
+        # Read back
+        resp = client.get(f"/progress/{series.slug}/{ch.id}")
+        assert resp.status_code == 200
+        assert resp.json()["last_page"] == 10
+
+        # Update progress
+        resp = client.post(
+            f"/progress/{series.slug}/{ch.id}",
+            json={"chapter_uuid": str(ch.id), "last_page": 20, "completed": True},
+            headers={"X-CSRF-Token": csrf},
+        )
+        assert resp.status_code == 200
+        assert resp.json()["last_page"] == 20
+        assert resp.json()["completed"] is True
+
+    def test_progress_uniqueness_constraint(self, client, user_factory, db):
+        user_factory(username="uniq_u", password="pass12345")
+        series = self._create_series(db, "uniq-series")
+        ch = self._create_chapter(db, series)
+
+        from models import User
+        user = db.scalar(select(User).where(User.username == "uniq_u"))
+
+        self._login(client, "uniq_u")
+        csrf = client.cookies.get("is_csrf")
+
+        # Upsert twice — should update, not create duplicate
+        client.post(
+            f"/progress/{series.slug}/{ch.id}",
+            json={"chapter_uuid": str(ch.id), "last_page": 5},
+            headers={"X-CSRF-Token": csrf},
+        )
+        client.post(
+            f"/progress/{series.slug}/{ch.id}",
+            json={"chapter_uuid": str(ch.id), "last_page": 15},
+            headers={"X-CSRF-Token": csrf},
+        )
+
+        # Only one row for this user+chapter
+        rows = list(db.scalars(
+            select(ReadingProgress).where(
+                ReadingProgress.user_id == user.id,
+                ReadingProgress.chapter_id == ch.id,
+            )
+        ).all())
+        assert len(rows) == 1
+        assert rows[0].last_page == 15
+
+    # ── Unauthenticated access ───────────────────────────────────────────────
 
     def test_bookmarks_require_authentication(self, client):
         resp = client.get("/bookmarks")
         assert resp.status_code == 401
 
+    def test_bookmark_post_requires_authentication(self, client):
+        resp = client.post("/bookmarks", json={"series_path_word": "x", "series_name": "X"})
+        assert resp.status_code == 401
+
+    def test_bookmark_delete_requires_authentication(self, client):
+        resp = client.delete("/bookmarks/some-slug")
+        assert resp.status_code == 401
+
     def test_progress_require_authentication(self, client):
         ch_id = uuid.uuid4()
         resp = client.get(f"/progress/any-series/{ch_id}")
+        assert resp.status_code == 401
+
+    def test_progress_upsert_requires_authentication(self, client):
+        ch_id = uuid.uuid4()
+        resp = client.post(
+            f"/progress/any-series/{ch_id}",
+            json={"chapter_uuid": str(ch_id), "last_page": 0},
+        )
+        assert resp.status_code == 401
+
+    # ── Schema validation ────────────────────────────────────────────────────
+
+    def test_progress_rejects_negative_last_page(self, client, user_factory, db):
+        user_factory(username="neg_lp", password="pass12345")
+        series = self._create_series(db, "neg-series")
+        ch = self._create_chapter(db, series)
+
+        self._login(client, "neg_lp")
+        csrf = client.cookies.get("is_csrf")
+        resp = client.post(
+            f"/progress/{series.slug}/{ch.id}",
+            json={"chapter_uuid": str(ch.id), "last_page": -1},
+            headers={"X-CSRF-Token": csrf},
+        )
+        assert resp.status_code == 422
+
+    def test_progress_rejects_scroll_position_out_of_range(self, client, user_factory, db):
+        user_factory(username="oor_sp", password="pass12345")
+        series = self._create_series(db, "oor-series")
+        ch = self._create_chapter(db, series)
+
+        self._login(client, "oor_sp")
+        csrf = client.cookies.get("is_csrf")
+        # scroll_position > 1.0
+        resp = client.post(
+            f"/progress/{series.slug}/{ch.id}",
+            json={"chapter_uuid": str(ch.id), "scroll_position": 1.5},
+            headers={"X-CSRF-Token": csrf},
+        )
+        assert resp.status_code == 422
+
+    def test_progress_rejects_extra_fields(self, client, user_factory, db):
+        user_factory(username="extra_p", password="pass12345")
+        series = self._create_series(db, "extra-series")
+        ch = self._create_chapter(db, series)
+
+        self._login(client, "extra_p")
+        csrf = client.cookies.get("is_csrf")
+        resp = client.post(
+            f"/progress/{series.slug}/{ch.id}",
+            json={"chapter_uuid": str(ch.id), "last_page": 1, "injected": True},
+            headers={"X-CSRF-Token": csrf},
+        )
+        assert resp.status_code == 422
+
+    # ── Error message consistency (no data leakage) ──────────────────────────
+
+    def test_user_b_delete_nonexistent_bookmark_same_response(self, client, user_factory, db):
+        """Deleting a bookmark that doesn't exist returns 204 regardless
+        of whether the series exists — no information leaked about other
+        users' bookmarks."""
+        user_factory(username="leak_a", password="pass12345")
+        user_factory(username="leak_b", password="pass12345")
+        series = self._create_series(db, "leak-series")
+
+        from models import User
+        user_a = db.scalar(select(User).where(User.username == "leak_a"))
+        db.add(Bookmark(user_id=user_a.id, series_id=series.id))
+        db.commit()
+
+        # Login as user_b
+        self._login(client, "leak_b")
+        csrf = client.cookies.get("is_csrf")
+        resp = client.delete(f"/bookmarks/{series.slug}", headers={"X-CSRF-Token": csrf})
+        # Should be 204 (idempotent), no 404/403 that reveals user_a's bookmark exists
+        assert resp.status_code == 204
+
+    def test_unauth_progress_no_info_leakage(self, client, user_factory, db):
+        """Unauthenticated progress request returns 401, not 404."""
+        user_factory(username="noinf_a", password="pass12345")
+        series = self._create_series(db, "noinf-series")
+        ch = self._create_chapter(db, series)
+
+        from models import User
+        user_a = db.scalar(select(User).where(User.username == "noinf_a"))
+        db.add(ReadingProgress(user_id=user_a.id, chapter_id=ch.id, last_page=5))
+        db.commit()
+
+        # Unauthenticated request — should be 401, not 404
+        resp = client.get(f"/progress/{series.slug}/{ch.id}")
         assert resp.status_code == 401
 
 

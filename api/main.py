@@ -12,7 +12,7 @@ Authentication is cookie-based.  On login the server sets:
   • ``is_csrf``    — non-httpOnly cookie read by the frontend and sent back as
                      the ``X-CSRF-Token`` header on state-changing requests.
 
-X-User-ID is NOT used.  All identity derives from the session cookies.
+All identity derives from the session cookies.  No identity headers are accepted.
 
 Environment variables
 ---------------------

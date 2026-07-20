@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, useCallback } from "react";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -9,9 +9,7 @@ interface Series {
   slug: string;
   title: string;
   synopsis: string | null;
-  /** Resolved CDN/S3 URL returned by the local-library listing endpoint. */
   cover_url?: string | null;
-  /** S3 object key — present on local-library rows when cover_url is absent. */
   cover_object_key: string | null;
   content_type: "manga" | "manhua" | "manhwa";
   status: "ongoing" | "completed" | "hiatus" | "cancelled";
@@ -22,28 +20,27 @@ interface Series {
 interface User {
   id: string;
   username: string;
-  email: string;
+  email: string | null;
   role: string;
   is_active: boolean;
-}
-
-interface Token {
-  access_token: string;
-  token_type: string;
-  user: User;
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
 const API = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
 
-function getAuthHeaders(): HeadersInit {
-  const headers: HeadersInit = { "Content-Type": "application/json" };
-  const token = localStorage.getItem("token");
-  if (token) {
-    headers["Authorization"] = `Bearer ${token}`;
-  }
-  return headers;
+function readCookie(name: string): string | null {
+  const match = document.cookie.match(new RegExp("(^| )" + name + "=([^;]*)"));
+  return match ? decodeURIComponent(match[2]) : null;
+}
+
+function csrfHeaders(): HeadersInit {
+  const csrf = readCookie("is_csrf");
+  return csrf ? { "X-CSRF-Token": csrf } : {};
+}
+
+function jsonHeaders(): HeadersInit {
+  return { "Content-Type": "application/json", ...csrfHeaders() };
 }
 
 const STATUS_LABELS: Record<string, string> = {
@@ -146,8 +143,6 @@ function SearchBar({
 }
 
 function SeriesCard({ series }: { series: Series }) {
-  // Prefer the pre-resolved URL from the API; fall back to constructing from the
-  // object key (useful when the frontend is pointed at a custom S3/CDN proxy).
   const coverUrl =
     series.cover_url ??
     (series.cover_object_key
@@ -201,17 +196,19 @@ function EmptyState({ searching }: { searching: boolean }) {
   );
 }
 
-function LoginModal({
+function AuthModal({
   open,
   onClose,
-  onLogin,
+  onAuth,
 }: {
   open: boolean;
   onClose: () => void;
-  onLogin: (token: Token) => void;
+  onAuth: (user: User) => void;
 }) {
+  const [mode, setMode] = useState<"login" | "register">("login");
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
+  const [email, setEmail] = useState("");
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
 
@@ -223,28 +220,39 @@ function LoginModal({
     setLoading(true);
 
     try {
-      const formData = new URLSearchParams();
-      formData.append("username", username);
-      formData.append("password", password);
+      if (mode === "register") {
+        const regRes = await fetch(`${API}/register`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            username,
+            password,
+            ...(email ? { email } : {}),
+          }),
+        });
+        if (!regRes.ok) {
+          const err = await regRes.json();
+          throw new Error(err.detail || "Registration failed");
+        }
+      }
 
-      const res = await fetch(`${API}/token`, {
+      const loginRes = await fetch(`${API}/token`, {
         method: "POST",
-        headers: { "Content-Type": "application/x-www-form-urlencoded" },
-        body: formData,
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ username, password }),
+        credentials: "include",
       });
 
-      if (!res.ok) {
-        const err = await res.json();
+      if (!loginRes.ok) {
+        const err = await loginRes.json();
         throw new Error(err.detail || "Login failed");
       }
 
-      const token: Token = await res.json();
-      localStorage.setItem("token", token.access_token);
-      localStorage.setItem("user", JSON.stringify(token.user));
-      onLogin(token);
+      const data = await loginRes.json();
+      onAuth(data.user);
       onClose();
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Login failed");
+      setError(err instanceof Error ? err.message : "Failed");
     } finally {
       setLoading(false);
     }
@@ -253,7 +261,9 @@ function LoginModal({
   return (
     <div className="modal-overlay" onClick={onClose}>
       <div className="modal" onClick={(e) => e.stopPropagation()}>
-        <h2 style={{ marginBottom: 16 }}>Login</h2>
+        <h2 style={{ marginBottom: 16 }}>
+          {mode === "login" ? "Login" : "Register"}
+        </h2>
         <form onSubmit={handleSubmit}>
           <div style={{ marginBottom: 12 }}>
             <label style={{ display: "block", marginBottom: 4, fontSize: "0.875rem" }}>
@@ -266,8 +276,23 @@ function LoginModal({
               className="search-input"
               required
               autoFocus
+              minLength={mode === "register" ? 3 : 1}
+              pattern={mode === "register" ? "^[a-zA-Z0-9_]+$" : undefined}
             />
           </div>
+          {mode === "register" && (
+            <div style={{ marginBottom: 12 }}>
+              <label style={{ display: "block", marginBottom: 4, fontSize: "0.875rem" }}>
+                Email (optional)
+              </label>
+              <input
+                type="email"
+                value={email}
+                onChange={(e) => setEmail(e.target.value)}
+                className="search-input"
+              />
+            </div>
+          )}
           <div style={{ marginBottom: 16 }}>
             <label style={{ display: "block", marginBottom: 4, fontSize: "0.875rem" }}>
               Password
@@ -278,6 +303,7 @@ function LoginModal({
               onChange={(e) => setPassword(e.target.value)}
               className="search-input"
               required
+              minLength={8}
             />
           </div>
           {error && (
@@ -285,13 +311,27 @@ function LoginModal({
               ⚠ {error}
             </p>
           )}
-          <div style={{ display: "flex", gap: 8, justifyContent: "flex-end" }}>
-            <button type="button" className="btn ghost" onClick={onClose}>
-              Cancel
+          <div style={{ display: "flex", gap: 8, justifyContent: "space-between", alignItems: "center" }}>
+            <button
+              type="button"
+              className="btn ghost small"
+              onClick={() => {
+                setMode(mode === "login" ? "register" : "login");
+                setError("");
+              }}
+            >
+              {mode === "login" ? "Create account" : "Back to login"}
             </button>
-            <button type="submit" className="btn" disabled={loading}>
-              {loading ? "Logging in..." : "Login"}
-            </button>
+            <div style={{ display: "flex", gap: 8 }}>
+              <button type="button" className="btn ghost" onClick={onClose}>
+                Cancel
+              </button>
+              <button type="submit" className="btn" disabled={loading}>
+                {loading
+                  ? mode === "login" ? "Logging in..." : "Registering..."
+                  : mode === "login" ? "Login" : "Register"}
+              </button>
+            </div>
           </div>
         </form>
       </div>
@@ -310,23 +350,29 @@ export default function HomePage() {
   const [user, setUser] = useState<User | null>(null);
   const [loginOpen, setLoginOpen] = useState(false);
 
-  // Load user from localStorage on mount
+  // Check session on mount via /me (cookies auto-sent)
   useEffect(() => {
-    const storedUser = localStorage.getItem("user");
-    if (storedUser) {
-      try {
-        setUser(JSON.parse(storedUser));
-      } catch {}
-    }
+    fetch(`${API}/me`, { credentials: "include" })
+      .then((res) => {
+        if (res.ok) return res.json();
+        throw new Error("not logged in");
+      })
+      .then((u: User) => setUser(u))
+      .catch(() => {});
   }, []);
 
-  const handleLogin = (token: Token) => {
-    setUser(token.user);
+  const handleAuth = (u: User) => {
+    setUser(u);
   };
 
-  const handleLogout = () => {
-    localStorage.removeItem("token");
-    localStorage.removeItem("user");
+  const handleLogout = async () => {
+    try {
+      await fetch(`${API}/logout`, {
+        method: "POST",
+        headers: jsonHeaders(),
+        credentials: "include",
+      });
+    } catch {}
     setUser(null);
   };
 
@@ -350,7 +396,6 @@ export default function HomePage() {
     return () => controller.abort();
   }, []);
 
-  // Client-side filter
   const filtered = query.trim()
     ? allSeries.filter((s) =>
         s.title.toLowerCase().includes(query.toLowerCase())
@@ -367,10 +412,10 @@ export default function HomePage() {
         onLogout={handleLogout}
       />
       <SearchBar open={searchOpen} query={query} onQuery={setQuery} />
-      <LoginModal
+      <AuthModal
         open={loginOpen}
         onClose={() => setLoginOpen(false)}
-        onLogin={handleLogin}
+        onAuth={handleAuth}
       />
 
       <main className="wrap">
