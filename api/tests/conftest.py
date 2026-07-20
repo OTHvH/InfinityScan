@@ -87,6 +87,10 @@ def _do_login(client, username: str, password: str):
 
 def _do_register(client, username: str, password: str, email: str | None = None):
     """Register via canonical /auth/register with pre-auth CSRF."""
+    # Registration establishes an authenticated session.  Clear it when a
+    # helper call represents a fresh pre-auth registration attempt.
+    client.cookies.delete("is_access")
+    client.cookies.delete("is_refresh")
     resp = client.get("/auth/csrf")
     csrf = resp.json()["csrf_token"]
     body = {"username": username, "password": password}

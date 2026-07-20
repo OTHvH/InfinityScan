@@ -24,6 +24,9 @@ async function registerUser(
     data: body,
   })
   expect(regResp.status()).toBe(201)
+  const meResp = await page.request.get(`${API_URL}/auth/me`)
+  expect(meResp.status()).toBe(200)
+  expect((await meResp.json()).username).toBe(username)
 }
 
 /** Login via the UI. */
@@ -74,10 +77,7 @@ test.describe('Complete authentication and data isolation flow', () => {
     // ── Step 1: Register User A via API ───────────────────────────────────
     await registerUser(page, USER_A.username, USER_A.password)
 
-    // ── Step 2: Login as User A via UI and bookmark a series ──────────────
-    await loginViaUI(page, USER_A.username, USER_A.password)
-
-    // Navigate to home page (series list)
+    // ── Step 2: Use the authenticated registration session ────────────────
     await page.goto('/')
     await expect(page.locator('.brand-title')).toContainText('InfinityScan')
 
@@ -130,7 +130,6 @@ test.describe('Complete authentication and data isolation flow', () => {
     await registerUser(page, USER_B.username, USER_B.password)
 
     // ── Step 6: Confirm User A data is absent for User B ─────────────────
-    await loginViaUI(page, USER_B.username, USER_B.password)
 
     // User B should see no bookmarks
     const bmResp = await page.request.get(`${API_URL}/bookmarks`)

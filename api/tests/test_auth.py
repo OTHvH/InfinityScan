@@ -51,6 +51,13 @@ class TestRegistration:
         assert "access_token" not in body
         assert "refresh_token" not in body
 
+        assert "is_access" in resp.cookies
+        assert "is_refresh" in resp.cookies
+        assert "is_csrf" in resp.cookies
+        me = client.get("/auth/me")
+        assert me.status_code == 200
+        assert me.json()["username"] == "newuser"
+
     def test_register_with_email(self, client):
         resp = _do_register(client, "emailuser", "strongpassword123", email="test@example.com")
         assert resp.status_code == 201
@@ -59,13 +66,13 @@ class TestRegistration:
     def test_register_duplicate_username(self, client, user_factory):
         user_factory(username="dupe_user")
         resp = _do_register(client, "dupe_user", "strongpassword123")
-        assert resp.status_code == 400
+        assert resp.status_code == 409
         assert "already registered" in resp.json()["detail"]
 
     def test_register_duplicate_email(self, client, user_factory):
         user_factory(username="first", email="same@example.com")
         resp = _do_register(client, "second", "strongpassword123", email="same@example.com")
-        assert resp.status_code == 400
+        assert resp.status_code == 409
 
     def test_register_short_password(self, client):
         resp = _do_register(client, "shortpw", "abc")

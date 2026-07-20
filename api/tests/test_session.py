@@ -8,7 +8,6 @@ Covers:
 - /auth/register, /auth/login, /auth/refresh, /auth/logout, /auth/logout-all
 - /auth/me and /auth/csrf
 - Session validation (revoked/expired → 401)
-- Deprecated legacy routes still function
 """
 
 from __future__ import annotations
@@ -184,7 +183,7 @@ class TestIssueRefreshSession:
         assert rs.user_agent == "TestAgent/1.0"
 
 
-class TestRotateRefreshToken:
+class TestRotateRefreshSession:
     def test_valid_token_rotates(self, db):
         user = User(
             username="testuser",
@@ -414,7 +413,7 @@ class TestAuthRegister:
             json={"username": "dupeuser", "password": "strongpassword123"},
             headers={"X-CSRF-Token": client.cookies.get("is_csrf")},
         )
-        assert resp.status_code == 400
+        assert resp.status_code == 409
         assert "already registered" in resp.json()["detail"]
 
     def test_register_weak_password(self, client):
@@ -845,11 +844,3 @@ class TestAuthCsrf:
         resp = client.get("/auth/csrf")
         cookie = resp.cookies["is_csrf"]
         assert cookie
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# 3. Deprecated legacy routes still function
-# ═══════════════════════════════════════════════════════════════════════════
-
-
-

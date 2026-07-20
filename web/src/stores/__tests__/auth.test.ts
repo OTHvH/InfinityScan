@@ -116,12 +116,9 @@ describe("login", () => {
 });
 
 describe("register", () => {
-  it("fetches CSRF, registers, fetches CSRF again, then logs in", async () => {
-    mockedApi.fetchCsrf
-      .mockResolvedValueOnce("csrf1")
-      .mockResolvedValueOnce("csrf2");
+  it("fetches CSRF, registers, and enters the authenticated state", async () => {
+    mockedApi.fetchCsrf.mockResolvedValueOnce("csrf1");
     mockedApi.register.mockResolvedValueOnce({ user: mockUser });
-    mockedApi.login.mockResolvedValueOnce({ user: mockUser });
 
     await useAuthStore.getState().register({
       username: "newuser",
@@ -129,22 +126,18 @@ describe("register", () => {
       email: "new@example.com",
     });
 
-    expect(mockedApi.fetchCsrf).toHaveBeenCalledTimes(2);
+    expect(mockedApi.fetchCsrf).toHaveBeenCalledTimes(1);
     expect(mockedApi.register).toHaveBeenCalledWith({
       username: "newuser",
       password: "pass1234",
       email: "new@example.com",
     });
-    expect(mockedApi.login).toHaveBeenCalledWith({
-      username: "newuser",
-      password: "pass1234",
-    });
+    expect(mockedApi.login).not.toHaveBeenCalled();
   });
 
-  it("sets user from login response", async () => {
+  it("sets user from registration response", async () => {
     mockedApi.fetchCsrf.mockResolvedValue("csrf");
     mockedApi.register.mockResolvedValueOnce({ user: mockUser });
-    mockedApi.login.mockResolvedValueOnce({ user: mockUser });
 
     await useAuthStore.getState().register({
       username: "newuser",
@@ -156,7 +149,7 @@ describe("register", () => {
   it("re-throws errors", async () => {
     mockedApi.fetchCsrf.mockResolvedValueOnce("csrf");
     mockedApi.register.mockRejectedValueOnce(
-      new ApiError(400, "Username already taken"),
+      new ApiError(409, "Username already taken"),
     );
 
     await expect(

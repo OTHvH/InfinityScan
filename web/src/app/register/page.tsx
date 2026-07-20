@@ -4,7 +4,7 @@ import { Suspense, useState, useCallback } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import Link from "next/link";
 import { useAuthStore } from "@/stores/auth";
-import { api, getReturnUrl, ApiError } from "@/lib/api";
+import { getReturnUrl, ApiError } from "@/lib/api";
 
 function RegisterForm() {
   const router = useRouter();
@@ -62,7 +62,6 @@ function RegisterForm() {
       setLoading(true);
 
       try {
-        await api.fetchCsrf();
         await register({
           username,
           password,

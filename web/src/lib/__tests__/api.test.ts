@@ -246,7 +246,7 @@ describe("No tokens in client", () => {
     // The only cookie access should be for is_csrf via readCsrfCookie
     // which uses a regex on document.cookie — it should never read
     // access_token or refresh_token by name
-    const cookieGetCalls = cookieSpy.mock.calls.map((c) => c[0]);
+    const cookieGetCalls = cookieSpy.mock.calls as unknown as Array<[string]>;
     for (const call of cookieGetCalls) {
       expect(call).not.toMatch(/access_token/);
       expect(call).not.toMatch(/refresh_token/);

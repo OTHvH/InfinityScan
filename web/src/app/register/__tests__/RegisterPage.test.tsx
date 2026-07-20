@@ -143,10 +143,10 @@ describe("RegisterPage", () => {
     });
   });
 
-  it("shows 'Username already taken' on 400 with that detail", async () => {
+  it("shows 'Username already taken' on 409 with that detail", async () => {
     const user = userEvent.setup();
     mockRegister.mockRejectedValueOnce(
-      new ApiError(400, "Username already taken"),
+      new ApiError(409, "Username already taken"),
     );
     render(<RegisterPage />);
     await fillForm(user, {
@@ -161,10 +161,10 @@ describe("RegisterPage", () => {
     });
   });
 
-  it("shows 'Email already registered' on 400 with that detail", async () => {
+  it("shows 'Email already registered' on 409 with that detail", async () => {
     const user = userEvent.setup();
     mockRegister.mockRejectedValueOnce(
-      new ApiError(400, "Email already registered"),
+      new ApiError(409, "Email already registered"),
     );
     render(<RegisterPage />);
     await fillForm(user, {
@@ -183,7 +183,7 @@ describe("RegisterPage", () => {
   it("shows loading state during submission", async () => {
     const user = userEvent.setup();
     let resolveRegister!: () => void;
-    mockRegister.mockReturnValueOnce(new Promise((r) => { resolveRegister = r; }));
+    mockRegister.mockReturnValueOnce(new Promise<void>((resolve) => { resolveRegister = resolve; }));
 
     render(<RegisterPage />);
     await fillForm(user, {

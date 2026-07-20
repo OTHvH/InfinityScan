@@ -17,7 +17,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 
 import jwt
-from sqlalchemy import select, update
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from auth import (
@@ -159,7 +159,7 @@ def rotate_refresh_token(
         user_agent=user_agent,
     )
 
-    # Revoke old session and link to replacement
+    # Revoke old session and link to replacement.
     session.revoked_at = now
     session.replaced_by_session_id = new_session
     session.last_used_at = now

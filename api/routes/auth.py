@@ -10,12 +10,12 @@ Endpoints:
 - GET  /auth/csrf       — issue a new CSRF token (sets cookie + returns value)
 """
 
-import logging
 import uuid
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Request, Response
 from slowapi import Limiter
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from auth import (
@@ -23,7 +23,6 @@ from auth import (
     generate_csrf_token,
     hash_password,
     set_cookie,
-    validate_csrf_token,
     verify_and_update_password,
 )
 from auth.schemas import LoginIn, LoginOut, RegisterIn, RegisterOut, UserOut
@@ -36,11 +35,8 @@ from session import (
     revoke_all_user_sessions,
     revoke_session,
     rotate_refresh_token,
-    is_session_active,
 )
 from settings import get_settings
-
-logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 
@@ -113,15 +109,16 @@ def _clear_auth_cookies(response: Response) -> None:
 @limiter.limit(_cfg.register_rate_limit)
 def register(
     request: Request,
+    response: Response,
     body: RegisterIn = Body(...),
     _csrf: None = Depends(require_preauth_csrf),
     db: Session = Depends(get_db),
 ) -> RegisterOut:
     if db.scalar(select(User).where(User.username == body.username)):
-        raise HTTPException(status_code=400, detail="Username already registered")
+        raise HTTPException(status_code=409, detail="Username already registered")
 
     if body.email and db.scalar(select(User).where(User.email == body.email)):
-        raise HTTPException(status_code=400, detail="Email already registered")
+        raise HTTPException(status_code=409, detail="Email already registered")
 
     try:
         hashed = hash_password(body.password)
@@ -135,8 +132,25 @@ def register(
         role=UserRole.user,
     )
     db.add(user)
-    db.commit()
+    try:
+        db.commit()
+    except IntegrityError:
+        # The pre-checks avoid unnecessary work, but only the database
+        # constraint closes the uniqueness race between concurrent requests.
+        db.rollback()
+        if db.scalar(select(User).where(User.username == body.username)):
+            raise HTTPException(status_code=409, detail="Username already registered")
+        if body.email and db.scalar(select(User).where(User.email == body.email)):
+            raise HTTPException(status_code=409, detail="Email already registered")
+        raise HTTPException(status_code=409, detail="Username or email already registered")
     db.refresh(user)
+
+    user_agent = request.headers.get("User-Agent", "")
+    raw_refresh, session_id = issue_refresh_session(
+        db, user_id=user.id, user_agent=user_agent
+    )
+    access = issue_access_token(user.id, session_id, user.role.value)
+    _set_auth_cookies(response, access, raw_refresh, session_id)
 
     return RegisterOut(user=_user_to_out(user))
 

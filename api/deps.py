@@ -50,7 +50,7 @@ import uuid
 from dataclasses import dataclass
 from typing import Annotated
 
-from fastapi import Depends, HTTPException, Request
+from fastapi import Depends, Header, HTTPException, Request
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -279,7 +279,7 @@ def require_admin(
 def require_csrf(
     request: Request,
     session: RefreshSession = Depends(get_current_session),
-    x_csrf_token: str | None = None,
+    x_csrf_token: str | None = Header(default=None, alias="X-CSRF-Token"),
 ) -> None:
     """Validate the signed, session-bound CSRF token.
 
@@ -289,8 +289,7 @@ def require_csrf(
     4. Validates the HMAC signature bound to the current session ID.
     5. Checks token expiry.
 
-    The ``x_csrf_token`` parameter is intentionally a plain parameter
-    so that FastAPI does **not** inject it from query / body.
+    The token is read only from the ``X-CSRF-Token`` request header.
     """
     cfg = get_settings()
     csrf_cookie: str | None = request.cookies.get(cfg.csrf_cookie_name)
@@ -309,7 +308,7 @@ def require_csrf(
 
 def require_preauth_csrf(
     request: Request,
-    x_csrf_token: str | None = None,
+    x_csrf_token: str | None = Header(default=None, alias="X-CSRF-Token"),
 ) -> None:
     """Validate the pre-authentication CSRF token (login / register).
 

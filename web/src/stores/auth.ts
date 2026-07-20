@@ -19,7 +19,7 @@ interface AuthState {
 
   /** Check the session and load the current user. Called once on mount. */
   loadCurrentUser: () => Promise<void>;
-  /** Register a new account, then auto-login. */
+  /** Register a new account and enter the authenticated state. */
   register: (data: {
     username: string;
     password: string;
@@ -52,13 +52,7 @@ export const useAuthStore = create<AuthState>((set) => ({
     try {
       // Fetch pre-auth CSRF token first
       await api.fetchCsrf();
-      await api.register(data);
-      // After registration, login automatically
-      await api.fetchCsrf();
-      const res = await api.login({
-        username: data.username,
-        password: data.password,
-      });
+      const res = await api.register(data);
       set({ user: res.user, isLoading: false });
     } catch (err) {
       set({ isLoading: false });

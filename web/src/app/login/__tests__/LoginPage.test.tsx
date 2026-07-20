@@ -91,7 +91,7 @@ describe("LoginPage", () => {
   it("shows loading state during submission", async () => {
     const user = userEvent.setup();
     let resolveLogin!: () => void;
-    mockLogin.mockReturnValueOnce(new Promise((r) => { resolveLogin = r; }));
+    mockLogin.mockReturnValueOnce(new Promise<void>((resolve) => { resolveLogin = resolve; }));
 
     render(<LoginPage />);
     await user.type(screen.getByLabelText(/username/i), "user");

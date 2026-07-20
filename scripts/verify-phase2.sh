@@ -1,1105 +1,631 @@
 #!/usr/bin/env bash
-# ===========================================================================
-# verify-phase2.sh — InfinityScan Phase 2 release-gate verification
-# ===========================================================================
-# Runs all Phase 2 security checks and reports pass/fail.
-# Requires: docker, docker compose v2, curl, jq, bash.
+# InfinityScan Phase 2 security release-gate verification.
 #
-# Usage:
-#   ./scripts/verify-phase2.sh              # full run (builds + starts stack)
-#   ./scripts/verify-phase2.sh --skip-docker  # static checks only
-#   ./scripts/verify-phase2.sh --cleanup      # stop + remove containers/volumes
-# ===========================================================================
+# Every check is mandatory.  --skip-docker is retained only as a diagnostic
+# switch and fails the gate rather than converting required checks to skips.
 set -euo pipefail
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
 NC='\033[0m'
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$REPO_ROOT"
-
+TMPDIR="$(mktemp -d /tmp/infinityscan-phase2-XXXXXX)"
 PASS_COUNT=0
 FAIL_COUNT=0
 SKIP_COUNT=0
 RESULTS=()
 FAILED_CHECKS=()
 
-pass() { PASS_COUNT=$((PASS_COUNT + 1)); RESULTS+=("PASS  $1"); echo -e "${GREEN}PASS${NC}  $1"; }
-fail() { FAIL_COUNT=$((FAIL_COUNT + 1)); RESULTS+=("FAIL  $1"); FAILED_CHECKS+=("$1"); echo -e "${RED}FAIL${NC}  $1"; }
-skip() { SKIP_COUNT=$((SKIP_COUNT + 1)); RESULTS+=("SKIP  $1"); echo -e "${YELLOW}SKIP${NC}  $1"; }
+pass() {
+  PASS_COUNT=$((PASS_COUNT + 1))
+  RESULTS+=("PASS  $1")
+  printf '%bPASS%b  %s\n' "$GREEN" "$NC" "$1"
+}
+
+fail() {
+  FAIL_COUNT=$((FAIL_COUNT + 1))
+  RESULTS+=("FAIL  $1")
+  FAILED_CHECKS+=("$1")
+  printf '%bFAIL%b  %s\n' "$RED" "$NC" "$1"
+}
+
+short_error() {
+  printf '%s\n' "$1" | tail -n 8
+}
+
+cleanup_stack() {
+  if [ -f "$REPO_ROOT/infra/.env" ]; then
+    docker compose --env-file "$REPO_ROOT/infra/.env" -f "$REPO_ROOT/infra/docker-compose.yml" down -v --remove-orphans >/dev/null 2>&1 || true
+  fi
+}
+
+cleanup() {
+  local status=$?
+  cleanup_stack
+  rm -rf "$TMPDIR"
+  exit "$status"
+}
+trap cleanup EXIT
 
 SKIP_DOCKER=false
 CLEANUP_ONLY=false
 for arg in "$@"; do
   case "$arg" in
     --skip-docker) SKIP_DOCKER=true ;;
-    --cleanup)     CLEANUP_ONLY=true ;;
+    --cleanup) CLEANUP_ONLY=true ;;
+    *) fail "Unknown argument: $arg" ;;
   esac
 done
 
-API_BASE="http://localhost:8000"
-WEB_BASE="http://localhost:3000"
-COMPOSE="docker compose -f infra/docker-compose.yml"
-TMPDIR=$(mktemp -d /tmp/phase2-verify-XXXXXX)
-trap 'rm -rf "$TMPDIR"' EXIT
+ENV_FILE="$REPO_ROOT/infra/.env"
+if [ ! -f "$ENV_FILE" ]; then
+  cp "$REPO_ROOT/infra/.env.example" "$ENV_FILE"
+fi
+COMPOSE=(docker compose --env-file "$ENV_FILE" -f "$REPO_ROOT/infra/docker-compose.yml")
+compose() { "${COMPOSE[@]}" "$@"; }
+env_value() {
+  local key="$1"
+  awk -F= -v wanted="$key" '$1 == wanted { value=substr($0, index($0, "=") + 1) } END { print value }' "$ENV_FILE"
+}
+DB_USER="$(env_value POSTGRES_USER)"
+DB_NAME="$(env_value POSTGRES_DB)"
+DB_PASS="$(env_value POSTGRES_PASSWORD)"
+DB_USER="${DB_USER:-infinityscan}"
+DB_NAME="${DB_NAME:-infinityscan}"
 
-# ===========================================================================
-# Cleanup mode
-# ===========================================================================
 if [ "$CLEANUP_ONLY" = true ]; then
-  echo "Cleaning up containers and volumes..."
-  $COMPOSE down -v --remove-orphans 2>/dev/null || true
-  echo "Done."
+  cleanup_stack
   exit 0
 fi
 
-# ===========================================================================
-# Cleanup on exit
-# ===========================================================================
-cleanup() {
-  echo ""
-  echo "Stopping containers..."
-  $COMPOSE down -v --remove-orphans 2>/dev/null || true
-}
-trap 'cleanup; rm -rf "$TMPDIR"' EXIT
+API_BASE="http://localhost:8000"
+WEB_BASE="http://localhost:3000"
+API_VENV="$REPO_ROOT/api/.venv"
+if [ ! -x "$API_VENV/bin/python" ]; then
+  API_VENV="/tmp/infinityscan-audit-venv"
+  if [ ! -x "$API_VENV/bin/python" ]; then
+    if ! python3 -m venv "$API_VENV" >/dev/null 2>&1; then
+      fail "PYTHON: could not create verifier virtualenv"
+    fi
+  fi
+fi
+API_PYTHON="$API_VENV/bin/python"
 
-# ===========================================================================
-# Tool checks
-# ===========================================================================
-echo ""
 echo "======================================"
 echo "  InfinityScan Phase 2 Verification"
 echo "======================================"
-echo ""
 
-missing_tools=0
-for tool in curl jq; do
-  if ! command -v "$tool" &>/dev/null; then
-    echo "  MISSING: $tool"
-    missing_tools=1
+for tool in python3 node npm curl jq git; do
+  if command -v "$tool" >/dev/null 2>&1; then
+    pass "TOOL: $tool available"
+  else
+    fail "TOOL: $tool is required"
   fi
 done
-if [ "$missing_tools" -eq 1 ]; then
-  echo "Install missing tools and retry."
-  exit 1
-fi
-echo "  Tools: curl, jq — OK"
 
-# ===========================================================================
-# Helper: extract cookie attributes from Set-Cookie header
-# ===========================================================================
-# get_cookie_attr <headers_file> <cookie_name> <attribute>
-# Returns the value of the named attribute (e.g. "httponly", "path", "max-age")
-# from the first Set-Cookie line matching cookie_name.
-get_cookie_attr() {
-  local headers_file="$1" cookie_name="$2" attr="$3"
-  # Get the Set-Cookie line for this cookie (case-insensitive cookie name)
-  local line
-  line=$(grep -i "^set-cookie:.*${cookie_name}=" "$headers_file" 2>/dev/null | head -1 || true)
-  if [ -z "$line" ]; then
-    echo ""
+if [ -x "$API_PYTHON" ]; then
+  if DEV_INSTALL_OUT=$("$API_PYTHON" -m pip install -q -r api/requirements-dev.txt 2>&1); then
+    pass "PYTHON: requirements-dev.txt installed"
+  else
+    status=$?
+    fail "PYTHON: requirements-dev.txt installation failed (exit $status): $(short_error "$DEV_INSTALL_OUT")"
+  fi
+else
+  fail "PYTHON: verifier virtualenv is unavailable"
+fi
+
+run_local_check() {
+  local label="$1"
+  shift
+  local output status
+  if output=$("$@" 2>&1); then
+    pass "$label"
+  else
+    status=$?
+    fail "$label (exit $status): $(short_error "$output")"
+  fi
+}
+
+if [ -x "$API_PYTHON" ]; then
+  run_local_check "CHECK-A1: backend pytest" "$API_PYTHON" -m pytest api/tests
+else
+  fail "CHECK-A1: backend pytest cannot run without API Python"
+fi
+run_local_check "CHECK-A2: frontend unit tests" npm --prefix web run test
+run_local_check "CHECK-A3: frontend lint" npm --prefix web run lint
+run_local_check "CHECK-A4: TypeScript check" sh -c 'cd web && npx tsc --noEmit'
+run_local_check "CHECK-A5: production frontend build" npm --prefix web run build
+
+if [ -x "$API_PYTHON" ]; then
+  run_local_check "CHECK-A6: pip-audit runtime dependencies" "$API_PYTHON" -m pip_audit -r api/requirements.txt
+  run_local_check "CHECK-A7: pip-audit development dependencies" "$API_PYTHON" -m pip_audit -r api/requirements-dev.txt
+else
+  fail "CHECK-A6/A7: pip-audit cannot run without API Python"
+fi
+
+audit_npm() {
+  local report="$TMPDIR/npm-audit.json"
+  if (cd web && npm audit --json >"$report" 2>&1); then
+    pass "CHECK-A8: npm audit found no vulnerabilities"
     return
   fi
-  # Lowercase the line for attribute matching
-  local lower
-  lower=$(echo "$line" | tr '[:upper:]' '[:lower:]')
-  case "$attr" in
-    httponly)
-      if echo "$lower" | grep -qi "httponly"; then
-        echo "true"
-      else
-        echo "false"
-      fi
-      ;;
-    secure)
-      if echo "$lower" | grep -qi "; *secure" || echo "$lower" | grep -qi "^set-cookie:.*; *secure"; then
-        echo "true"
-      else
-        echo "false"
-      fi
-      ;;
-    samesite)
-      echo "$lower" | grep -oP 'samesite=\K[^; ]+' || echo ""
-      ;;
-    path)
-      echo "$lower" | grep -oP 'path=\K[^; ]+' || echo ""
-      ;;
-    max-age)
-      echo "$lower" | grep -oP 'max-age=\K[^; ]+' || echo ""
-      ;;
-    *)
-      echo ""
-      ;;
-  esac
+  if node - "$report" <<'NODE'
+const fs = require("fs");
+const report = JSON.parse(fs.readFileSync(process.argv[2], "utf8"));
+const allowlisted = [];
+for (const [name, vulnerability] of Object.entries(report.vulnerabilities ?? {})) {
+  const via = vulnerability.via ?? [];
+  const postcss = name === "postcss" && via.some(
+    (item) => item && typeof item === "object" && item.source === 1117015
+  );
+  const nextPropagation = name === "next" && via.length === 1 && via[0] === "postcss";
+  if (postcss || nextPropagation) {
+    allowlisted.push(name);
+    continue;
+  }
+  console.error(`${name}: unallowlisted npm audit finding`);
+  process.exitCode = 1;
+}
+if (process.exitCode !== 1 && allowlisted.length > 0) {
+  console.log(`allowlisted PostCSS advisory affecting Next.js: ${allowlisted.join(", ")}`);
+}
+NODE
+  then
+    pass "CHECK-A8: npm audit findings are limited to the documented PostCSS/Next.js allowlist"
+  else
+    fail "CHECK-A8: npm audit found an unallowlisted vulnerability"
+  fi
+}
+audit_npm
+
+if git grep -n -E 'X-User-ID|x_user_id|get_user_id' -- ':!api/tests/**' ':!scripts/**' >/dev/null 2>&1; then
+  fail "CHECK-A9: forbidden identity reference exists in runtime or documentation"
+else
+  pass "CHECK-A9: no forbidden identity reference in runtime or documentation"
+fi
+
+if [ "$SKIP_DOCKER" = true ]; then
+  fail "CHECK-0: Docker checks were explicitly skipped"
+elif docker info >/dev/null 2>&1; then
+  pass "CHECK-0: Docker daemon available"
+else
+  fail "CHECK-0: Docker daemon is required"
+fi
+
+STACK_STARTED=false
+DB_CONTAINER=""
+db_query() {
+  local sql="$1"
+  [ -n "$DB_CONTAINER" ] || return 1
+  docker exec -e "PGPASSWORD=$DB_PASS" "$DB_CONTAINER" psql -h localhost -U "$DB_USER" -d "$DB_NAME" -t -A -v ON_ERROR_STOP=1 -c "$sql"
 }
 
-# ===========================================================================
-# Helper: count Set-Cookie headers for a cookie name
-# ===========================================================================
-count_cookie_headers() {
-  local headers_file="$1" cookie_name="$2"
-  grep -ci "^set-cookie:.*${cookie_name}=" "$headers_file" 2>/dev/null || echo "0"
-}
+if [ "$SKIP_DOCKER" = false ] && docker info >/dev/null 2>&1; then
+  if COMPOSE_CONFIG=$(compose config 2>&1); then
+    pass "CHECK-1: docker compose config is valid"
+  else
+    status=$?
+    fail "CHECK-1: docker compose config failed (exit $status): $(short_error "$COMPOSE_CONFIG")"
+  fi
 
-# ===========================================================================
-# Helper: start stack and wait for health
-# ===========================================================================
-start_stack() {
-  echo ""
-  echo "--- Starting full stack ---"
-  $COMPOSE down -v --remove-orphans 2>/dev/null || true
+  if DOWN_OUT=$(compose down -v --remove-orphans 2>&1); then
+    :
+  else
+    status=$?
+    fail "CHECK-2a: could not reset Docker Compose stack (exit $status): $(short_error "$DOWN_OUT")"
+  fi
+  if START_OUT=$(compose up -d --build 2>&1); then
+    STACK_STARTED=true
+    pass "CHECK-2: full stack startup command succeeded"
+  else
+    status=$?
+    fail "CHECK-2: full stack startup failed (exit $status): $(short_error "$START_OUT")"
+  fi
 
-  $COMPOSE up -d --build 2>&1 | tail -5
-
-  # Wait for DB
-  echo "  Waiting for PostgreSQL..."
   DB_READY=false
-  for i in $(seq 1 40); do
-    if $COMPOSE exec -T db pg_isready -U infinityscan -d infinityscan &>/dev/null 2>&1; then
+  for _ in $(seq 1 45); do
+    if compose exec -T db pg_isready -U "$DB_USER" -d "$DB_NAME" >/dev/null 2>&1; then
       DB_READY=true
       break
     fi
     sleep 1
   done
+  if [ "$DB_READY" = true ]; then
+    pass "CHECK-3: PostgreSQL is healthy"
+  else
+    fail "CHECK-3: PostgreSQL did not become healthy"
+  fi
 
-  # Wait for migrate
-  echo "  Waiting for migrations..."
-  MIGRATE_DONE=false
-  for i in $(seq 1 30); do
-    MIGRATE_STATUS=$($COMPOSE ps migrate --format '{{.State}}' 2>/dev/null || echo "unknown")
-    if [ "$MIGRATE_STATUS" = "exited (0)" ] || [ "$MIGRATE_STATUS" = "exited(0)" ]; then
-      MIGRATE_DONE=true
-      break
-    fi
-    sleep 1
-  done
+  DB_CONTAINER="$(compose ps -q db)"
+  MIGRATE_CONTAINER="$(compose ps -aq migrate)"
+  MIGRATE_EXIT="$(docker inspect "$MIGRATE_CONTAINER" --format '{{.State.ExitCode}}' 2>/dev/null || printf '%s' '-1')"
+  if [ "$MIGRATE_EXIT" = 0 ]; then
+    pass "CHECK-4: migration container exited 0"
+  else
+    fail "CHECK-4: migration container exit code is $MIGRATE_EXIT"
+  fi
 
-  # Wait for API
-  echo "  Waiting for API..."
-  API_READY=false
-  for i in $(seq 1 60); do
-    HTTP_CODE=$(curl -s -o /dev/null -w '%{http_code}' "$API_BASE/health" 2>/dev/null || echo "000")
-    if [ "$HTTP_CODE" = "200" ]; then
-      API_READY=true
-      break
-    fi
-    sleep 2
-  done
-
-  # Wait for web
-  echo "  Waiting for frontend..."
-  WEB_READY=false
-  for i in $(seq 1 40); do
-    WEB_CODE=$(curl -s -o /dev/null -w '%{http_code}' "$WEB_BASE" 2>/dev/null || echo "000")
-    if [ "$WEB_CODE" = "200" ] || [ "$WEB_CODE" = "301" ] || [ "$WEB_CODE" = "302" ]; then
-      WEB_READY=true
+  API_CODE=000
+  WEB_CODE=000
+  for _ in $(seq 1 60); do
+    API_CODE="$(curl -sS -o /dev/null -w '%{http_code}' "$API_BASE/health" 2>/dev/null || printf '000')"
+    WEB_CODE="$(curl -sS -o /dev/null -w '%{http_code}' "$WEB_BASE" 2>/dev/null || printf '000')"
+    if [ "$API_CODE" = 200 ] && [ "$WEB_CODE" = 200 ]; then
       break
     fi
     sleep 2
   done
+  if [ "$API_CODE" = 200 ]; then
+    pass "CHECK-5: API /health returns 200"
+  else
+    fail "CHECK-5: API /health returned $API_CODE"
+  fi
+  if [ "$WEB_CODE" = 200 ]; then
+    pass "CHECK-6: frontend returns 200"
+  else
+    fail "CHECK-6: frontend returned $WEB_CODE"
+  fi
+else
+  fail "CHECK-1 through CHECK-6: stack checks cannot run without Docker"
+fi
+
+COOKIE_HEADER() {
+  local headers_file="$1" cookie_name="$2"
+  grep -i "^set-cookie:.*${cookie_name}=" "$headers_file" 2>/dev/null | head -n 1 || true
+}
+cookie_attr() {
+  local headers_file="$1" cookie_name="$2" attr="$3" line lower
+  line="$(COOKIE_HEADER "$headers_file" "$cookie_name")"
+  lower="$(printf '%s' "$line" | tr '[:upper:]' '[:lower:]')"
+  case "$attr" in
+    httponly) [[ "$lower" =~ httponly ]] && printf true || printf false ;;
+    secure) printf '%s' "$lower" | grep -qE ';[[:space:]]*secure([;[:space:]]|$)' && printf true || printf false ;;
+    samesite) printf '%s' "$lower" | sed -n 's/.*samesite=\([^; ]*\).*/\1/p' ;;
+    path) printf '%s' "$lower" | sed -n 's/.*path=\([^; ]*\).*/\1/p' ;;
+    max-age) printf '%s' "$lower" | sed -n 's/.*max-age=\([^; ]*\).*/\1/p' ;;
+    *) printf '' ;;
+  esac
+}
+cookie_value() {
+  local jar="$1" name="$2"
+  awk -v wanted="$name" '$6 == wanted { print $7; exit }' "$jar" 2>/dev/null || true
+}
+get_csrf() {
+  local jar="$1" response="$2" code token
+  if ! code="$(curl -sS -c "$jar" -o "$response" -w '%{http_code}' "$API_BASE/auth/csrf")"; then
+    return 1
+  fi
+  [ "$code" = 200 ] || return 1
+  token="$(jq -r '.csrf_token // empty' "$response")"
+  [ -n "$token" ] || return 1
+  printf '%s' "$token"
+}
+login_user() {
+  local username="$1" password="$2" jar="$3" csrf response code
+  response="$TMPDIR/login-$(basename "$jar").json"
+  csrf="$(get_csrf "$jar" "$TMPDIR/csrf-$(basename "$jar").json")" || return 1
+  if ! code="$(curl -sS -b "$jar" -c "$jar" -o "$response" -w '%{http_code}' \
+      -H "X-CSRF-Token: $csrf" -H 'Content-Type: application/json' \
+      -d "{\"username\":\"$username\",\"password\":\"$password\"}" \
+      "$API_BASE/auth/login")"; then
+    return 1
+  fi
+  [ "$code" = 200 ]
 }
 
-# ===========================================================================
-# Helper: get CSRF token (pre-auth)
-# ===========================================================================
-get_preauth_csrf() {
-  local cookie_file="$1"
-  local resp_file="$2"
-  # GET /auth/csrf — returns {"csrf_token":"..."} and sets is_csrf cookie
-  curl -s -c "$cookie_file" "$API_BASE/auth/csrf" -o "$resp_file"
-  jq -r '.csrf_token // empty' "$resp_file"
-}
-
-# ===========================================================================
-# Helper: extract cookie value from cookie jar
-# ===========================================================================
-get_cookie_value() {
-  local cookie_file="$1" cookie_name="$2"
-  grep "$cookie_name" "$cookie_file" 2>/dev/null | awk '{print $NF}' | head -1
-}
-
-# ===========================================================================
-# CHECK 0: Docker daemon
-# ===========================================================================
-echo ""
-echo "--- Check 0: Docker daemon ---"
-if docker info &>/dev/null 2>&1; then
-  pass "CHECK-0: Docker daemon running"
+REG_USER="verify_user_$(date +%s)"
+REG_PASS='VerifyPass123!'
+REG_JAR="$TMPDIR/register.jar"
+REG_HEADERS="$TMPDIR/register.headers"
+REG_BODY="$TMPDIR/register.body"
+if REG_TOKEN="$(get_csrf "$REG_JAR" "$TMPDIR/register-csrf.json")"; then
+  pass "CHECK-7a: pre-auth CSRF obtained"
 else
-  fail "CHECK-0: Docker daemon not running"
-  SKIP_DOCKER=true
+  REG_TOKEN=''
+  fail "CHECK-7a: pre-auth CSRF could not be obtained"
 fi
-
-# ===========================================================================
-# CHECK 1: docker compose config valid
-# ===========================================================================
-echo ""
-echo "--- Check 1: docker compose config ---"
-if [ "$SKIP_DOCKER" = false ]; then
-  if $COMPOSE config &>/dev/null 2>&1; then
-    pass "CHECK-1: docker compose config valid"
+if [ -n "$REG_TOKEN" ] && REG_CODE="$(curl -sS -b "$REG_JAR" -c "$REG_JAR" -D "$REG_HEADERS" -o "$REG_BODY" -w '%{http_code}' \
+    -H "X-CSRF-Token: $REG_TOKEN" -H 'Content-Type: application/json' \
+    -d "{\"username\":\"$REG_USER\",\"password\":\"$REG_PASS\"}" \
+    "$API_BASE/auth/register")"; then
+  if [ "$REG_CODE" = 201 ]; then
+    pass "CHECK-7b: registration returned 201"
+    REG_USER_ID="$(jq -r '.user.id // empty' "$REG_BODY")"
   else
-    fail "CHECK-1: docker compose config invalid"
-    SKIP_DOCKER=true
+    fail "CHECK-7b: registration returned $REG_CODE"
   fi
+else
+  REG_CODE=000
+  fail "CHECK-7b: registration request failed"
 fi
 
-if [ "$SKIP_DOCKER" = true ]; then
-  skip "CHECK-2: Stack startup (requires Docker)"
-  skip "CHECK-3: API container healthy"
-  skip "CHECK-4: Migrate container succeeded"
-  skip "CHECK-5: Frontend container healthy"
-  skip "CHECK-6 through CHECK-31: All require running stack"
-  echo ""
-  echo "======================================"
-  echo "  Phase 2 Verification Summary"
-  echo "======================================"
-  echo ""
-  for r in "${RESULTS[@]}"; do
-    echo "  $r"
-  done
-  echo ""
-  echo -e "  ${GREEN}Passed: ${PASS_COUNT}${NC}"
-  echo -e "  ${RED}Failed: ${FAIL_COUNT}${NC}"
-  echo -e "  ${YELLOW}Skipped: ${SKIP_COUNT}${NC}"
-  echo ""
-  if [ "$FAIL_COUNT" -eq 0 ]; then
-    echo -e "${GREEN}Phase 2 gate: PASS (with skips)${NC}"
-    exit 0
+for cookie in is_access is_refresh is_csrf; do
+  if [ -n "$(cookie_value "$REG_JAR" "$cookie")" ]; then
+    pass "CHECK-7c: registration sets $cookie"
   else
-    echo -e "${RED}Phase 2 gate: FAIL${NC}"
-    exit 1
-  fi
-fi
-
-# ===========================================================================
-# CHECK 2: Stack startup
-# ===========================================================================
-echo ""
-echo "--- Check 2: Stack startup ---"
-start_stack
-if [ "$API_READY" = true ] && [ "$WEB_READY" = true ]; then
-  pass "CHECK-2: Full stack started (db + migrate + api + web)"
-else
-  if [ "$API_READY" != true ]; then
-    fail "CHECK-2a: API did not become healthy"
-    $COMPOSE logs api 2>&1 | tail -30
-  fi
-  if [ "$WEB_READY" != true ]; then
-    fail "CHECK-2b: Frontend did not become healthy"
-    $COMPOSE logs web 2>&1 | tail -30
-  fi
-fi
-
-# ===========================================================================
-# CHECK 3: API container healthy
-# ===========================================================================
-echo ""
-echo "--- Check 3: API container health ---"
-API_HEALTH=$($COMPOSE ps api --format '{{.Status}}' 2>/dev/null || echo "unknown")
-if echo "$API_HEALTH" | grep -qi "healthy"; then
-  pass "CHECK-3: API container reports healthy"
-elif [ "$API_READY" = true ]; then
-  pass "CHECK-3: API container responding (healthcheck may still be pending)"
-else
-  fail "CHECK-3: API container not healthy — status: $API_HEALTH"
-fi
-
-# ===========================================================================
-# CHECK 4: Migrate container succeeded
-# ===========================================================================
-echo ""
-echo "--- Check 4: Migration ---"
-MIGRATE_CONTAINER=$($COMPOSE ps -a migrate --format '{{.Name}}' 2>/dev/null | head -1)
-if [ -z "$MIGRATE_CONTAINER" ]; then
-  # Fallback: try to infer the container name from compose project name
-  MIGRATE_CONTAINER="infra-migrate-1"
-fi
-MIGRATE_EXIT=$(docker inspect "$MIGRATE_CONTAINER" --format '{{.State.ExitCode}}' 2>/dev/null || echo "-1")
-if [ "$MIGRATE_EXIT" = "0" ]; then
-  pass "CHECK-4: Migrate container completed (exit 0)"
-else
-  fail "CHECK-4: Migrate container failed (exit $MIGRATE_EXIT)"
-  $COMPOSE logs migrate 2>&1 | tail -30
-fi
-
-# ===========================================================================
-# CHECK 5: Frontend container healthy
-# ===========================================================================
-echo ""
-echo "--- Check 5: Frontend container ---"
-WEB_HEALTH=$($COMPOSE ps web --format '{{.Status}}' 2>/dev/null || echo "unknown")
-if echo "$WEB_HEALTH" | grep -qi "healthy"; then
-  pass "CHECK-5: Frontend container reports healthy"
-elif [ "$WEB_READY" = true ]; then
-  pass "CHECK-5: Frontend container responding"
-else
-  fail "CHECK-5: Frontend container not healthy — status: $WEB_HEALTH"
-fi
-
-# ===========================================================================
-# CHECK 6: Registration creates user + sets is_csrf cookie
-# ===========================================================================
-echo ""
-echo "--- Check 6: Registration ---"
-UNIQUE="v2test$(date +%s)"
-REG_USER="testuser_${UNIQUE}"
-REG_PASS="TestPass123!"
-REG_JAR="$TMPDIR/reg_cookies.txt"
-REG_HEADERS="$TMPDIR/reg_headers.txt"
-REG_BODY="$TMPDIR/reg_body.txt"
-
-# Get CSRF token first
-CSRF_TOKEN=$(get_preauth_csrf "$REG_JAR" "$TMPDIR/csrf_resp.json")
-if [ -z "$CSRF_TOKEN" ]; then
-  fail "CHECK-6a: Could not obtain pre-auth CSRF token"
-else
-  pass "CHECK-6a: Pre-auth CSRF token obtained"
-fi
-
-# Register
-HTTP_REG=$(curl -s -w '%{http_code}' -o "$REG_BODY" \
-  -D "$REG_HEADERS" \
-  -b "$REG_JAR" -c "$REG_JAR" \
-  -H "X-CSRF-Token: $CSRF_TOKEN" \
-  -H "Content-Type: application/json" \
-  -d "{\"username\":\"$REG_USER\",\"password\":\"$REG_PASS\"}" \
-  "$API_BASE/auth/register" 2>/dev/null || echo "000")
-
-if [ "$HTTP_REG" = "201" ]; then
-  pass "CHECK-6b: Registration returned 201"
-  REG_USER_ID=$(jq -r '.user.id // empty' "$REG_BODY")
-else
-  fail "CHECK-6b: Registration returned HTTP $HTTP_REG (expected 201)"
-  cat "$REG_BODY" 2>/dev/null
-fi
-
-# Verify CSRF cookie was obtained via /auth/csrf before registration
-# (Registration itself does not set cookies — CSRF flow precedes it)
-if [ -n "$CSRF_TOKEN" ]; then
-  pass "CHECK-6c: CSRF cookie obtained before registration (pre-auth flow)"
-else
-  fail "CHECK-6c: No CSRF token available before registration"
-fi
-
-# ===========================================================================
-# CHECK 7: Login sets is_access, is_refresh, is_csrf cookies
-# ===========================================================================
-echo ""
-echo "--- Check 7: Login cookies ---"
-LOGIN_JAR="$TMPDIR/login_cookies.txt"
-LOGIN_HEADERS="$TMPDIR/login_headers.txt"
-LOGIN_BODY="$TMPDIR/login_body.txt"
-
-# Get CSRF token for login
-CSRF_TOKEN=$(get_preauth_csrf "$LOGIN_JAR" "$TMPDIR/login_csrf.json")
-
-HTTP_LOGIN=$(curl -s -w '%{http_code}' -o "$LOGIN_BODY" \
-  -D "$LOGIN_HEADERS" \
-  -b "$LOGIN_JAR" -c "$LOGIN_JAR" \
-  -H "X-CSRF-Token: $CSRF_TOKEN" \
-  -H "Content-Type: application/json" \
-  -d "{\"username\":\"$REG_USER\",\"password\":\"$REG_PASS\"}" \
-  "$API_BASE/auth/login" 2>/dev/null || echo "000")
-
-if [ "$HTTP_LOGIN" = "200" ]; then
-  pass "CHECK-7a: Login returned 200"
-  LOGIN_USER_ID=$(jq -r '.user.id // empty' "$LOGIN_BODY")
-else
-  fail "CHECK-7a: Login returned HTTP $HTTP_LOGIN (expected 200)"
-  cat "$LOGIN_BODY" 2>/dev/null
-fi
-
-ACCESS_COOKIE=$(count_cookie_headers "$LOGIN_HEADERS" "is_access")
-REFRESH_COOKIE=$(count_cookie_headers "$LOGIN_HEADERS" "is_refresh")
-CSRF_COOKIE=$(count_cookie_headers "$LOGIN_HEADERS" "is_csrf")
-
-if [ "$ACCESS_COOKIE" -ge 1 ]; then
-  pass "CHECK-7b: Login sets is_access cookie"
-else
-  fail "CHECK-7b: Login missing is_access cookie"
-fi
-
-if [ "$REFRESH_COOKIE" -ge 1 ]; then
-  pass "CHECK-7c: Login sets is_refresh cookie"
-else
-  fail "CHECK-7c: Login missing is_refresh cookie"
-fi
-
-if [ "$CSRF_COOKIE" -ge 1 ]; then
-  pass "CHECK-7d: Login sets is_csrf cookie"
-else
-  fail "CHECK-7d: Login missing is_csrf cookie"
-fi
-
-# ===========================================================================
-# CHECK 8: Protected endpoint rejects unauthenticated requests
-# ===========================================================================
-echo ""
-echo "--- Check 8: Unauthenticated rejection ---"
-HTTP_ME_NOAUTH=$(curl -s -o /dev/null -w '%{http_code}' "$API_BASE/auth/me" 2>/dev/null || echo "000")
-if [ "$HTTP_ME_NOAUTH" = "401" ]; then
-  pass "CHECK-8: GET /auth/me without cookie returns 401"
-else
-  fail "CHECK-8: GET /auth/me without cookie returned $HTTP_ME_NOAUTH (expected 401)"
-fi
-
-# ===========================================================================
-# CHECK 9: CSRF validation — POST without header = 403, with header = 200
-# ===========================================================================
-echo ""
-echo "--- Check 9: CSRF validation ---"
-# First get a fresh CSRF token for the authenticated session
-CSRF_JAR="$TMPDIR/csrf_auth_cookies.txt"
-cp "$LOGIN_JAR" "$CSRF_JAR"
-CSRF_RESP="$TMPDIR/csrf_auth_resp.json"
-CSRF_AUTH_TOKEN=$(get_preauth_csrf "$CSRF_JAR" "$CSRF_RESP")
-
-# POST to /auth/logout without CSRF header (should be 401 or 403)
-# Without cookies, session check fails first (401); with cookies but no CSRF, CSRF fails (403)
-HTTP_NO_CSRF=$(curl -s -o /dev/null -w '%{http_code}' \
-  -b "$CSRF_JAR" \
-  -X POST \
-  "$API_BASE/auth/logout" 2>/dev/null || echo "000")
-
-if [ "$HTTP_NO_CSRF" = "401" ] || [ "$HTTP_NO_CSRF" = "403" ]; then
-  pass "CHECK-9a: POST /auth/logout without X-CSRF-Token returns $HTTP_NO_CSRF (auth/reject)"
-else
-  fail "CHECK-9a: POST /auth/logout without X-CSRF-Token returned $HTTP_NO_CSRF (expected 401 or 403)"
-fi
-
-# Use a fresh login for the positive CSRF check (since we haven't logged out yet in this jar)
-CSRF_POS_JAR="$TMPDIR/csrf_pos_cookies.txt"
-CSRF_POS_HEADERS="$TMPDIR/csrf_pos_headers.txt"
-CSRF_TOKEN2=$(get_preauth_csrf "$CSRF_POS_JAR" "$TMPDIR/csrf_pos_csrf.json")
-curl -s -o /dev/null -b "$CSRF_POS_JAR" -c "$CSRF_POS_JAR" \
-  -H "X-CSRF-Token: $CSRF_TOKEN2" \
-  -H "Content-Type: application/json" \
-  -d "{\"username\":\"$REG_USER\",\"password\":\"$REG_PASS\"}" \
-  "$API_BASE/auth/login" 2>/dev/null || true
-
-# Get a session-bound CSRF token via /auth/csrf (with session cookie)
-CSRF_SESSION_JAR="$TMPDIR/csrf_session_cookies.txt"
-cp "$CSRF_POS_JAR" "$CSRF_SESSION_JAR"
-CSRF_SESSION_RESP="$TMPDIR/csrf_session_resp.json"
-curl -s -b "$CSRF_SESSION_JAR" -c "$CSRF_SESSION_JAR" \
-  "$API_BASE/auth/csrf" -o "$CSRF_SESSION_RESP" 2>/dev/null || true
-SESSION_CSRF=$(jq -r '.csrf_token // empty' "$CSRF_SESSION_RESP")
-
-if [ -n "$SESSION_CSRF" ]; then
-  # POST to /auth/logout with CSRF header (should succeed)
-  HTTP_WITH_CSRF=$(curl -s -o /dev/null -w '%{http_code}' \
-    -b "$CSRF_SESSION_JAR" \
-    -H "X-CSRF-Token: $SESSION_CSRF" \
-    -X POST \
-    "$API_BASE/auth/logout" 2>/dev/null || echo "000")
-  if [ "$HTTP_WITH_CSRF" = "200" ]; then
-    pass "CHECK-9b: POST /auth/logout with valid X-CSRF-Token returns 200"
-  else
-    fail "CHECK-9b: POST /auth/logout with valid X-CSRF-Token returned $HTTP_WITH_CSRF (expected 200)"
-  fi
-else
-  skip "CHECK-9b: Could not obtain session-bound CSRF token"
-fi
-
-# ===========================================================================
-# CHECK 10: Refresh token rotation
-# ===========================================================================
-echo ""
-echo "--- Check 10: Refresh token rotation ---"
-ROT_JAR="$TMPDIR/rot_cookies.txt"
-ROT_HEADERS="$TMPDIR/rot_headers.txt"
-
-# Login fresh
-ROT_TOKEN=$(get_preauth_csrf "$ROT_JAR" "$TMPDIR/rot_csrf.json")
-curl -s -o /dev/null \
-  -b "$ROT_JAR" -c "$ROT_JAR" \
-  -H "X-CSRF-Token: $ROT_TOKEN" \
-  -H "Content-Type: application/json" \
-  -d "{\"username\":\"$REG_USER\",\"password\":\"$REG_PASS\"}" \
-  "$API_BASE/auth/login" 2>/dev/null || true
-
-# Save the old refresh cookie value
-OLD_REFRESH=$(get_cookie_value "$ROT_JAR" "is_refresh")
-
-# Get session-bound CSRF token for refresh
-ROT_CSRF_JAR="$TMPDIR/rot_csrf_auth.txt"
-cp "$ROT_JAR" "$ROT_CSRF_JAR"
-ROT_CSRF_RESP="$TMPDIR/rot_csrf_resp.json"
-curl -s -b "$ROT_CSRF_JAR" -c "$ROT_CSRF_JAR" \
-  "$API_BASE/auth/csrf" -o "$ROT_CSRF_RESP" 2>/dev/null || true
-ROT_CSRF=$(jq -r '.csrf_token // empty' "$ROT_CSRF_RESP")
-
-if [ -n "$ROT_CSRF" ]; then
-  # Call refresh
-  HTTP_REFRESH=$(curl -s -o /dev/null -w '%{http_code}' \
-    -D "$ROT_HEADERS" \
-    -b "$ROT_CSRF_JAR" -c "$ROT_CSRF_JAR" \
-    -H "X-CSRF-Token: $ROT_CSRF" \
-    -X POST \
-    "$API_BASE/auth/refresh" 2>/dev/null || echo "000")
-
-  if [ "$HTTP_REFRESH" = "200" ]; then
-    pass "CHECK-10a: POST /auth/refresh returned 200"
-  else
-    fail "CHECK-10a: POST /auth/refresh returned $HTTP_REFRESH (expected 200)"
-  fi
-
-  # Verify the old refresh token is now invalid by trying to use it
-  OLD_JAR="$TMPDIR/rot_old_cookies.txt"
-  # Manually write old refresh cookie into jar
-  echo "localhost	FALSE	/	FALSE	0	is_refresh	$OLD_REFRESH" > "$OLD_JAR"
-  # Copy access cookie from current jar
-  get_cookie_value "$ROT_CSRF_JAR" "is_access" | while read -r val; do
-    [ -n "$val" ] && echo "localhost	FALSE	/	FALSE	0	is_access	$val" >> "$OLD_JAR"
-  done
-  # Copy CSRF cookie from current jar
-  get_cookie_value "$ROT_CSRF_JAR" "is_csrf" | while read -r val; do
-    [ -n "$val" ] && echo "localhost	FALSE	/	FALSE	0	is_csrf	$val" >> "$OLD_JAR"
-  done
-
-  # Get session-bound CSRF for the old token attempt
-  OLD_CSRF_RESP="$TMPDIR/old_csrf_resp.json"
-  curl -s -b "$OLD_JAR" -c "$OLD_JAR" "$API_BASE/auth/csrf" -o "$OLD_CSRF_RESP" 2>/dev/null || true
-  # The old refresh token should make the session invalid, so /auth/csrf may not work
-  # Try using old refresh cookie directly for refresh
-  HTTP_OLD_REFRESH=$(curl -s -o /dev/null -w '%{http_code}' \
-    -b "$OLD_JAR" -c "$OLD_JAR" \
-    -H "X-CSRF-Token: $(jq -r '.csrf_token // empty' "$OLD_CSRF_RESP")" \
-    -X POST \
-    "$API_BASE/auth/refresh" 2>/dev/null || echo "000")
-
-  if [ "$HTTP_OLD_REFRESH" = "401" ]; then
-    pass "CHECK-10b: Old refresh token is rejected after rotation"
-  elif [ "$HTTP_OLD_REFRESH" = "403" ]; then
-    # 403 could be CSRF failure — check if the old token is actually revoked
-    # Try with a fresh CSRF flow
-    pass "CHECK-10b: Old refresh token effectively rejected (403 CSRF — token likely revoked)"
-  else
-    fail "CHECK-10b: Old refresh token returned $HTTP_OLD_REFRESH (expected 401)"
-  fi
-else
-  skip "CHECK-10a: Could not obtain session-bound CSRF token for refresh"
-  skip "CHECK-10b: Skipped (depends on CHECK-10a)"
-fi
-
-# ===========================================================================
-# CHECK 11: is_access cookie attributes
-# ===========================================================================
-echo ""
-echo "--- Check 11: is_access cookie attributes ---"
-# Re-login to get fresh headers
-ATTR_JAR="$TMPDIR/attr_cookies.txt"
-ATTR_HEADERS="$TMPDIR/attr_headers.txt"
-ATTR_TOKEN=$(get_preauth_csrf "$ATTR_JAR" "$TMPDIR/attr_csrf.json")
-curl -s -o /dev/null \
-  -D "$ATTR_HEADERS" \
-  -b "$ATTR_JAR" -c "$ATTR_JAR" \
-  -H "X-CSRF-Token: $ATTR_TOKEN" \
-  -H "Content-Type: application/json" \
-  -d "{\"username\":\"$REG_USER\",\"password\":\"$REG_PASS\"}" \
-  "$API_BASE/auth/login" 2>/dev/null || true
-
-ACC_HTTPONLY=$(get_cookie_attr "$ATTR_HEADERS" "is_access" "httponly")
-ACC_SECURE=$(get_cookie_attr "$ATTR_HEADERS" "is_access" "secure")
-ACC_SAMESITE=$(get_cookie_attr "$ATTR_HEADERS" "is_access" "samesite")
-ACC_PATH=$(get_cookie_attr "$ATTR_HEADERS" "is_access" "path")
-ACC_MAXAGE=$(get_cookie_attr "$ATTR_HEADERS" "is_access" "max-age")
-
-if [ "$ACC_HTTPONLY" = "true" ]; then
-  pass "CHECK-11a: is_access cookie has HttpOnly"
-else
-  fail "CHECK-11a: is_access cookie missing HttpOnly"
-fi
-
-if [ "$ACC_SECURE" = "true" ]; then
-  pass "CHECK-11b: is_access cookie has Secure"
-else
-  # In development, Secure may be false — this is expected
-  pass "CHECK-11b: is_access cookie Secure=$ACC_SECURE (dev mode — Secure may be off)"
-fi
-
-if [ -n "$ACC_SAMESITE" ]; then
-  pass "CHECK-11c: is_access cookie has SameSite=$ACC_SAMESITE"
-else
-  fail "CHECK-11c: is_access cookie missing SameSite attribute"
-fi
-
-if [ -n "$ACC_PATH" ]; then
-  pass "CHECK-11d: is_access cookie has Path=$ACC_PATH"
-else
-  fail "CHECK-11d: is_access cookie missing Path attribute"
-fi
-
-if [ -n "$ACC_MAXAGE" ] && [ "$ACC_MAXAGE" -gt 0 ] 2>/dev/null; then
-  pass "CHECK-11e: is_access cookie has Max-Age=$ACC_MAXAGE"
-else
-  fail "CHECK-11e: is_access cookie missing or zero Max-Age"
-fi
-
-# ===========================================================================
-# CHECK 12: is_refresh cookie attributes
-# ===========================================================================
-echo ""
-echo "--- Check 12: is_refresh cookie attributes ---"
-REF_HTTPONLY=$(get_cookie_attr "$ATTR_HEADERS" "is_refresh" "httponly")
-REF_SECURE=$(get_cookie_attr "$ATTR_HEADERS" "is_refresh" "secure")
-REF_SAMESITE=$(get_cookie_attr "$ATTR_HEADERS" "is_refresh" "samesite")
-REF_PATH=$(get_cookie_attr "$ATTR_HEADERS" "is_refresh" "path")
-REF_MAXAGE=$(get_cookie_attr "$ATTR_HEADERS" "is_refresh" "max-age")
-
-if [ "$REF_HTTPONLY" = "true" ]; then
-  pass "CHECK-12a: is_refresh cookie has HttpOnly"
-else
-  fail "CHECK-12a: is_refresh cookie missing HttpOnly"
-fi
-
-if [ "$REF_SECURE" = "true" ]; then
-  pass "CHECK-12b: is_refresh cookie has Secure"
-else
-  pass "CHECK-12b: is_refresh cookie Secure=$REF_SECURE (dev mode)"
-fi
-
-if [ -n "$REF_SAMESITE" ]; then
-  pass "CHECK-12c: is_refresh cookie has SameSite=$REF_SAMESITE"
-else
-  fail "CHECK-12c: is_refresh cookie missing SameSite attribute"
-fi
-
-if [ -n "$REF_PATH" ]; then
-  pass "CHECK-12d: is_refresh cookie has Path=$REF_PATH"
-else
-  fail "CHECK-12d: is_refresh cookie missing Path attribute"
-fi
-
-if [ -n "$REF_MAXAGE" ] && [ "$REF_MAXAGE" -gt 0 ] 2>/dev/null; then
-  pass "CHECK-12e: is_refresh cookie has Max-Age=$REF_MAXAGE"
-else
-  fail "CHECK-12e: is_refresh cookie missing or zero Max-Age"
-fi
-
-# ===========================================================================
-# CHECK 13: is_csrf cookie NOT HttpOnly
-# ===========================================================================
-echo ""
-echo "--- Check 13: is_csrf cookie attributes ---"
-CSRF_HTTPONLY=$(get_cookie_attr "$ATTR_HEADERS" "is_csrf" "httponly")
-CSRF_SECURE=$(get_cookie_attr "$ATTR_HEADERS" "is_csrf" "secure")
-CSRF_SAMESITE=$(get_cookie_attr "$ATTR_HEADERS" "is_csrf" "samesite")
-
-if [ "$CSRF_HTTPONLY" = "false" ]; then
-  pass "CHECK-13a: is_csrf cookie is NOT HttpOnly (JS-readable)"
-else
-  fail "CHECK-13a: is_csrf cookie should NOT be HttpOnly"
-fi
-
-if [ "$CSRF_SECURE" = "true" ]; then
-  pass "CHECK-13b: is_csrf cookie has Secure"
-else
-  pass "CHECK-13b: is_csrf cookie Secure=$CSRF_SECURE (dev mode)"
-fi
-
-if [ -n "$CSRF_SAMESITE" ]; then
-  pass "CHECK-13c: is_csrf cookie has SameSite=$CSRF_SAMESITE"
-else
-  fail "CHECK-13c: is_csrf cookie missing SameSite attribute"
-fi
-
-# ===========================================================================
-# CHECK 14: Max-Age set on access and refresh cookies
-# ===========================================================================
-echo ""
-echo "--- Check 14: Cookie Max-Age values ---"
-if [ -n "$ACC_MAXAGE" ] && [ "$ACC_MAXAGE" -gt 0 ] 2>/dev/null && \
-   [ -n "$REF_MAXAGE" ] && [ "$REF_MAXAGE" -gt 0 ] 2>/dev/null; then
-  pass "CHECK-14: Both access (Max-Age=$ACC_MAXAGE) and refresh (Max-Age=$REF_MAXAGE) have Max-Age"
-else
-  fail "CHECK-14: Missing Max-Age on access ($ACC_MAXAGE) or refresh ($REF_MAXAGE) cookie"
-fi
-
-# ===========================================================================
-# CHECK 15: No tokens in JSON response body
-# ===========================================================================
-echo ""
-echo "--- Check 15: Token secrecy ---"
-LOGIN_BODY_FULL="$TMPDIR/token_secrecy_body.txt"
-CSRF_JAR2="$TMPDIR/token_secrecy_cookies.txt"
-TS_TOKEN=$(get_preauth_csrf "$CSRF_JAR2" "$TMPDIR/ts_csrf.json")
-curl -s -o "$LOGIN_BODY_FULL" \
-  -b "$CSRF_JAR2" -c "$CSRF_JAR2" \
-  -H "X-CSRF-Token: $TS_TOKEN" \
-  -H "Content-Type: application/json" \
-  -d "{\"username\":\"$REG_USER\",\"password\":\"$REG_PASS\"}" \
-  "$API_BASE/auth/login" 2>/dev/null || true
-
-BODY_HAS_TOKEN=false
-if jq -e '.access_token // .refresh_token // .token // .access // .refresh' "$LOGIN_BODY_FULL" &>/dev/null 2>&1; then
-  BODY_HAS_TOKEN=true
-fi
-# Also check raw text for JWT-like patterns (three base64 segments separated by dots)
-if grep -qE 'eyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\.' "$LOGIN_BODY_FULL" 2>/dev/null; then
-  BODY_HAS_TOKEN=true
-fi
-
-if [ "$BODY_HAS_TOKEN" = false ]; then
-  pass "CHECK-15: Login response body contains no tokens"
-else
-  fail "CHECK-15: Login response body leaks token(s)"
-fi
-
-# ===========================================================================
-# CHECK 16-20: Two-user data isolation
-# ===========================================================================
-echo ""
-echo "--- Checks 16-20: Two-user isolation ---"
-
-# Register User B
-UNIQUE_B="v2testb$(date +%s)"
-REG_USER_B="testuser_${UNIQUE_B}"
-CSRF_JAR_B="$TMPDIR/userb_csrf.txt"
-CSRF_B_TOKEN=$(get_preauth_csrf "$CSRF_JAR_B" "$TMPDIR/csrf_b.json")
-HTTP_REG_B=$(curl -s -o /dev/null -w '%{http_code}' \
-  -b "$CSRF_JAR_B" -c "$CSRF_JAR_B" \
-  -H "X-CSRF-Token: $CSRF_B_TOKEN" \
-  -H "Content-Type: application/json" \
-  -d "{\"username\":\"$REG_USER_B\",\"password\":\"$REG_PASS\"}" \
-  "$API_BASE/auth/register" 2>/dev/null || echo "000")
-
-if [ "$HTTP_REG_B" = "201" ]; then
-  pass "CHECK-16: User B registered successfully"
-else
-  fail "CHECK-16: User B registration returned HTTP $HTTP_REG_B"
-fi
-
-# Login User A
-USERA_JAR="$TMPDIR/usera_auth.txt"
-UA_TOKEN=$(get_preauth_csrf "$USERA_JAR" "$TMPDIR/ua_csrf.json")
-curl -s -o /dev/null \
-  -b "$USERA_JAR" -c "$USERA_JAR" \
-  -H "X-CSRF-Token: $UA_TOKEN" \
-  -H "Content-Type: application/json" \
-  -d "{\"username\":\"$REG_USER\",\"password\":\"$REG_PASS\"}" \
-  "$API_BASE/auth/login" 2>/dev/null || true
-
-# Login User B
-USERB_JAR="$TMPDIR/userb_auth.txt"
-UB_TOKEN=$(get_preauth_csrf "$USERB_JAR" "$TMPDIR/ub_csrf.json")
-curl -s -o /dev/null \
-  -b "$USERB_JAR" -c "$USERB_JAR" \
-  -H "X-CSRF-Token: $UB_TOKEN" \
-  -H "Content-Type: application/json" \
-  -d "{\"username\":\"$REG_USER_B\",\"password\":\"$REG_PASS\"}" \
-  "$API_BASE/auth/login" 2>/dev/null || true
-
-# User A: create a bookmark
-UA_CSRF_JAR="$TMPDIR/usera_csrf.txt"
-cp "$USERA_JAR" "$UA_CSRF_JAR"
-curl -s -b "$UA_CSRF_JAR" -c "$UA_CSRF_JAR" "$API_BASE/auth/csrf" -o "$TMPDIR/ua_csrf_resp.json" 2>/dev/null || true
-UA_CSRF=$(jq -r '.csrf_token // empty' "$TMPDIR/ua_csrf_resp.json")
-
-if [ -n "$UA_CSRF" ]; then
-  curl -s -o /dev/null \
-    -b "$UA_CSRF_JAR" \
-    -H "X-CSRF-Token: $UA_CSRF" \
-    -H "Content-Type: application/json" \
-    -d '{"series_path_word":"test-isolation-series","series_name":"Test Isolation"}' \
-    "$API_BASE/bookmarks" -X POST 2>/dev/null || true
-fi
-
-# User A: list bookmarks (should have at least one)
-UA_BOOKMARKS=$(curl -s -b "$UA_CSRF_JAR" "$API_BASE/bookmarks" 2>/dev/null || echo "[]")
-UA_BM_COUNT=$(echo "$UA_BOOKMARKS" | jq 'length' 2>/dev/null || echo "0")
-
-# User B: list bookmarks (should be empty — different user)
-UB_BOOKMARKS=$(curl -s -b "$USERB_JAR" "$API_BASE/bookmarks" 2>/dev/null || echo "[]")
-UB_BM_COUNT=$(echo "$UB_BOOKMARKS" | jq 'length' 2>/dev/null || echo "0")
-
-if [ "$UA_BM_COUNT" -gt 0 ] 2>/dev/null; then
-  pass "CHECK-17a: User A has bookmarks ($UA_BM_COUNT)"
-else
-  # Bookmark creation may have failed due to CSRF — check if endpoint is protected
-  pass "CHECK-17a: User A bookmark count=$UA_BM_COUNT (may be 0 if CSRF/series creation failed)"
-fi
-
-if [ "$UB_BM_COUNT" = "0" ] 2>/dev/null; then
-  pass "CHECK-17b: User B cannot see User A bookmarks (count=0)"
-else
-  fail "CHECK-17b: User B can see User A bookmarks (count=$UB_BM_COUNT)"
-fi
-
-# CHECK 18: Reading progress isolation
-# User A: upsert progress
-UA_CHAPTER="00000000-0000-0000-0000-000000000001"
-if [ -n "$UA_CSRF" ]; then
-  curl -s -o /dev/null \
-    -b "$UA_CSRF_JAR" \
-    -H "X-CSRF-Token: $UA_CSRF" \
-    -H "Content-Type: application/json" \
-    -d '{"last_page":5,"scroll_position":100.0,"completed":false}' \
-    "$API_BASE/progress/test-series/$UA_CHAPTER" -X POST 2>/dev/null || true
-fi
-
-# User B: read same chapter progress (should get default/empty)
-UB_PROGRESS=$(curl -s -b "$USERB_JAR" "$API_BASE/progress/test-series/$UA_CHAPTER" 2>/dev/null || echo "{}")
-UB_LAST_PAGE=$(echo "$UB_PROGRESS" | jq -r '.last_page // "null"' 2>/dev/null || echo "null")
-
-if [ "$UB_LAST_PAGE" = "null" ] || [ "$UB_LAST_PAGE" = "0" ] || [ "$UB_LAST_PAGE" = "" ]; then
-  pass "CHECK-18: User B cannot see User A reading progress (last_page=$UB_LAST_PAGE)"
-else
-  fail "CHECK-18: User B sees User A progress (last_page=$UB_LAST_PAGE)"
-fi
-
-# CHECK 19: User B cannot access User A private endpoints (direct user_id access is not exposed,
-# so we verify by checking /auth/me returns User B's own data)
-UB_ME=$(curl -s -b "$USERB_JAR" "$API_BASE/auth/me" 2>/dev/null || echo "{}")
-UB_ME_USERNAME=$(echo "$UB_ME" | jq -r '.username // empty' 2>/dev/null || echo "")
-
-if [ "$UB_ME_USERNAME" = "$REG_USER_B" ]; then
-  pass "CHECK-19: User B /auth/me returns own identity ($UB_ME_USERNAME)"
-else
-  fail "CHECK-19: User B /auth/me returned unexpected username: $UB_ME_USERNAME"
-fi
-
-# CHECK 20: Logout invalidates session
-# Logout User B
-UB_CSRF_JAR="$TMPDIR/userb_csrf.txt"
-cp "$USERB_JAR" "$UB_CSRF_JAR"
-curl -s -b "$UB_CSRF_JAR" -c "$UB_CSRF_JAR" "$API_BASE/auth/csrf" -o "$TMPDIR/ub_csrf_resp.json" 2>/dev/null || true
-UB_CSRF=$(jq -r '.csrf_token // empty' "$TMPDIR/ub_csrf_resp.json")
-
-if [ -n "$UB_CSRF" ]; then
-  curl -s -o /dev/null \
-    -b "$UB_CSRF_JAR" \
-    -H "X-CSRF-Token: $UB_CSRF" \
-    -X POST \
-    "$API_BASE/auth/logout" 2>/dev/null || true
-fi
-
-# Try accessing /auth/me after logout (should be 401)
-HTTP_AFTER_LOGOUT=$(curl -s -o /dev/null -w '%{http_code}' \
-  -b "$UB_CSRF_JAR" \
-  "$API_BASE/auth/me" 2>/dev/null || echo "000")
-
-if [ "$HTTP_AFTER_LOGOUT" = "401" ]; then
-  pass "CHECK-20: POST /auth/logout invalidates session (401 after logout)"
-else
-  fail "CHECK-20: POST /auth/logout did not invalidate session (got $HTTP_AFTER_LOGOUT)"
-fi
-
-# ===========================================================================
-# CHECK 21-25: Public access preserved
-# ===========================================================================
-echo ""
-echo "--- Checks 21-25: Public access ---"
-
-# CHECK 21: Health endpoint
-HTTP_HEALTH=$(curl -s -o /dev/null -w '%{http_code}' "$API_BASE/health" 2>/dev/null || echo "000")
-if [ "$HTTP_HEALTH" = "200" ]; then
-  pass "CHECK-21: GET /health returns 200 (no auth required)"
-else
-  fail "CHECK-21: GET /health returned $HTTP_HEALTH (expected 200)"
-fi
-
-# CHECK 22: Series endpoint (public browse)
-HTTP_SERIES=$(curl -s -o /dev/null -w '%{http_code}' "$API_BASE/series" 2>/dev/null || echo "000")
-if [ "$HTTP_SERIES" = "200" ] || [ "$HTTP_SERIES" = "502" ]; then
-  # 502 is acceptable if CopyManga is unreachable
-  pass "CHECK-22: GET /series returns HTTP $HTTP_SERIES (public browse works)"
-else
-  fail "CHECK-22: GET /series returned $HTTP_SERIES"
-fi
-
-# CHECK 23: Root serves HTML
-HTTP_ROOT=$(curl -s -o /dev/null -w '%{http_code}' "$WEB_BASE" 2>/dev/null || echo "000")
-ROOT_CT=$(curl -s -I "$WEB_BASE" 2>/dev/null | grep -i content-type | head -1 || true)
-if [ "$HTTP_ROOT" = "200" ] || [ "$HTTP_ROOT" = "301" ] || [ "$HTTP_ROOT" = "302" ]; then
-  pass "CHECK-23: Frontend root returns HTTP $HTTP_ROOT (serves HTML)"
-else
-  fail "CHECK-23: Frontend root returned $HTTP_ROOT"
-fi
-
-# CHECK 24: Static assets accessible (check _next/static or similar)
-HTTP_STATIC=$(curl -s -o /dev/null -w '%{http_code}' "$WEB_BASE/_next/static" 2>/dev/null || echo "000")
-# _next/static may 301 to a hash directory; any non-500 is acceptable
-if [ "$HTTP_STATIC" != "500" ] && [ "$HTTP_STATIC" != "000" ]; then
-  pass "CHECK-24: Static assets accessible (HTTP $HTTP_STATIC)"
-else
-  # Try the login page which should have static assets
-  HTTP_LOGIN_PAGE=$(curl -s -o /dev/null -w '%{http_code}' "$WEB_BASE/login" 2>/dev/null || echo "000")
-  if [ "$HTTP_LOGIN_PAGE" = "200" ] || [ "$HTTP_LOGIN_PAGE" = "301" ] || [ "$HTTP_LOGIN_PAGE" = "302" ]; then
-    pass "CHECK-24: Frontend pages accessible without auth (login=$HTTP_LOGIN_PAGE)"
-  else
-    fail "CHECK-24: Frontend not accessible (static=$HTTP_STATIC, login=$HTTP_LOGIN_PAGE)"
-  fi
-fi
-
-# CHECK 25: No user data in unauthenticated response headers
-UNAUTH_HEADERS="$TMPDIR/unauth_headers.txt"
-curl -s -o /dev/null -D "$UNAUTH_HEADERS" "$API_BASE/health" 2>/dev/null || true
-HAS_USER_HEADER=false
-if grep -qi "x-user-id\|x-auth-user\|x-current-user" "$UNAUTH_HEADERS" 2>/dev/null; then
-  HAS_USER_HEADER=true
-fi
-
-if [ "$HAS_USER_HEADER" = false ]; then
-  pass "CHECK-25: No user-identifying headers in unauthenticated response"
-else
-  fail "CHECK-25: Response leaks user-identifying headers"
-fi
-
-# ===========================================================================
-# CHECK 26-28: Frontend serves auth pages
-# ===========================================================================
-echo ""
-echo "--- Checks 26-28: Frontend auth pages ---"
-
-# CHECK 26: /login serves HTML with form
-HTTP_LOGIN_PAGE=$(curl -s -o /dev/null -w '%{http_code}' "$WEB_BASE/login" 2>/dev/null || echo "000")
-LOGIN_HTML=$(curl -s "$WEB_BASE/login" 2>/dev/null || echo "")
-if echo "$LOGIN_HTML" | grep -qi "login\|password\|username\|sign.in"; then
-  pass "CHECK-26: /login serves HTML with login form"
-elif [ "$HTTP_LOGIN_PAGE" = "200" ]; then
-  pass "CHECK-26: /login returns 200"
-else
-  fail "CHECK-26: /login not accessible (HTTP $HTTP_LOGIN_PAGE)"
-fi
-
-# CHECK 27: /register serves HTML with form
-HTTP_REG_PAGE=$(curl -s -o /dev/null -w '%{http_code}' "$WEB_BASE/register" 2>/dev/null || echo "000")
-REG_HTML=$(curl -s "$WEB_BASE/register" 2>/dev/null || echo "")
-if echo "$REG_HTML" | grep -qi "register\|create.account\|password\|username"; then
-  pass "CHECK-27: /register serves HTML with register form"
-elif [ "$HTTP_REG_PAGE" = "200" ]; then
-  pass "CHECK-27: /register returns 200"
-else
-  fail "CHECK-27: /register not accessible (HTTP $HTTP_REG_PAGE)"
-fi
-
-# CHECK 28: API calls use credentials:include (verified via CORS headers)
-HTTP_CORS=$(curl -s -I -X OPTIONS \
-  -H "Origin: http://localhost:3000" \
-  -H "Access-Control-Request-Method: POST" \
-  -H "Access-Control-Request-Headers: Content-Type, X-CSRF-Token" \
-  "$API_BASE/auth/login" 2>/dev/null || echo "")
-if echo "$HTTP_CORS" | grep -qi "access-control-allow-credentials: true"; then
-  pass "CHECK-28: CORS allows credentials (Access-Control-Allow-Credentials: true)"
-else
-  # Check if CORS middleware is returning the right headers at all
-  if echo "$HTTP_CORS" | grep -qi "access-control-allow-origin"; then
-    pass "CHECK-28: CORS configured (credentials header may be implicit for same-origin)"
-  else
-    fail "CHECK-28: CORS not configured for frontend origin"
-  fi
-fi
-
-# ===========================================================================
-# CHECK 29: Rate limiting (429 after threshold)
-# ===========================================================================
-echo ""
-echo "--- Check 29: Rate limiting ---"
-# The register rate limit is 5/minute. Send 7 rapid requests to trigger 429.
-RATE_429_FOUND=false
-for i in $(seq 1 7); do
-  RATE_RESP=$(curl -s -o /dev/null -w '%{http_code}' \
-    -H "Content-Type: application/json" \
-    -d "{\"username\":\"rate_limit_probe_${i}_$(date +%s%N)\",\"password\":\"RateLimitTest1!\"}" \
-    "$API_BASE/auth/register" 2>/dev/null || echo "000")
-  if [ "$RATE_RESP" = "429" ]; then
-    RATE_429_FOUND=true
-    break
+    fail "CHECK-7c: registration missing $cookie"
   fi
 done
-
-if [ "$RATE_429_FOUND" = true ]; then
-  pass "CHECK-29: Rate limiting returns 429 after threshold"
+REG_ME_BODY="$TMPDIR/register-me.body"
+if REG_ME_CODE="$(curl -sS -b "$REG_JAR" -o "$REG_ME_BODY" -w '%{http_code}' "$API_BASE/auth/me")" && [ "$REG_ME_CODE" = 200 ] && [ "$(jq -r '.username // empty' "$REG_ME_BODY")" = "$REG_USER" ]; then
+  pass "CHECK-7d: /auth/me succeeds immediately after registration"
 else
-  # Rate limits may be very high in test config — check if the endpoint works at all
-  pass "CHECK-29: Rate limiting configured (threshold not reached in 7 requests — may be high test limit)"
+  fail "CHECK-7d: /auth/me did not confirm the registration session"
+fi
+if jq -e '.access_token // .refresh_token // .token // .access // .refresh' "$REG_BODY" >/dev/null 2>&1 || grep -qE 'eyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\.' "$REG_BODY"; then
+  fail "CHECK-7e: registration response contains a token"
+else
+  pass "CHECK-7e: registration response contains no token"
 fi
 
-# ===========================================================================
-# CHECK 30: Origin validation (403 from untrusted origin with cookies)
-# ===========================================================================
-echo ""
-echo "--- Check 30: Origin validation ---"
-# Send a POST with cookies and an untrusted Origin header
-ORIGIN_RESP=$(curl -s -o /dev/null -w '%{http_code}' \
-  -b "$USERA_JAR" \
-  -H "Origin: https://evil.example.com" \
-  -H "Content-Type: application/json" \
-  -d '{}' \
-  "$API_BASE/auth/logout" 2>/dev/null || echo "000")
-
-if [ "$ORIGIN_RESP" = "403" ]; then
-  pass "CHECK-30: Origin validation blocks untrusted origin (403)"
+LOGIN_JAR="$TMPDIR/login.jar"
+LOGIN_HEADERS="$TMPDIR/login.headers"
+LOGIN_BODY="$TMPDIR/login.body"
+if login_user "$REG_USER" "$REG_PASS" "$LOGIN_JAR"; then
+  pass "CHECK-8: login succeeds"
 else
-  fail "CHECK-30: Origin validation did not block untrusted origin (got $ORIGIN_RESP)"
+  fail "CHECK-8: login failed"
+fi
+if [ -f "$LOGIN_JAR" ]; then
+  for cookie in is_access is_refresh is_csrf; do
+    if [ -n "$(cookie_value "$LOGIN_JAR" "$cookie")" ]; then
+      pass "CHECK-8a: login jar contains $cookie"
+    else
+      fail "CHECK-8a: login jar missing $cookie"
+    fi
+  done
 fi
 
-# ===========================================================================
-# CHECK 31: X-User-ID header ignored
-# ===========================================================================
-echo ""
-echo "--- Check 31: X-User-ID ignored ---"
-# Login User A again
-XUID_JAR="$TMPDIR/xuid_cookies.txt"
-XUID_TOKEN=$(get_preauth_csrf "$XUID_JAR" "$TMPDIR/xuid_csrf.json")
-curl -s -o /dev/null \
-  -b "$XUID_JAR" -c "$XUID_JAR" \
-  -H "X-CSRF-Token: $XUID_TOKEN" \
-  -H "Content-Type: application/json" \
-  -d "{\"username\":\"$REG_USER\",\"password\":\"$REG_PASS\"}" \
-  "$API_BASE/auth/login" 2>/dev/null || true
+NO_AUTH_CODE="$(curl -sS -o /dev/null -w '%{http_code}' -X POST "$API_BASE/auth/logout" 2>/dev/null || printf '000')"
+if [ "$NO_AUTH_CODE" = 401 ]; then
+  pass "CHECK-9a: unauthenticated unsafe request returns 401"
+else
+  fail "CHECK-9a: unauthenticated unsafe request returned $NO_AUTH_CODE"
+fi
+NO_CSRF_CODE="$(curl -sS -b "$LOGIN_JAR" -o /dev/null -w '%{http_code}' -X POST "$API_BASE/auth/logout" 2>/dev/null || printf '000')"
+if [ "$NO_CSRF_CODE" = 403 ]; then
+  pass "CHECK-9b: authenticated unsafe request without CSRF header returns exactly 403"
+else
+  fail "CHECK-9b: authenticated unsafe request without CSRF header returned $NO_CSRF_CODE"
+fi
+BAD_CSRF_CODE="$(curl -sS -b "$LOGIN_JAR" -H 'X-CSRF-Token: invalid-token' -o /dev/null -w '%{http_code}' -X POST "$API_BASE/auth/logout" 2>/dev/null || printf '000')"
+if [ "$BAD_CSRF_CODE" = 403 ]; then
+  pass "CHECK-9c: authenticated unsafe request with invalid CSRF returns exactly 403"
+else
+  fail "CHECK-9c: invalid CSRF returned $BAD_CSRF_CODE"
+fi
 
-# GET /auth/me with X-User-ID header (should still return User A, not impersonate)
-ME_WITH_HEADER=$(curl -s -b "$XUID_JAR" -H "X-User-ID: fake-uuid" "$API_BASE/auth/me" 2>/dev/null || echo "{}")
-ME_USERNAME=$(echo "$ME_WITH_HEADER" | jq -r '.username // empty' 2>/dev/null || echo "")
-
-if [ "$ME_USERNAME" = "$REG_USER" ]; then
-  pass "CHECK-31: X-User-ID header is ignored (returns own identity)"
-elif [ -z "$ME_USERNAME" ]; then
-  # May be 401 due to invalid session
-  HTTP_XUID=$(curl -s -o /dev/null -w '%{http_code}' -b "$XUID_JAR" -H "X-User-ID: fake-uuid" "$API_BASE/auth/me" 2>/dev/null || echo "000")
-  if [ "$HTTP_XUID" = "401" ]; then
-    pass "CHECK-31: X-User-ID header is ignored (request rejected — no identity confusion)"
+ROT_JAR="$TMPDIR/rotation.jar"
+if login_user "$REG_USER" "$REG_PASS" "$ROT_JAR"; then
+  OLD_REFRESH="$(cookie_value "$ROT_JAR" is_refresh)"
+  OLD_ACCESS="$(cookie_value "$ROT_JAR" is_access)"
+  OLD_CSRF="$(cookie_value "$ROT_JAR" is_csrf)"
+  SESSION_INFO="$(db_query "SELECT id::text || '|' || family_id::text FROM refresh_sessions WHERE user_id = '$REG_USER_ID' ORDER BY created_at DESC LIMIT 1;")"
+  OLD_SESSION_ID="${SESSION_INFO%%|*}"
+  FAMILY_ID="${SESSION_INFO#*|}"
+  REFRESH_CODE="$(curl -sS -b "$ROT_JAR" -c "$ROT_JAR" -H "X-CSRF-Token: $OLD_CSRF" -o /dev/null -w '%{http_code}' -X POST "$API_BASE/auth/refresh")"
+  if [ "$REFRESH_CODE" = 200 ]; then
+    pass "CHECK-10a: refresh rotation returns 200"
   else
-    fail "CHECK-31: X-User-ID caused unexpected behavior (HTTP $HTTP_XUID)"
+    fail "CHECK-10a: refresh rotation returned $REFRESH_CODE"
+  fi
+  OLD_REVOKED="$(db_query "SELECT (revoked_at IS NOT NULL)::text FROM refresh_sessions WHERE id = '$OLD_SESSION_ID';")"
+  if [ "$OLD_REVOKED" = true ] || [ "$OLD_REVOKED" = t ]; then
+    pass "CHECK-10b: rotated old session is revoked in PostgreSQL"
+  else
+    fail "CHECK-10b: rotated old session is not revoked in PostgreSQL"
+  fi
+  NEW_ACCESS="$(cookie_value "$ROT_JAR" is_access)"
+  NEW_CSRF="$(cookie_value "$ROT_JAR" is_csrf)"
+  REUSE_JAR="$TMPDIR/reuse.jar"
+  printf '# Netscape HTTP Cookie File\nlocalhost\tFALSE\t/\tFALSE\t0\tis_refresh\t%s\nlocalhost\tFALSE\t/\tFALSE\t0\tis_access\t%s\nlocalhost\tFALSE\t/\tFALSE\t0\tis_csrf\t%s\n' "$OLD_REFRESH" "$NEW_ACCESS" "$NEW_CSRF" > "$REUSE_JAR"
+  REUSE_CODE="$(curl -sS -b "$REUSE_JAR" -H "X-CSRF-Token: $NEW_CSRF" -o /dev/null -w '%{http_code}' -X POST "$API_BASE/auth/refresh")"
+  if [ "$REUSE_CODE" = 401 ]; then
+    pass "CHECK-10c: old refresh token reuse returns exactly 401"
+  else
+    fail "CHECK-10c: old refresh token reuse returned $REUSE_CODE"
+  fi
+  ACTIVE_FAMILY="$(db_query "SELECT count(*) FROM refresh_sessions WHERE family_id = '$FAMILY_ID' AND revoked_at IS NULL;")"
+  if [ "$ACTIVE_FAMILY" = 0 ]; then
+    pass "CHECK-10d: refresh reuse revoked every active session in the family"
+  else
+    fail "CHECK-10d: refresh family still has $ACTIVE_FAMILY active sessions"
   fi
 else
-  fail "CHECK-31: X-User-ID header influenced identity (got $ME_USERNAME instead of $REG_USER)"
+  fail "CHECK-10: could not create a session for refresh verification"
 fi
 
-# ===========================================================================
-# Summary
-# ===========================================================================
+USERA_JAR="$TMPDIR/usera.jar"
+USERB_REG_JAR="$TMPDIR/userb-registration.jar"
+USERB_JAR="$TMPDIR/userb.jar"
+USER_B="verify_user_b_$(date +%s)"
+USER_B_PASS='VerifyPass456!'
+if B_TOKEN="$(get_csrf "$USERB_REG_JAR" "$TMPDIR/userb-csrf.json")" && B_REG_CODE="$(curl -sS -b "$USERB_REG_JAR" -c "$USERB_REG_JAR" -H "X-CSRF-Token: $B_TOKEN" -H 'Content-Type: application/json' -d "{\"username\":\"$USER_B\",\"password\":\"$USER_B_PASS\"}" -o /dev/null -w '%{http_code}' "$API_BASE/auth/register")" && [ "$B_REG_CODE" = 201 ]; then
+  pass "CHECK-11a: User B registration succeeds"
+else
+  fail "CHECK-11a: User B registration failed"
+fi
+rm -f "$USERB_JAR"
+if login_user "$REG_USER" "$REG_PASS" "$USERA_JAR"; then
+  pass "CHECK-11b: User A login succeeds"
+else
+  fail "CHECK-11b: User A login failed"
+fi
+if login_user "$USER_B" "$USER_B_PASS" "$USERB_JAR"; then
+  pass "CHECK-11c: User B login succeeds"
+else
+  fail "CHECK-11c: User B login failed"
+fi
+
+SERIES_SLUG="verify-series-$(date +%s%N)"
+UA_CSRF="$(cookie_value "$USERA_JAR" is_csrf)"
+UA_BM_BODY="$TMPDIR/usera-bookmark.json"
+UA_BM_CODE="$(curl -sS -b "$USERA_JAR" -H "X-CSRF-Token: $UA_CSRF" -H 'Content-Type: application/json' -d "{\"series_path_word\":\"$SERIES_SLUG\",\"series_name\":\"Verifier Series\"}" -o "$UA_BM_BODY" -w '%{http_code}' -X POST "$API_BASE/bookmarks")"
+if [ "$UA_BM_CODE" = 201 ]; then
+  pass "CHECK-12a: User A bookmark creation returns documented 201"
+else
+  fail "CHECK-12a: User A bookmark creation returned $UA_BM_CODE"
+fi
+UA_BOOKMARKS="$TMPDIR/usera-bookmarks.json"
+UB_BOOKMARKS="$TMPDIR/userb-bookmarks.json"
+UA_LIST_CODE="$(curl -sS -b "$USERA_JAR" -o "$UA_BOOKMARKS" -w '%{http_code}' "$API_BASE/bookmarks")"
+UB_LIST_CODE="$(curl -sS -b "$USERB_JAR" -o "$UB_BOOKMARKS" -w '%{http_code}' "$API_BASE/bookmarks")"
+UA_BM_COUNT="$(jq 'length' "$UA_BOOKMARKS")"
+UB_BM_COUNT="$(jq 'length' "$UB_BOOKMARKS")"
+if [ "$UA_LIST_CODE" = 200 ] && [ "$UA_BM_COUNT" -gt 0 ]; then
+  pass "CHECK-12b: User A bookmark count is greater than zero ($UA_BM_COUNT)"
+else
+  fail "CHECK-12b: User A bookmark list failed or is empty (HTTP $UA_LIST_CODE, count $UA_BM_COUNT)"
+fi
+if [ "$UB_LIST_CODE" = 200 ] && [ "$UB_BM_COUNT" = 0 ]; then
+  pass "CHECK-12c: User B cannot see User A bookmarks"
+else
+  fail "CHECK-12c: User B bookmark isolation failed (HTTP $UB_LIST_CODE, count $UB_BM_COUNT)"
+fi
+
+SERIES_ID="$(db_query "SELECT id::text FROM series WHERE slug = '$SERIES_SLUG';")"
+CHAPTER_UUID="$(python3 -c 'import uuid; print(uuid.uuid4())')"
+if [ -n "$SERIES_ID" ] && db_query "INSERT INTO chapters (id, series_id, number, language) VALUES ('$CHAPTER_UUID', '$SERIES_ID', 1.0, 'en');" >/dev/null; then
+  pass "CHECK-13a: seeded real Series and Chapter in PostgreSQL"
+else
+  fail "CHECK-13a: could not seed real Series and Chapter"
+fi
+UA_PROGRESS_CSRF="$(cookie_value "$USERA_JAR" is_csrf)"
+UB_PROGRESS_CSRF="$(cookie_value "$USERB_JAR" is_csrf)"
+PROGRESS_BODY="$TMPDIR/progress.json"
+PROGRESS_CODE="$(curl -sS -b "$USERA_JAR" -H "X-CSRF-Token: $UA_PROGRESS_CSRF" -H 'Content-Type: application/json' -d "{\"chapter_uuid\":\"$CHAPTER_UUID\",\"last_page\":5,\"scroll_position\":0.5,\"completed\":false}" -o "$PROGRESS_BODY" -w '%{http_code}' -X POST "$API_BASE/progress/$SERIES_SLUG/$CHAPTER_UUID")"
+if [ "$PROGRESS_CODE" = 200 ]; then
+  pass "CHECK-13b: User A saved valid progress"
+else
+  fail "CHECK-13b: User A progress save returned $PROGRESS_CODE"
+fi
+UA_PROGRESS_GET="$TMPDIR/usera-progress.json"
+UA_PROGRESS_GET_CODE="$(curl -sS -b "$USERA_JAR" -o "$UA_PROGRESS_GET" -w '%{http_code}' "$API_BASE/progress/$SERIES_SLUG/$CHAPTER_UUID")"
+if [ "$UA_PROGRESS_GET_CODE" = 200 ] && [ "$(jq -r '.scroll_position' "$UA_PROGRESS_GET")" = 0.5 ]; then
+  pass "CHECK-13c: User A reads saved progress successfully"
+else
+  fail "CHECK-13c: User A could not read saved progress"
+fi
+UB_PROGRESS_GET="$TMPDIR/userb-progress.json"
+UB_PROGRESS_GET_CODE="$(curl -sS -b "$USERB_JAR" -o "$UB_PROGRESS_GET" -w '%{http_code}' "$API_BASE/progress/$SERIES_SLUG/$CHAPTER_UUID")"
+if [ "$UB_PROGRESS_GET_CODE" = 200 ] && [ "$(jq -r '.scroll_position' "$UB_PROGRESS_GET")" = null ]; then
+  pass "CHECK-13d: User B cannot see User A progress"
+else
+  fail "CHECK-13d: User B can see User A progress"
+fi
+UB_PROGRESS_CODE="$(curl -sS -b "$USERB_JAR" -H "X-CSRF-Token: $UB_PROGRESS_CSRF" -H 'Content-Type: application/json' -d "{\"chapter_uuid\":\"$CHAPTER_UUID\",\"last_page\":9,\"scroll_position\":0.9,\"completed\":true}" -o /dev/null -w '%{http_code}' -X POST "$API_BASE/progress/$SERIES_SLUG/$CHAPTER_UUID")"
+UA_PROGRESS_AFTER="$TMPDIR/usera-progress-after.json"
+curl -sS -b "$USERA_JAR" -o "$UA_PROGRESS_AFTER" "$API_BASE/progress/$SERIES_SLUG/$CHAPTER_UUID" >/dev/null
+if [ "$UB_PROGRESS_CODE" = 200 ] && [ "$(jq -r '.scroll_position' "$UA_PROGRESS_AFTER")" = 0.5 ]; then
+  pass "CHECK-13e: User B cannot overwrite User A progress"
+else
+  fail "CHECK-13e: User B progress mutation affected User A"
+fi
+
+SERIES_CODE="$(curl -sS -o "$TMPDIR/series.json" -w '%{http_code}' "$API_BASE/series")"
+if [ "$SERIES_CODE" = 200 ]; then
+  pass "CHECK-14: public GET /series without search query returns 200"
+else
+  fail "CHECK-14: public GET /series returned $SERIES_CODE"
+fi
+ROOT_HTML="$TMPDIR/root.html"
+ROOT_CODE="$(curl -sS -o "$ROOT_HTML" -w '%{http_code}' "$WEB_BASE")"
+ASSET_URL="$(grep -oE '/_next/static/[^" ]+\.(js|css)(\?[^" ]*)?' "$ROOT_HTML" | sed -n '1p')"
+if [ -z "$ASSET_URL" ]; then
+  fail "CHECK-15a: no concrete /_next/static asset URL found in returned HTML"
+else
+  ASSET_CODE="$(curl -sS -o /dev/null -w '%{http_code}' "$WEB_BASE$ASSET_URL")"
+  if [ "$ASSET_CODE" = 200 ]; then
+    pass "CHECK-15a: concrete static asset returns 200"
+  else
+    fail "CHECK-15a: concrete static asset returned $ASSET_CODE"
+  fi
+fi
+if [ "$ROOT_CODE" = 200 ]; then
+  pass "CHECK-15b: frontend root returns 200"
+else
+  fail "CHECK-15b: frontend root returned $ROOT_CODE"
+fi
+
+USERA_ME="$TMPDIR/usera-me.json"
+SPOOF_CODE="$(curl -sS -b "$USERA_JAR" -H 'X-User-ID: 00000000-0000-0000-0000-000000000000' -o "$USERA_ME" -w '%{http_code}' "$API_BASE/auth/me")"
+if [ "$SPOOF_CODE" = 200 ] && [ "$(jq -r '.username' "$USERA_ME")" = "$REG_USER" ]; then
+  pass "CHECK-16: identity spoof header cannot change authenticated user"
+else
+  fail "CHECK-16: identity spoof test returned unexpected identity/status"
+fi
+
+if [ -x web/node_modules/.bin/playwright ]; then
+  if PLAYWRIGHT_OUT=$(API_URL="$API_BASE" WEB_URL="$WEB_BASE" npm --prefix web run test:e2e -- e2e/auth-flow.spec.ts 2>&1); then
+    pass "CHECK-20: Playwright authentication tests"
+  else
+    status=$?
+    fail "CHECK-20: Playwright authentication tests failed (exit $status): $(short_error "$PLAYWRIGHT_OUT")"
+  fi
+else
+  fail "CHECK-20: Playwright is unavailable; authentication tests are mandatory when tooling exists"
+fi
+
+RATE_CSRF="$(cookie_value "$USERA_JAR" is_csrf)"
+RATE_429=false
+RATE_INVALID=false
+for i in $(seq 1 40); do
+  RATE_CODE="$(curl -sS -b "$USERA_JAR" -H "X-CSRF-Token: $RATE_CSRF" -H 'Content-Type: application/json' -d "{\"series_path_word\":\"rate-series-$i-$(date +%s%N)\",\"series_name\":\"Rate Series\"}" -o /dev/null -w '%{http_code}' -X POST "$API_BASE/bookmarks")"
+  if [ "$RATE_CODE" = 429 ]; then
+    RATE_429=true
+    break
+  elif [ "$RATE_CODE" != 201 ]; then
+    RATE_INVALID=true
+  fi
+done
+if [ "$RATE_429" = true ] && [ "$RATE_INVALID" = false ]; then
+  pass "CHECK-17: valid limited requests reach HTTP 429"
+else
+  fail "CHECK-17: rate limit did not produce 429 after valid requests"
+fi
+
+if PROD_COOKIE_OUT="$(cd api && env APP_ENV=production DATABASE_URL=sqlite:/// CSRF_SECRET_KEY=prod-csrf-secret-012345678901234567890123456789 JWT_SECRET_KEY=prod-jwt-secret-012345678901234567890123456789 COOKIE_SECURE=true COOKIE_SAME_SITE=lax "$API_PYTHON" - <<'PY'
+import uuid
+
+from fastapi import Response
+
+from routes.auth import _set_auth_cookies
+
+response = Response()
+_set_auth_cookies(response, "access", "refresh", uuid.uuid4())
+cookies = response.headers.getlist("set-cookie")
+assert len(cookies) == 3, cookies
+for name in ("is_access", "is_refresh", "is_csrf"):
+    matching = [cookie for cookie in cookies if cookie.startswith(name + "=")]
+    assert matching and "; Secure" in matching[0], matching
+print("OK")
+PY
+  )"; then
+  pass "CHECK-18: production configuration sets Secure on access, refresh, and CSRF cookies"
+else
+  fail "CHECK-18: production cookie security check failed"
+fi
+
+ORIGIN_CODE="$(curl -sS -b "$USERA_JAR" -H 'Origin: https://evil.example.com' -H 'Content-Type: application/json' -d '{}' -o /dev/null -w '%{http_code}' -X POST "$API_BASE/auth/logout")"
+if [ "$ORIGIN_CODE" = 403 ]; then
+  pass "CHECK-19: untrusted Origin is rejected with 403"
+else
+  fail "CHECK-19: untrusted Origin returned $ORIGIN_CODE"
+fi
+
 echo ""
 echo "======================================"
 echo "  Phase 2 Verification Summary"
 echo "======================================"
-echo ""
-for r in "${RESULTS[@]}"; do
-  echo "  $r"
+for result in "${RESULTS[@]}"; do
+  printf '  %s\n' "$result"
 done
-echo ""
-echo -e "  ${GREEN}Passed: ${PASS_COUNT}${NC}"
-echo -e "  ${RED}Failed: ${FAIL_COUNT}${NC}"
-echo -e "  ${YELLOW}Skipped: ${SKIP_COUNT}${NC}"
-echo ""
-
-if [ "$FAIL_COUNT" -gt 0 ]; then
-  echo -e "${RED}Failed checks:${NC}"
-  for c in "${FAILED_CHECKS[@]}"; do
-    echo -e "  ${RED}- $c${NC}"
-  done
-  echo ""
-fi
-
-if [ "$FAIL_COUNT" -eq 0 ]; then
-  echo -e "${GREEN}Phase 2 gate: PASS${NC}"
+printf 'Passed: %d\nFailed: %d\nSkipped: %d\n' "$PASS_COUNT" "$FAIL_COUNT" "$SKIP_COUNT"
+if [ "$FAIL_COUNT" -eq 0 ] && [ "$SKIP_COUNT" -eq 0 ]; then
+  printf '%bPhase 2 gate: PASS%b\n' "$GREEN" "$NC"
   exit 0
-else
-  echo -e "${RED}Phase 2 gate: FAIL${NC}"
-  exit 1
 fi
+printf '%bPhase 2 gate: FAIL%b\n' "$RED" "$NC"
+exit 1
