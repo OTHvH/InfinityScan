@@ -28,15 +28,13 @@ import os
 import sys
 import uuid
 from contextlib import asynccontextmanager
-from datetime import datetime, timedelta, timezone
-from typing import Annotated, Any
+from typing import Any
 
 import httpx
 from fastapi import Body, Depends, FastAPI, HTTPException, Path, Query, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.responses import JSONResponse
-from starlette.middleware.base import BaseHTTPMiddleware
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session, joinedload
 from slowapi.errors import RateLimitExceeded
@@ -54,32 +52,12 @@ from models import (
     ReadingMode,
     ReadingProgress,
     RefreshSession,
-    RefreshToken,
     Series,
     SeriesStatus,
     User,
     UserRole,
 )
-from auth import (
-    create_access_token,
-    decode_access_token,
-    generate_csrf_token,
-    generate_refresh_token,
-    hash_password,
-    hash_refresh_token,
-    set_cookie,
-    clear_cookie,
-    verify_and_update_password,
-)
-from auth.schemas import (
-    LoginIn,
-    LoginOut,
-    RegisterIn,
-    RegisterOut,
-    UserOut,
-)
-from session import issue_access_token, issue_refresh_session, rotate_refresh_token
-from deps import get_current_user, require_csrf, require_role
+from deps import get_current_user, require_csrf
 from schemas import (
     BookmarkIn,
     BookmarkOut,
@@ -253,59 +231,6 @@ async def _fetch_chapter_pages(path_word: str, chapter_uuid: str) -> ChapterPage
     )
 
 
-def _set_auth_cookies(response: Response, access_token: str, refresh_token: str, session_id: uuid.UUID) -> None:
-    """Set access, refresh, and session-bound CSRF cookies on *response*."""
-    cfg = get_settings()
-    set_cookie(response, cfg.access_cookie_name, access_token,
-               max_age=cfg.access_token_ttl_minutes * 60)
-    set_cookie(response, cfg.refresh_cookie_name, refresh_token,
-               max_age=cfg.refresh_token_ttl_days * 86400)
-    csrf = generate_csrf_token(session_id)
-    set_cookie(response, cfg.csrf_cookie_name, csrf,
-               max_age=cfg.csrf_token_ttl_seconds,
-               http_only=False)
-
-
-def _clear_auth_cookies(response: Response) -> None:
-    cfg = get_settings()
-    clear_cookie(response, cfg.access_cookie_name)
-    clear_cookie(response, cfg.refresh_cookie_name)
-    clear_cookie(response, cfg.csrf_cookie_name)
-
-
-def _user_to_out(user: User) -> UserOut:
-    return UserOut(
-        id=str(user.id),
-        username=user.username,
-        email=user.email,
-        role=user.role.value,
-        is_active=user.is_active,
-        created_at=user.created_at.isoformat() if user.created_at else "",
-    )
-
-
-def _issue_refresh_token(db: Session, user: User) -> str:
-    """Generate, hash, and store a refresh token.  Returns the raw token."""
-    raw = generate_refresh_token()
-    db.add(RefreshToken(
-        user_id=user.id,
-        token_hash=hash_refresh_token(raw),
-        expires_at=datetime.now(timezone.utc) + timedelta(days=get_settings().refresh_token_ttl_days),
-    ))
-    db.commit()
-    return raw
-
-
-def _revoke_all_refresh_tokens(db: Session, user: User) -> None:
-    from sqlalchemy import update
-    db.execute(
-        update(RefreshToken)
-        .where(RefreshToken.user_id == user.id, RefreshToken.revoked == False)  # noqa: E712
-        .values(revoked=True)
-    )
-    db.commit()
-
-
 # ---------------------------------------------------------------------------
 # Routes — health
 # ---------------------------------------------------------------------------
@@ -314,157 +239,6 @@ def _revoke_all_refresh_tokens(db: Session, user: User) -> None:
 @app.get("/health")
 def health() -> dict:
     return {"status": "ok"}
-
-
-# ---------------------------------------------------------------------------
-# Routes — deprecated legacy authentication (use /auth/* instead)
-# ---------------------------------------------------------------------------
-
-
-@app.post(
-    "/register",
-    response_model=RegisterOut,
-    summary="[DEPRECATED] Use POST /auth/register instead",
-    include_in_schema=True,
-)
-@limiter.limit(_cfg.register_rate_limit)
-def register(
-    request: Request,
-    body: RegisterIn = Body(...),
-    db: Session = Depends(get_db),
-) -> RegisterOut:
-    if db.scalar(select(User).where(User.username == body.username)):
-        raise HTTPException(status_code=400, detail="Username already registered")
-
-    if body.email and db.scalar(select(User).where(User.email == body.email)):
-        raise HTTPException(status_code=400, detail="Email already registered")
-
-    try:
-        hashed = hash_password(body.password)
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
-
-    user = User(
-        username=body.username,
-        email=body.email,
-        hashed_password=hashed,
-        role=UserRole.user,
-    )
-    db.add(user)
-    db.commit()
-    db.refresh(user)
-
-    return RegisterOut(user=_user_to_out(user))
-
-
-@app.post(
-    "/token",
-    response_model=LoginOut,
-    summary="[DEPRECATED] Use POST /auth/login instead",
-    include_in_schema=True,
-)
-@limiter.limit(_cfg.login_rate_limit)
-def login(
-    request: Request,
-    response: Response,
-    body: LoginIn = Body(...),
-    db: Session = Depends(get_db),
-) -> LoginOut:
-    user = db.scalar(select(User).where(User.username == body.username))
-    if not user:
-        raise HTTPException(status_code=401, detail="Incorrect username or password")
-
-    success, new_hash = verify_and_update_password(body.password, user.hashed_password)
-    if not success:
-        raise HTTPException(status_code=401, detail="Incorrect username or password")
-
-    if not user.is_active:
-        raise HTTPException(status_code=403, detail="User account is disabled")
-
-    if new_hash is not None:
-        user.hashed_password = new_hash
-        db.commit()
-
-    user_agent = request.headers.get("User-Agent", "")
-    raw_refresh, session_id = issue_refresh_session(db, user_id=user.id, user_agent=user_agent)
-    access = issue_access_token(user.id, session_id, user.role.value)
-
-    _set_auth_cookies(response, access, raw_refresh, session_id)
-    return LoginOut(user=_user_to_out(user))
-
-
-@app.post(
-    "/logout",
-    summary="[DEPRECATED] Use POST /auth/logout instead",
-    include_in_schema=True,
-)
-@limiter.limit(_cfg.logout_rate_limit)
-def logout(
-    request: Request,
-    response: Response,
-    user: User = Depends(get_current_user),
-    _csrf: None = Depends(require_csrf),
-    db: Session = Depends(get_db),
-) -> dict:
-    raw_refresh: str | None = request.cookies.get(_cfg.refresh_cookie_name)
-    if raw_refresh:
-        token_hash = hash_refresh_token(raw_refresh)
-        session = db.scalar(
-            select(RefreshSession).where(RefreshSession.token_hash == token_hash)
-        )
-        if session and session.revoked_at is None:
-            session.revoked_at = datetime.now(timezone.utc)
-            db.commit()
-
-    _clear_auth_cookies(response)
-    return {"detail": "Logged out"}
-
-
-@app.post(
-    "/refresh",
-    summary="[DEPRECATED] Use POST /auth/refresh instead",
-    include_in_schema=True,
-)
-@limiter.limit(_cfg.refresh_rate_limit)
-def refresh_token(
-    request: Request,
-    response: Response,
-    db: Session = Depends(get_db),
-) -> dict:
-    raw_refresh: str | None = request.cookies.get(_cfg.refresh_cookie_name)
-    if not raw_refresh:
-        raise HTTPException(status_code=401, detail="No refresh token")
-
-    user_agent = request.headers.get("User-Agent", "")
-    result = rotate_refresh_token(db, raw_refresh, user_agent=user_agent)
-
-    if result is None:
-        _clear_auth_cookies(response)
-        raise HTTPException(status_code=401, detail="Invalid or expired refresh token")
-
-    new_raw, new_session_id = result
-    token_hash = hash_refresh_token(raw_refresh)
-    old_session = db.scalar(
-        select(RefreshSession).where(RefreshSession.token_hash == token_hash)
-    )
-    user = db.scalar(select(User).where(User.id == old_session.user_id))
-    if not user or not user.is_active:
-        _clear_auth_cookies(response)
-        raise HTTPException(status_code=401, detail="User not found or disabled")
-
-    access = issue_access_token(user.id, new_session_id, user.role.value)
-    _set_auth_cookies(response, access, new_raw, new_session_id)
-    return {"detail": "Token refreshed"}
-
-
-@app.get(
-    "/me",
-    response_model=UserOut,
-    summary="[DEPRECATED] Use GET /auth/me instead",
-    include_in_schema=True,
-)
-def get_me(user: User = Depends(get_current_user)) -> UserOut:
-    return _user_to_out(user)
 
 
 # ---------------------------------------------------------------------------

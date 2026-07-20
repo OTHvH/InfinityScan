@@ -83,23 +83,6 @@ def verify_and_update_password(plain: str, hashed: str) -> tuple[bool, str | Non
 # ── JWT access tokens ───────────────────────────────────────────────────────
 
 
-def create_access_token(user_id: uuid.UUID, role: str) -> str:
-    """Create a short-lived JWT carrying the user id and role."""
-    cfg = get_settings()
-    now = datetime.now(timezone.utc)
-    expire = now + timedelta(minutes=cfg.access_token_ttl_minutes)
-    payload = {
-        "sub": str(user_id),
-        "role": role,
-        "iat": now,
-        "exp": expire,
-        "jti": secrets.token_hex(16),
-        "iss": cfg.jwt_issuer,
-        "aud": cfg.jwt_audience,
-    }
-    return jwt.encode(payload, cfg.secret_key, algorithm=cfg.jwt_algorithm)
-
-
 def decode_access_token(token: str) -> dict | None:
     """Decode and validate a JWT. Returns the payload dict or None."""
     cfg = get_settings()

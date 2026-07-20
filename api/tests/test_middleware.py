@@ -201,8 +201,8 @@ class TestNoCacheAuthMiddleware:
         assert "no-store" not in cache_control
 
     def test_legacy_auth_endpoints_have_no_cache(self, client):
-        """/me (legacy) should have Cache-Control: no-store."""
-        resp = client.get("/me")
+        """/auth/me (canonical) should have Cache-Control: no-store."""
+        resp = client.get("/auth/me")
         assert resp.headers.get("cache-control") == "no-store"
         assert resp.headers.get("pragma") == "no-cache"
 

@@ -19,6 +19,7 @@ import pytest
 from sqlalchemy import select
 
 from models import User, UserRole
+from conftest import _do_login, _do_register
 
 
 class TestArgon2idHashing:
@@ -114,10 +115,7 @@ class TestLegacyBcryptCompatibility:
         assert bc.startswith("$2")
 
         # Login via the endpoint
-        resp = client.post("/token", json={
-            "username": "legacyuser",
-            "password": "strongpassword123",
-        })
+        resp = _do_login(client, "legacyuser", "strongpassword123")
         assert resp.status_code == 200
 
         # Refresh from DB and confirm hash was upgraded
@@ -129,10 +127,7 @@ class TestPasswordNeverInResponses:
     """Password hashes never leak in API responses."""
 
     def test_register_response_has_no_hash(self, client):
-        resp = client.post("/register", json={
-            "username": "noleak1",
-            "password": "strongpassword123",
-        })
+        resp = _do_register(client, "noleak1", "strongpassword123")
         body = resp.json()
         user = body["user"]
         assert "hashed_password" not in user
@@ -142,10 +137,7 @@ class TestPasswordNeverInResponses:
 
     def test_login_response_has_no_hash(self, client, user_factory):
         user_factory(username="noleak2", password="pass12345")
-        resp = client.post("/token", json={
-            "username": "noleak2",
-            "password": "pass12345",
-        })
+        resp = _do_login(client, "noleak2", "pass12345")
         body = resp.json()
         user = body["user"]
         assert "hashed_password" not in user
@@ -154,8 +146,8 @@ class TestPasswordNeverInResponses:
 
     def test_me_response_has_no_hash(self, client, user_factory):
         user_factory(username="noleak3", password="pass12345")
-        client.post("/token", json={"username": "noleak3", "password": "pass12345"})
-        resp = client.get("/me")
+        _do_login(client, "noleak3", "pass12345")
+        resp = client.get("/auth/me")
         body = resp.json()
         assert "hashed_password" not in body
         assert "password" not in body

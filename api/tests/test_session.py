@@ -564,6 +564,30 @@ class TestAuthRefresh:
         resp = client.post("/auth/refresh")
         assert resp.status_code == 401
 
+    def test_concurrent_refresh_attempts(self, client, user_factory, db):
+        self._login(client, user_factory, "concurrent_user")
+        original_refresh = client.cookies.get("is_refresh")
+        cfg = get_settings()
+        csrf = client.cookies.get("is_csrf")
+
+        resp = client.post("/auth/refresh", headers={"X-CSRF-Token": csrf})
+        assert resp.status_code == 200
+
+        new_csrf = None
+        for raw in resp.headers.get_list("set-cookie"):
+            if raw.startswith(cfg.csrf_cookie_name + "="):
+                new_csrf = raw.split("=", 1)[1].split(";")[0]
+                break
+        assert new_csrf is not None
+
+        client.cookies.delete(cfg.refresh_cookie_name)
+        client.cookies.set(cfg.refresh_cookie_name, original_refresh)
+        client.cookies.delete(cfg.csrf_cookie_name)
+        client.cookies.set(cfg.csrf_cookie_name, new_csrf)
+
+        resp2 = client.post("/auth/refresh", headers={"X-CSRF-Token": new_csrf})
+        assert resp2.status_code == 401
+
     def test_refresh_reuse_detection(self, client, user_factory, db):
         self._login(client, user_factory)
         refresh1 = client.cookies.get("is_refresh")
@@ -654,6 +678,21 @@ class TestAuthLogout:
         resp = client.post("/auth/logout")
         assert resp.status_code == 403
 
+    def test_repeated_logout_safe(self, client, user_factory):
+        self._login(client, user_factory)
+        csrf = client.cookies.get("is_csrf")
+        resp1 = client.post(
+            "/auth/logout",
+            headers={"x-csrf-token": csrf} if csrf else {},
+        )
+        assert resp1.status_code == 200
+
+        resp2 = client.post(
+            "/auth/logout",
+            headers={"x-csrf-token": csrf} if csrf else {},
+        )
+        assert resp2.status_code in (200, 401)
+
 
 class TestAuthLogoutAll:
     def _login(self, client, user_factory, username: str = "logoutalltest"):
@@ -725,6 +764,73 @@ class TestAuthMe:
         resp = client.get("/auth/me")
         assert resp.status_code == 401
 
+    def test_me_missing_exp_claim(self, client, user_factory):
+        user = user_factory(username="expmissing")
+        cfg = get_settings()
+
+        payload = {
+            "sub": str(user.id),
+            "sid": str(uuid.uuid4()),
+            "role": "user",
+            "iat": datetime.now(timezone.utc),
+            "nbf": datetime.now(timezone.utc),
+            "jti": "deadbeef",
+            "iss": cfg.jwt_issuer,
+            "aud": cfg.jwt_audience,
+        }
+        token = jwt.encode(payload, cfg.secret_key, algorithm=cfg.jwt_algorithm)
+        client.cookies.set(cfg.access_cookie_name, token)
+
+        resp = client.get("/auth/me")
+        assert resp.status_code == 401
+
+    def test_me_wrong_type_claim(self, client, user_factory):
+        user = user_factory(username="wrongtype")
+        cfg = get_settings()
+        now = datetime.now(timezone.utc)
+
+        payload = {
+            "sub": str(user.id),
+            "sid": str(uuid.uuid4()),
+            "role": "user",
+            "type": "refresh",
+            "iat": now,
+            "nbf": now,
+            "exp": now + timedelta(hours=1),
+            "jti": "deadbeef",
+            "iss": cfg.jwt_issuer,
+            "aud": cfg.jwt_audience,
+        }
+        token = jwt.encode(payload, cfg.secret_key, algorithm=cfg.jwt_algorithm)
+        client.cookies.set(cfg.access_cookie_name, token)
+
+        resp = client.get("/auth/me")
+        assert resp.status_code == 401
+
+    def test_me_missing_user(self, client, user_factory, db):
+        user = user_factory(username="deleteduser")
+        cfg = get_settings()
+
+        payload = {
+            "sub": str(user.id),
+            "sid": str(uuid.uuid4()),
+            "role": "user",
+            "iat": datetime.now(timezone.utc),
+            "nbf": datetime.now(timezone.utc),
+            "exp": datetime.now(timezone.utc) + timedelta(hours=1),
+            "jti": "deadbeef",
+            "iss": cfg.jwt_issuer,
+            "aud": cfg.jwt_audience,
+        }
+        token = jwt.encode(payload, cfg.secret_key, algorithm=cfg.jwt_algorithm)
+        client.cookies.set(cfg.access_cookie_name, token)
+
+        db.delete(user)
+        db.commit()
+
+        resp = client.get("/auth/me")
+        assert resp.status_code == 401
+
 
 class TestAuthCsrf:
     def test_csrf_returns_token_and_cookie(self, client):
@@ -746,52 +852,4 @@ class TestAuthCsrf:
 # ═══════════════════════════════════════════════════════════════════════════
 
 
-class TestDeprecatedLegacyRoutes:
-    def test_legacy_register(self, client):
-        resp = client.post(
-            "/register",
-            json={"username": "legacyuser", "password": "strongpassword123"},
-        )
-        assert resp.status_code == 200
-        assert resp.json()["user"]["username"] == "legacyuser"
 
-    def test_legacy_token_login(self, client, user_factory):
-        user_factory(username="legacylogin")
-        resp = client.post(
-            "/token",
-            json={"username": "legacylogin", "password": "strongpassword123"},
-        )
-        assert resp.status_code == 200
-        assert "is_access" in resp.cookies
-
-    def test_legacy_me(self, client, user_factory):
-        user_factory(username="legacyme")
-        client.post(
-            "/token",
-            json={"username": "legacyme", "password": "strongpassword123"},
-        )
-        resp = client.get("/me")
-        assert resp.status_code == 200
-        assert resp.json()["username"] == "legacyme"
-
-    def test_legacy_refresh(self, client, user_factory):
-        user_factory(username="legacyrefresh")
-        client.post(
-            "/token",
-            json={"username": "legacyrefresh", "password": "strongpassword123"},
-        )
-        resp = client.post("/refresh")
-        assert resp.status_code == 200
-
-    def test_legacy_logout(self, client, user_factory):
-        user_factory(username="legacylogout")
-        client.post(
-            "/token",
-            json={"username": "legacylogout", "password": "strongpassword123"},
-        )
-        csrf = client.cookies.get("is_csrf")
-        resp = client.post(
-            "/logout",
-            headers={"x-csrf-token": csrf} if csrf else {},
-        )
-        assert resp.status_code == 200

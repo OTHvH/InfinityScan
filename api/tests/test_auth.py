@@ -30,6 +30,9 @@ from auth import (
 from models import Bookmark, ReadingProgress, Series, Chapter, Page, ContentType, ReadingMode, SeriesStatus
 from settings import get_settings
 
+# Import test helpers from conftest
+from conftest import _do_login, _do_register
+
 
 # ═════════════════════════════════════════════════════════════════════════════
 #  Registration
@@ -38,11 +41,8 @@ from settings import get_settings
 
 class TestRegistration:
     def test_register_success(self, client):
-        resp = client.post("/register", json={
-            "username": "newuser",
-            "password": "strongpassword123",
-        })
-        assert resp.status_code == 200
+        resp = _do_register(client, "newuser", "strongpassword123")
+        assert resp.status_code == 201
         body = resp.json()
         assert "user" in body
         assert body["user"]["username"] == "newuser"
@@ -52,59 +52,77 @@ class TestRegistration:
         assert "refresh_token" not in body
 
     def test_register_with_email(self, client):
-        resp = client.post("/register", json={
-            "username": "emailuser",
-            "password": "strongpassword123",
-            "email": "test@example.com",
-        })
-        assert resp.status_code == 200
+        resp = _do_register(client, "emailuser", "strongpassword123", email="test@example.com")
+        assert resp.status_code == 201
         assert resp.json()["user"]["email"] == "test@example.com"
 
     def test_register_duplicate_username(self, client, user_factory):
         user_factory(username="dupe_user")
-        resp = client.post("/register", json={
-            "username": "dupe_user",
-            "password": "strongpassword123",
-        })
+        resp = _do_register(client, "dupe_user", "strongpassword123")
         assert resp.status_code == 400
         assert "already registered" in resp.json()["detail"]
 
     def test_register_duplicate_email(self, client, user_factory):
         user_factory(username="first", email="same@example.com")
-        resp = client.post("/register", json={
-            "username": "second",
-            "password": "strongpassword123",
-            "email": "same@example.com",
-        })
+        resp = _do_register(client, "second", "strongpassword123", email="same@example.com")
         assert resp.status_code == 400
 
     def test_register_short_password(self, client):
-        resp = client.post("/register", json={
-            "username": "shortpw",
-            "password": "abc",
-        })
+        resp = _do_register(client, "shortpw", "abc")
         assert resp.status_code == 422  # Pydantic validation
 
     def test_register_username_too_short(self, client):
-        resp = client.post("/register", json={
-            "username": "ab",
-            "password": "strongpassword123",
-        })
+        resp = _do_register(client, "ab", "strongpassword123")
         assert resp.status_code == 422
 
     def test_register_extra_fields_rejected(self, client):
-        resp = client.post("/register", json={
-            "username": "evil",
-            "password": "strongpassword123",
-            "role": "admin",
-        })
+        # Must go through raw endpoint to send extra field
+        resp = client.get("/auth/csrf")
+        csrf = resp.json()["csrf_token"]
+        resp = client.post(
+            "/auth/register",
+            json={"username": "evil", "password": "strongpassword123", "role": "admin"},
+            headers={"X-CSRF-Token": csrf},
+        )
         assert resp.status_code == 422
 
     def test_register_invalid_username_chars(self, client):
-        resp = client.post("/register", json={
-            "username": "has spaces!",
-            "password": "strongpassword123",
-        })
+        resp = _do_register(client, "has spaces!", "strongpassword123")
+        assert resp.status_code == 422
+
+    def test_register_username_case_sensitive(self, client):
+        resp = _do_register(client, "User", "strongpassword123")
+        assert resp.status_code == 201
+        assert resp.json()["user"]["username"] == "User"
+
+    def test_register_email_domain_normalized(self, client):
+        resp = _do_register(client, "emailcase", "strongpassword123", email="Test@Example.COM")
+        assert resp.status_code == 201
+        email = resp.json()["user"]["email"]
+        assert email == "Test@example.com"
+
+    def test_register_invalid_email(self, client):
+        resp = _do_register(client, "bademail", "strongpassword123", email="not-an-email")
+        assert resp.status_code == 422
+
+    def test_register_overly_long_password(self, client):
+        resp = _do_register(client, "longpw", "a" * 129)
+        assert resp.status_code in (400, 422)
+
+    def test_register_duplicate_normalized_email(self, client):
+        resp1 = _do_register(client, "user_email1", "strongpassword123", email="Same@Example.com")
+        assert resp1.status_code == 201
+        resp2 = _do_register(client, "user_email2", "strongpassword123", email="same@example.com")
+        assert resp2.status_code == 201  # EmailStr normalizes domain only; local part case differs
+
+    def test_register_client_supplied_user_id_rejected(self, client):
+        resp = client.get("/auth/csrf")
+        csrf = resp.json()["csrf_token"]
+        resp = client.post(
+            "/auth/register",
+            json={"username": "x", "password": "strongpassword123", "id": "some-uuid"},
+            headers={"X-CSRF-Token": csrf},
+        )
         assert resp.status_code == 422
 
 
@@ -116,10 +134,7 @@ class TestRegistration:
 class TestLogin:
     def test_login_success_sets_cookies(self, client, user_factory):
         user_factory(username="logintest", password="mypassword123")
-        resp = client.post("/token", json={
-            "username": "logintest",
-            "password": "mypassword123",
-        })
+        resp = _do_login(client, "logintest", "mypassword123")
         assert resp.status_code == 200
         # Access cookie is set
         assert "is_access" in resp.cookies
@@ -135,17 +150,11 @@ class TestLogin:
 
     def test_login_wrong_password(self, client, user_factory):
         user_factory(username="wrongpw", password="correctpassword")
-        resp = client.post("/token", json={
-            "username": "wrongpw",
-            "password": "wrongpassword",
-        })
+        resp = _do_login(client, "wrongpw", "wrongpassword")
         assert resp.status_code == 401
 
     def test_login_nonexistent_user(self, client):
-        resp = client.post("/token", json={
-            "username": "ghost",
-            "password": "whatever123",
-        })
+        resp = _do_login(client, "ghost", "whatever123")
         assert resp.status_code == 401
 
     def test_login_disabled_account(self, client, db):
@@ -159,19 +168,27 @@ class TestLogin:
         )
         db.add(user)
         db.commit()
-        resp = client.post("/token", json={
-            "username": "disabled_user",
-            "password": "password123",
-        })
+        resp = _do_login(client, "disabled_user", "password123")
         assert resp.status_code == 403
 
     def test_login_extra_fields_rejected(self, client):
-        resp = client.post("/token", json={
-            "username": "x",
-            "password": "y",
-            "hacked": True,
-        })
+        # Must go through raw endpoint to send extra field
+        resp = client.get("/auth/csrf")
+        csrf = resp.json()["csrf_token"]
+        resp = client.post(
+            "/auth/login",
+            json={"username": "x", "password": "y", "hacked": True},
+            headers={"X-CSRF-Token": csrf},
+        )
         assert resp.status_code == 422
+
+    def test_login_wrong_password_and_nonexistent_same_response(self, client, user_factory):
+        user_factory(username="compare_user", password="realpassword")
+        resp_wrong = _do_login(client, "compare_user", "wrongpassword")
+        resp_none = _do_login(client, "nonexistent_user", "whatever123")
+        assert resp_wrong.status_code == 401
+        assert resp_none.status_code == 401
+        assert resp_wrong.json()["detail"] == resp_none.json()["detail"]
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -182,18 +199,18 @@ class TestLogin:
 class TestMe:
     def test_me_with_valid_cookie(self, client, user_factory):
         user_factory(username="meuser", password="mypass1234")
-        client.post("/token", json={"username": "meuser", "password": "mypass1234"})
-        resp = client.get("/me")
+        _do_login(client, "meuser", "mypass1234")
+        resp = client.get("/auth/me")
         assert resp.status_code == 200
         assert resp.json()["username"] == "meuser"
 
     def test_me_without_cookie(self, client):
-        resp = client.get("/me")
+        resp = client.get("/auth/me")
         assert resp.status_code == 401
 
     def test_me_with_invalid_token(self, client):
         client.cookies.set("is_access", "totally.forged.token")
-        resp = client.get("/me")
+        resp = client.get("/auth/me")
         assert resp.status_code == 401
 
     def test_me_ignores_identity_header(self, client, user_factory):
@@ -201,9 +218,9 @@ class TestMe:
         user_a = user_factory(username="userA", password="pass12345")
         user_factory(username="userB", password="pass12345")
         # Login as userA
-        client.post("/token", json={"username": "userA", "password": "pass12345"})
+        _do_login(client, "userA", "pass12345")
         # Try to impersonate userA via X-User-ID (should be ignored)
-        resp = client.get("/me", headers={"X-User-ID": str(user_a.id)})
+        resp = client.get("/auth/me", headers={"X-User-ID": str(user_a.id)})
         assert resp.status_code == 200
         assert resp.json()["username"] == "userA"
 
@@ -216,17 +233,17 @@ class TestMe:
 class TestLogout:
     def test_logout_clears_cookies(self, client, user_factory):
         user_factory(username="logoutuser", password="pass12345")
-        client.post("/token", json={"username": "logoutuser", "password": "pass12345"})
+        _do_login(client, "logoutuser", "pass12345")
         csrf = client.cookies.get("is_csrf")
-        resp = client.post("/logout", headers={"X-CSRF-Token": csrf})
+        resp = client.post("/auth/logout", headers={"X-CSRF-Token": csrf})
         assert resp.status_code == 200
-        # After logout, /me should return 401
-        resp2 = client.get("/me")
+        # After logout, /auth/me should return 401
+        resp2 = client.get("/auth/me")
         assert resp2.status_code == 401
 
     def test_logout_revokes_refresh_token(self, client, user_factory, db):
         user_factory(username="revokeuser", password="pass12345")
-        client.post("/token", json={"username": "revokeuser", "password": "pass12345"})
+        _do_login(client, "revokeuser", "pass12345")
 
         # Find the refresh session in DB
         from models import RefreshSession
@@ -235,10 +252,21 @@ class TestLogout:
         assert rt.revoked_at is None
 
         csrf = client.cookies.get("is_csrf")
-        client.post("/logout", headers={"X-CSRF-Token": csrf})
+        client.post("/auth/logout", headers={"X-CSRF-Token": csrf})
 
         db.refresh(rt)
         assert rt.revoked_at is not None
+
+    def test_repeated_logout_safe(self, client, user_factory):
+        user_factory(username="repeatlogout", password="pass12345")
+        _do_login(client, "repeatlogout", "pass12345")
+        csrf = client.cookies.get("is_csrf")
+        resp1 = client.post("/auth/logout", headers={"X-CSRF-Token": csrf})
+        assert resp1.status_code == 200
+        csrf2 = client.cookies.get("is_csrf")
+        resp2 = client.post("/auth/logout", headers={"X-CSRF-Token": csrf2} if csrf2 else {})
+        assert resp2.status_code in (200, 401)
+        assert resp2.status_code != 500
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -249,42 +277,39 @@ class TestLogout:
 class TestRefresh:
     def test_refresh_rotates_tokens(self, client, user_factory):
         user_factory(username="refreshuser", password="pass12345")
-        login_resp = client.post("/token", json={
-            "username": "refreshuser",
-            "password": "pass12345",
-        })
+        login_resp = _do_login(client, "refreshuser", "pass12345")
         old_refresh = login_resp.cookies.get("is_refresh")
 
-        # Call refresh
-        resp = client.post("/refresh")
+        # Call refresh with session-bound CSRF
+        csrf = client.cookies.get("is_csrf")
+        resp = client.post("/auth/refresh", headers={"X-CSRF-Token": csrf})
         assert resp.status_code == 200
         new_refresh = resp.cookies.get("is_refresh")
         assert new_refresh is not None
         assert new_refresh != old_refresh
 
         # New access token works
-        resp2 = client.get("/me")
+        resp2 = client.get("/auth/me")
         assert resp2.status_code == 200
 
     def test_refresh_reuses_old_token(self, client, user_factory):
         """Using a previously-used refresh token should fail and revoke all."""
         user_factory(username="reuseuser", password="pass12345")
-        login_resp = client.post("/token", json={
-            "username": "reuseuser",
-            "password": "pass12345",
-        })
+        login_resp = _do_login(client, "reuseuser", "pass12345")
         old_refresh = login_resp.cookies.get("is_refresh")
 
         # First refresh — rotates token
-        client.post("/refresh")
+        csrf = client.cookies.get("is_csrf")
+        client.post("/auth/refresh", headers={"X-CSRF-Token": csrf})
 
         # Try to use the old refresh token again
         client.cookies.set("is_refresh", old_refresh)
-        resp = client.post("/refresh")
+        csrf = client.cookies.get("is_csrf")
+        resp = client.post("/auth/refresh", headers={"X-CSRF-Token": csrf})
         assert resp.status_code == 401
 
     def test_refresh_without_token(self, client):
-        resp = client.post("/refresh")
+        resp = client.post("/auth/refresh")
         assert resp.status_code == 401
 
 
@@ -307,9 +332,15 @@ class TestCSRF:
     """
 
     def _login(self, client, user_factory, username: str = "csrfuser"):
-        """Login via legacy /token route (auto-sets session-bound CSRF)."""
+        """Login via canonical /auth/login (auto-sets session-bound CSRF)."""
         user_factory(username=username, password="pass12345")
-        client.post("/token", json={"username": username, "password": "pass12345"})
+        resp = client.get("/auth/csrf")
+        csrf = resp.json()["csrf_token"]
+        client.post(
+            "/auth/login",
+            json={"username": username, "password": "pass12345"},
+            headers={"X-CSRF-Token": csrf},
+        )
 
     def _login_auth(self, client, user_factory, username: str = "csrfauth"):
         """Login via /auth/login with pre-auth CSRF."""
@@ -467,18 +498,22 @@ class TestCSRF:
         user_factory(username="csrf_b", password="pass12345")
 
         # Login as user_a
-        client.post("/token", json={"username": "csrf_a", "password": "pass12345"})
+        resp = client.get("/auth/csrf")
+        csrf = resp.json()["csrf_token"]
+        client.post("/auth/login", json={"username": "csrf_a", "password": "pass12345"}, headers={"X-CSRF-Token": csrf})
         csrf_a = client.cookies.get("is_csrf")
 
         # Logout
         csrf = client.cookies.get("is_csrf")
-        client.post("/logout", headers={"X-CSRF-Token": csrf})
+        client.post("/auth/logout", headers={"X-CSRF-Token": csrf})
         client.cookies.delete("is_access")
         client.cookies.delete("is_refresh")
         client.cookies.delete("is_csrf")
 
         # Login as user_b
-        client.post("/token", json={"username": "csrf_b", "password": "pass12345"})
+        resp = client.get("/auth/csrf")
+        csrf = resp.json()["csrf_token"]
+        client.post("/auth/login", json={"username": "csrf_b", "password": "pass12345"}, headers={"X-CSRF-Token": csrf})
 
         # Try to use user_a's CSRF token
         resp = client.post(
@@ -493,12 +528,15 @@ class TestCSRF:
     def test_old_csrf_after_refresh_fails(self, client, user_factory):
         """CSRF token from before refresh is invalid (new session)."""
         user_factory(username="csrf_ref", password="pass12345")
-        client.post("/token", json={"username": "csrf_ref", "password": "pass12345"})
+        resp = client.get("/auth/csrf")
+        csrf = resp.json()["csrf_token"]
+        client.post("/auth/login", json={"username": "csrf_ref", "password": "pass12345"}, headers={"X-CSRF-Token": csrf})
         old_csrf = client.cookies.get("is_csrf")
 
         # Refresh rotates the session → new CSRF token
-        csrf = client.cookies.get("is_csrf")
-        client.post("/token", json={"username": "csrf_ref", "password": "pass12345"})
+        resp = client.get("/auth/csrf")
+        csrf = resp.json()["csrf_token"]
+        client.post("/auth/login", json={"username": "csrf_ref", "password": "pass12345"}, headers={"X-CSRF-Token": csrf})
         new_csrf = client.cookies.get("is_csrf")
 
         if old_csrf != new_csrf:
@@ -685,9 +723,9 @@ class TestCSRF:
         assert resp.status_code == 200
 
     def test_get_me_no_csrf_needed(self, client, user_factory):
-        """GET /me does not require CSRF."""
+        """GET /auth/me does not require CSRF."""
         self._login(client, user_factory)
-        resp = client.get("/me")
+        resp = client.get("/auth/me")
         assert resp.status_code == 200
 
     # ── CSRF endpoint ────────────────────────────────────────────────────────
@@ -763,7 +801,7 @@ class TestIsolation:
     """
 
     def _login(self, client, username: str, password: str = "pass12345"):
-        client.post("/token", json={"username": username, "password": password})
+        _do_login(client, username, password)
 
     def _create_series(self, db, slug: str) -> Series:
         s = Series(
@@ -1179,6 +1217,24 @@ class TestIsolation:
         resp = client.get(f"/progress/{series.slug}/{ch.id}")
         assert resp.status_code == 401
 
+    def test_user_id_query_param_ignored(self, client, user_factory, db):
+        """Passing user_id as a query parameter does not affect results."""
+        user_factory(username="qpa", password="pass12345")
+        user_factory(username="qpb", password="pass12345")
+        series = self._create_series(db, "qp-series")
+        ch = self._create_chapter(db, series)
+
+        from models import User
+        user_a = db.scalar(select(User).where(User.username == "qpa"))
+        db.add(ReadingProgress(user_id=user_a.id, chapter_id=ch.id, last_page=42))
+        db.commit()
+
+        self._login(client, "qpb")
+        resp = client.get(f"/progress/{series.slug}/{ch.id}?user_id={user_a.id}")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["last_page"] is None
+
 
 # ═════════════════════════════════════════════════════════════════════════════
 #  Schema strictness
@@ -1187,16 +1243,18 @@ class TestIsolation:
 
 class TestSchemaStrictness:
     def test_register_rejects_extra_fields(self, client):
-        resp = client.post("/register", json={
-            "username": "test",
-            "password": "strongpassword123",
-            "is_admin": True,
-        })
+        resp = client.get("/auth/csrf")
+        csrf = resp.json()["csrf_token"]
+        resp = client.post(
+            "/auth/register",
+            json={"username": "test", "password": "strongpassword123", "is_admin": True},
+            headers={"X-CSRF-Token": csrf},
+        )
         assert resp.status_code == 422
 
     def test_bookmark_rejects_extra_fields(self, client, user_factory):
         user_factory(username="strictuser", password="pass12345")
-        client.post("/token", json={"username": "strictuser", "password": "pass12345"})
+        _do_login(client, "strictuser", "pass12345")
         csrf = client.cookies.get("is_csrf")
         resp = client.post(
             "/bookmarks",
@@ -1211,7 +1269,7 @@ class TestSchemaStrictness:
 
     def test_progress_rejects_extra_fields(self, client, user_factory):
         user_factory(username="strict2", password="pass12345")
-        client.post("/token", json={"username": "strict2", "password": "pass12345"})
+        _do_login(client, "strict2", "pass12345")
         csrf = client.cookies.get("is_csrf")
         ch_id = uuid.uuid4()
         resp = client.post(
@@ -1247,10 +1305,7 @@ class TestHealth:
 class TestTokenSecrecy:
     def test_login_response_has_no_token_fields(self, client, user_factory):
         user_factory(username="secretuser", password="pass12345")
-        resp = client.post("/token", json={
-            "username": "secretuser",
-            "password": "pass12345",
-        })
+        resp = _do_login(client, "secretuser", "pass12345")
         body = resp.json()
         for key in body:
             assert "token" not in key.lower() or key == "token_type", f"Token field leaked: {key}"
@@ -1259,10 +1314,7 @@ class TestTokenSecrecy:
         assert "refresh_token" not in body
 
     def test_register_response_has_no_token_fields(self, client):
-        resp = client.post("/register", json={
-            "username": "secretreg",
-            "password": "strongpassword123",
-        })
+        resp = _do_register(client, "secretreg", "strongpassword123")
         body = resp.json()
         assert "access_token" not in body
         assert "refresh_token" not in body

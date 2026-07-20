@@ -161,11 +161,6 @@ class NoCacheAuthMiddleware(BaseHTTPMiddleware):
         "/auth/logout-all",
         "/auth/me",
         "/auth/csrf",
-        "/register",
-        "/token",
-        "/refresh",
-        "/logout",
-        "/me",
     })
 
     async def dispatch(self, request: Request, call_next):

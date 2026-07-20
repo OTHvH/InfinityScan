@@ -1,7 +1,7 @@
 """Pytest configuration for InfinityScan API tests.
 
-Provides an in-memory SQLite database, a TestClient, and fixtures for
-creating users and authenticated sessions.
+Provides a test database (PostgreSQL when TEST_DATABASE_URL is set, SQLite fallback),
+a TestClient, and fixtures for creating users and authenticated sessions.
 """
 
 from __future__ import annotations
@@ -12,9 +12,7 @@ import sys
 # Ensure the api/ package is importable
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-# Force SQLite + disable rate limits + disable secure cookies —
-# ALL of these MUST be set before any app module is imported.
-os.environ["DATABASE_URL"] = "sqlite://"
+# Force settings — ALL of these MUST be set before any app module is imported.
 os.environ["COOKIE_SECURE"] = "false"
 os.environ["REGISTER_RATE_LIMIT"] = "999999/second"
 os.environ["LOGIN_RATE_LIMIT"] = "999999/second"
@@ -25,38 +23,80 @@ os.environ["BOOKMARK_WRITE_RATE_LIMIT"] = "999999/second"
 os.environ["PROGRESS_WRITE_RATE_LIMIT"] = "999999/second"
 os.environ["TRUSTED_HOSTS"] = "localhost,127.0.0.1,testserver"
 
+# Select database backend: PostgreSQL if TEST_DATABASE_URL is set, else SQLite
+_TEST_DB_URL = os.environ.get("TEST_DATABASE_URL", "")
+if _TEST_DB_URL:
+    os.environ["DATABASE_URL"] = _TEST_DB_URL
+    _USE_POSTGRESQL = True
+else:
+    os.environ["DATABASE_URL"] = "sqlite://"
+    _USE_POSTGRESQL = False
+
 import uuid
 from datetime import datetime, timezone
 
 import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy import create_engine, event
+from sqlalchemy import create_engine, event, text
 from sqlalchemy.orm import sessionmaker
 
 from models import Base
 from main import app
 from database import get_db
 from auth import hash_password
+from auth import generate_csrf_token, _PREAUTH_SESSION_ID
 
-# ── SQLite with StaticPool (one shared connection) ────────────────────────────
+# ── Database engine ───────────────────────────────────────────────────────────
 
-from sqlalchemy.pool import StaticPool
+if _USE_POSTGRESQL:
+    _engine = create_engine(
+        _TEST_DB_URL,
+        pool_pre_ping=True,
+    )
+else:
+    from sqlalchemy.pool import StaticPool
+    _engine = create_engine(
+        "sqlite://",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
 
-_engine = create_engine(
-    "sqlite://",
-    connect_args={"check_same_thread": False},
-    poolclass=StaticPool,
-)
-
-
-@event.listens_for(_engine, "connect")
-def _set_sqlite_pragma(dbapi_conn, _connection_record):
-    cursor = dbapi_conn.cursor()
-    cursor.execute("PRAGMA foreign_keys=ON")
-    cursor.close()
+    @event.listens_for(_engine, "connect")
+    def _set_sqlite_pragma(dbapi_conn, _connection_record):
+        cursor = dbapi_conn.cursor()
+        cursor.execute("PRAGMA foreign_keys=ON")
+        cursor.close()
 
 
 _TestSession = sessionmaker(bind=_engine, autoflush=False, autocommit=False)
+
+
+# ── Helper functions (not fixtures) ────────────────────────────────────────
+
+
+def _do_login(client, username: str, password: str):
+    """Login via canonical /auth/login with pre-auth CSRF."""
+    resp = client.get("/auth/csrf")
+    csrf = resp.json()["csrf_token"]
+    return client.post(
+        "/auth/login",
+        json={"username": username, "password": password},
+        headers={"X-CSRF-Token": csrf},
+    )
+
+
+def _do_register(client, username: str, password: str, email: str | None = None):
+    """Register via canonical /auth/register with pre-auth CSRF."""
+    resp = client.get("/auth/csrf")
+    csrf = resp.json()["csrf_token"]
+    body = {"username": username, "password": password}
+    if email:
+        body["email"] = email
+    return client.post(
+        "/auth/register",
+        json=body,
+        headers={"X-CSRF-Token": csrf},
+    )
 
 
 # ── Fixtures ─────────────────────────────────────────────────────────────────
@@ -132,8 +172,8 @@ def auth_client(client, user_factory):
 
     def _login(username: str = "testuser", password: str = "strongpassword123"):
         user = user_factory(username=username, password=password)
-        resp = client.post("/token", json={"username": username, "password": password})
-        assert resp.status_code == 200, f"Login failed: {resp.text}"
+        resp = _do_login(client, username, password)
+        assert resp.status_code == 200, f"Login with failed: {resp.text}"
         return user
 
     return _login
