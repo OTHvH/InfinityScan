@@ -1,47 +1,13 @@
 "use client";
 
-import { useEffect, useRef, useState, useCallback } from "react";
+import { useEffect, useRef, useState } from "react";
+import { useRouter } from "next/navigation";
+import Link from "next/link";
+import { useAuthStore } from "@/stores/auth";
+import { api } from "@/lib/api";
+import type { Series } from "@/lib/types";
 
-// ─── Types ────────────────────────────────────────────────────────────────────
-
-interface Series {
-  id: string;
-  slug: string;
-  title: string;
-  synopsis: string | null;
-  cover_url?: string | null;
-  cover_object_key: string | null;
-  content_type: "manga" | "manhua" | "manhwa";
-  status: "ongoing" | "completed" | "hiatus" | "cancelled";
-  year: number | null;
-  is_nsfw: boolean;
-}
-
-interface User {
-  id: string;
-  username: string;
-  email: string | null;
-  role: string;
-  is_active: boolean;
-}
-
-// ─── Helpers ──────────────────────────────────────────────────────────────────
-
-const API = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
-
-function readCookie(name: string): string | null {
-  const match = document.cookie.match(new RegExp("(^| )" + name + "=([^;]*)"));
-  return match ? decodeURIComponent(match[2]) : null;
-}
-
-function csrfHeaders(): HeadersInit {
-  const csrf = readCookie("is_csrf");
-  return csrf ? { "X-CSRF-Token": csrf } : {};
-}
-
-function jsonHeaders(): HeadersInit {
-  return { "Content-Type": "application/json", ...csrfHeaders() };
-}
+// ─── Constants ───────────────────────────────────────────────────────────────
 
 const STATUS_LABELS: Record<string, string> = {
   ongoing: "Ongoing",
@@ -51,54 +17,84 @@ const STATUS_LABELS: Record<string, string> = {
 };
 
 const CONTENT_EMOJI: Record<string, string> = {
-  manga: "🇯🇵",
-  manhua: "🇨🇳",
-  manhwa: "🇰🇷",
+  manga: "\u{1F1EF}\u{1F1F5}",
+  manhua: "\u{1F1E8}\u{1F1F3}",
+  manhwa: "\u{1F1F0}\u{1F1F7}",
 };
 
-// ─── Sub-components ───────────────────────────────────────────────────────────
+const API_BASE = process.env.NEXT_PUBLIC_API_URL ?? "";
+
+// ─── Sub-components ──────────────────────────────────────────────────────────
 
 function Header({
   onSearchToggle,
   searchOpen,
-  user,
-  onLoginClick,
-  onLogout,
 }: {
   onSearchToggle: () => void;
   searchOpen: boolean;
-  user: User | null;
-  onLoginClick: () => void;
-  onLogout: () => void;
 }) {
+  const user = useAuthStore((s) => s.user);
+  const logout = useAuthStore((s) => s.logout);
+  const router = useRouter();
+
+  const handleLogout = async () => {
+    await logout();
+    router.push("/");
+  };
+
   return (
     <header className="header">
       <div className="header-inner">
-        <div className="brand">
+        <Link href="/" className="brand">
           <span className="brand-title">∞ InfinityScan</span>
           <span className="brand-sub">Manga · Manhwa · Manhua reader</span>
-        </div>
+        </Link>
         <div style={{ flex: 1 }} />
         <button
           className={`btn secondary small${searchOpen ? " active" : ""}`}
           onClick={onSearchToggle}
           aria-label="Toggle search"
         >
-          🔍 Browse
+          Browse
         </button>
         {user ? (
-          <div style={{ display: "flex", alignItems: "center", gap: 8, marginLeft: 8 }}>
+          <div
+            style={{
+              display: "flex",
+              alignItems: "center",
+              gap: 8,
+              marginLeft: 8,
+            }}
+          >
+            {user.role === "admin" && (
+              <a
+                href="/admin"
+                className="btn ghost small"
+                style={{ fontSize: "0.75rem" }}
+              >
+                Admin
+              </a>
+            )}
             <span style={{ fontSize: "0.875rem", color: "var(--text2)" }}>
-              👤 {user.username}
+              {user.username}
             </span>
-            <button className="btn ghost small" onClick={onLogout} aria-label="Logout">
+            <button
+              className="btn ghost small"
+              onClick={handleLogout}
+              aria-label="Logout"
+            >
               Logout
             </button>
           </div>
         ) : (
-          <button className="btn small" onClick={onLoginClick} style={{ marginLeft: 8 }}>
-            Login
-          </button>
+          <div style={{ display: "flex", gap: 6, marginLeft: 8 }}>
+            <Link href="/login" className="btn ghost small">
+              Login
+            </Link>
+            <Link href="/register" className="btn small">
+              Register
+            </Link>
+          </div>
         )}
       </div>
     </header>
@@ -127,14 +123,14 @@ function SearchBar({
           ref={inputRef}
           className="search-input"
           type="search"
-          placeholder="Search series…"
+          placeholder="Search series..."
           value={query}
           onChange={(e) => onQuery(e.target.value)}
           aria-label="Search series"
         />
         {query && (
           <button className="btn ghost small" onClick={() => onQuery("")}>
-            ✕ Clear
+            Clear
           </button>
         )}
       </div>
@@ -146,7 +142,7 @@ function SeriesCard({ series }: { series: Series }) {
   const coverUrl =
     series.cover_url ??
     (series.cover_object_key
-      ? `${API}/covers/${series.cover_object_key.split("/").map(encodeURIComponent).join("/")}`
+      ? `${API_BASE}/covers/${series.cover_object_key.split("/").map(encodeURIComponent).join("/")}`
       : null);
 
   return (
@@ -196,150 +192,7 @@ function EmptyState({ searching }: { searching: boolean }) {
   );
 }
 
-function AuthModal({
-  open,
-  onClose,
-  onAuth,
-}: {
-  open: boolean;
-  onClose: () => void;
-  onAuth: (user: User) => void;
-}) {
-  const [mode, setMode] = useState<"login" | "register">("login");
-  const [username, setUsername] = useState("");
-  const [password, setPassword] = useState("");
-  const [email, setEmail] = useState("");
-  const [error, setError] = useState("");
-  const [loading, setLoading] = useState(false);
-
-  if (!open) return null;
-
-  const handleSubmit = async (e: React.FormEvent) => {
-    e.preventDefault();
-    setError("");
-    setLoading(true);
-
-    try {
-      if (mode === "register") {
-        const regRes = await fetch(`${API}/register`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            username,
-            password,
-            ...(email ? { email } : {}),
-          }),
-        });
-        if (!regRes.ok) {
-          const err = await regRes.json();
-          throw new Error(err.detail || "Registration failed");
-        }
-      }
-
-      const loginRes = await fetch(`${API}/token`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ username, password }),
-        credentials: "include",
-      });
-
-      if (!loginRes.ok) {
-        const err = await loginRes.json();
-        throw new Error(err.detail || "Login failed");
-      }
-
-      const data = await loginRes.json();
-      onAuth(data.user);
-      onClose();
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed");
-    } finally {
-      setLoading(false);
-    }
-  };
-
-  return (
-    <div className="modal-overlay" onClick={onClose}>
-      <div className="modal" onClick={(e) => e.stopPropagation()}>
-        <h2 style={{ marginBottom: 16 }}>
-          {mode === "login" ? "Login" : "Register"}
-        </h2>
-        <form onSubmit={handleSubmit}>
-          <div style={{ marginBottom: 12 }}>
-            <label style={{ display: "block", marginBottom: 4, fontSize: "0.875rem" }}>
-              Username
-            </label>
-            <input
-              type="text"
-              value={username}
-              onChange={(e) => setUsername(e.target.value)}
-              className="search-input"
-              required
-              autoFocus
-              minLength={mode === "register" ? 3 : 1}
-              pattern={mode === "register" ? "^[a-zA-Z0-9_]+$" : undefined}
-            />
-          </div>
-          {mode === "register" && (
-            <div style={{ marginBottom: 12 }}>
-              <label style={{ display: "block", marginBottom: 4, fontSize: "0.875rem" }}>
-                Email (optional)
-              </label>
-              <input
-                type="email"
-                value={email}
-                onChange={(e) => setEmail(e.target.value)}
-                className="search-input"
-              />
-            </div>
-          )}
-          <div style={{ marginBottom: 16 }}>
-            <label style={{ display: "block", marginBottom: 4, fontSize: "0.875rem" }}>
-              Password
-            </label>
-            <input
-              type="password"
-              value={password}
-              onChange={(e) => setPassword(e.target.value)}
-              className="search-input"
-              required
-              minLength={8}
-            />
-          </div>
-          {error && (
-            <p style={{ color: "var(--accent3)", marginBottom: 12, fontSize: "0.875rem" }}>
-              ⚠ {error}
-            </p>
-          )}
-          <div style={{ display: "flex", gap: 8, justifyContent: "space-between", alignItems: "center" }}>
-            <button
-              type="button"
-              className="btn ghost small"
-              onClick={() => {
-                setMode(mode === "login" ? "register" : "login");
-                setError("");
-              }}
-            >
-              {mode === "login" ? "Create account" : "Back to login"}
-            </button>
-            <div style={{ display: "flex", gap: 8 }}>
-              <button type="button" className="btn ghost" onClick={onClose}>
-                Cancel
-              </button>
-              <button type="submit" className="btn" disabled={loading}>
-                {loading
-                  ? mode === "login" ? "Logging in..." : "Registering..."
-                  : mode === "login" ? "Login" : "Register"}
-              </button>
-            </div>
-          </div>
-        </form>
-      </div>
-    </div>
-  );
-}
-
-// ─── Page ─────────────────────────────────────────────────────────────────────
+// ─── Page ────────────────────────────────────────────────────────────────────
 
 export default function HomePage() {
   const [allSeries, setAllSeries] = useState<Series[]>([]);
@@ -347,44 +200,16 @@ export default function HomePage() {
   const [error, setError] = useState<string | null>(null);
   const [query, setQuery] = useState("");
   const [searchOpen, setSearchOpen] = useState(false);
-  const [user, setUser] = useState<User | null>(null);
-  const [loginOpen, setLoginOpen] = useState(false);
-
-  // Check session on mount via /me (cookies auto-sent)
-  useEffect(() => {
-    fetch(`${API}/me`, { credentials: "include" })
-      .then((res) => {
-        if (res.ok) return res.json();
-        throw new Error("not logged in");
-      })
-      .then((u: User) => setUser(u))
-      .catch(() => {});
-  }, []);
-
-  const handleAuth = (u: User) => {
-    setUser(u);
-  };
-
-  const handleLogout = async () => {
-    try {
-      await fetch(`${API}/logout`, {
-        method: "POST",
-        headers: jsonHeaders(),
-        credentials: "include",
-      });
-    } catch {}
-    setUser(null);
-  };
 
   // Fetch series list from the API
   useEffect(() => {
     const controller = new AbortController();
     (async () => {
       try {
-        const res = await fetch(`${API}/series`, { signal: controller.signal });
-        if (!res.ok) throw new Error(`API responded with ${res.status}`);
-        const data = await res.json();
-        setAllSeries(Array.isArray(data) ? data : (data.list ?? data.items ?? []));
+        const data = await api.get("/series");
+        setAllSeries(
+          Array.isArray(data) ? data : ((data as Record<string, unknown>).list ?? (data as Record<string, unknown>).items ?? []) as Series[],
+        );
       } catch (err) {
         if (err instanceof Error && err.name !== "AbortError") {
           setError(err.message);
@@ -398,7 +223,7 @@ export default function HomePage() {
 
   const filtered = query.trim()
     ? allSeries.filter((s) =>
-        s.title.toLowerCase().includes(query.toLowerCase())
+        s.title.toLowerCase().includes(query.toLowerCase()),
       )
     : allSeries;
 
@@ -407,22 +232,21 @@ export default function HomePage() {
       <Header
         searchOpen={searchOpen}
         onSearchToggle={() => setSearchOpen((v) => !v)}
-        user={user}
-        onLoginClick={() => setLoginOpen(true)}
-        onLogout={handleLogout}
       />
       <SearchBar open={searchOpen} query={query} onQuery={setQuery} />
-      <AuthModal
-        open={loginOpen}
-        onClose={() => setLoginOpen(false)}
-        onAuth={handleAuth}
-      />
 
       <main className="wrap">
         {/* Status summary */}
-        <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginBottom: 4 }}>
+        <div
+          style={{
+            display: "flex",
+            gap: 8,
+            flexWrap: "wrap",
+            marginBottom: 4,
+          }}
+        >
           <span className="pill">
-            {loading ? "Loading…" : `${filtered.length} series`}
+            {loading ? "Loading..." : `${filtered.length} series`}
           </span>
           {query && (
             <span className="pill" style={{ color: "var(--accent2)" }}>
@@ -445,7 +269,7 @@ export default function HomePage() {
               background: "rgba(255,77,246,.06)",
             }}
           >
-            ⚠ API error: {error}
+            API error: {error}
           </p>
         )}
 
@@ -478,21 +302,28 @@ export default function HomePage() {
         {!loading && filtered.length === 0 && (
           <EmptyState searching={!!query} />
         )}
-        
+
         {/* Most Popular Section */}
         {!loading && filtered.length > 0 && !query && (
           <section style={{ marginBottom: 32 }}>
-            <h2 style={{ 
-              fontSize: "1.5rem", 
-              fontWeight: 700, 
-              marginBottom: 16,
-              display: "flex",
-              alignItems: "center",
-              gap: 8 
-            }}>
+            <h2
+              style={{
+                fontSize: "1.5rem",
+                fontWeight: 700,
+                marginBottom: 16,
+                display: "flex",
+                alignItems: "center",
+                gap: 8,
+              }}
+            >
               <span style={{ fontSize: "1.25rem" }}>🔥</span> Most Popular
             </h2>
-            <div className="grid-cards" style={{ gridTemplateColumns: "repeat(auto-fill, minmax(180px, 1fr))" }}>
+            <div
+              className="grid-cards"
+              style={{
+                gridTemplateColumns: "repeat(auto-fill, minmax(180px, 1fr))",
+              }}
+            >
               {filtered.slice(0, 4).map((s) => (
                 <SeriesCard key={s.id} series={s} />
               ))}
@@ -503,16 +334,18 @@ export default function HomePage() {
         {/* All Series Section */}
         {!loading && filtered.length > 0 && (
           <section>
-            <h2 style={{ 
-              fontSize: "1.25rem", 
-              fontWeight: 600, 
-              marginBottom: 16,
-              marginTop: query ? 0 : 16,
-              display: "flex",
-              alignItems: "center",
-              gap: 8 
-            }}>
-              <span style={{ fontSize: "1rem" }}>📚</span> 
+            <h2
+              style={{
+                fontSize: "1.25rem",
+                fontWeight: 600,
+                marginBottom: 16,
+                marginTop: query ? 0 : 16,
+                display: "flex",
+                alignItems: "center",
+                gap: 8,
+              }}
+            >
+              <span style={{ fontSize: "1rem" }}>📚</span>
               {query ? `Search Results (${filtered.length})` : "All Series"}
             </h2>
             <div className="grid-cards">
@@ -526,8 +359,13 @@ export default function HomePage() {
 
       <style jsx global>{`
         @keyframes pulse {
-          0%, 100% { opacity: 0.35; }
-          50% { opacity: 0.6; }
+          0%,
+          100% {
+            opacity: 0.35;
+          }
+          50% {
+            opacity: 0.6;
+          }
         }
       `}</style>
     </>

@@ -2,37 +2,12 @@
 
 import { use, useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
+import { api } from "@/lib/api";
+import type { Series, Chapter } from "@/lib/types";
 
-// ─── Types ────────────────────────────────────────────────────────────────────
+// ─── Helpers ─────────────────────────────────────────────────────────────────
 
-interface Series {
-  id: string;
-  slug: string;
-  title: string;
-  synopsis: string | null;
-  cover_url: string | null;
-  cover_object_key: string | null;
-  content_type: "manga" | "manhua" | "manhwa";
-  status: "ongoing" | "completed" | "hiatus" | "cancelled";
-  year: number | null;
-  is_nsfw: boolean;
-}
-
-interface Chapter {
-  id: string;
-  number: number;
-  title: string | null;
-  page_count: number;
-  published_at: string | null;
-}
-
-interface SeriesDetail extends Series {
-  chapters: Chapter[];
-}
-
-// ─── Helpers ──────────────────────────────────────────────────────────────────
-
-const API = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
+const API_BASE = process.env.NEXT_PUBLIC_API_URL ?? "";
 
 const STATUS_LABELS: Record<string, string> = {
   ongoing: "Ongoing",
@@ -42,14 +17,22 @@ const STATUS_LABELS: Record<string, string> = {
 };
 
 const CONTENT_EMOJI: Record<string, string> = {
-  manga: "🇯🇵",
-  manhua: "🇨🇳",
-  manhwa: "🇰🇷",
+  manga: "\u{1F1EF}\u{1F1F5}",
+  manhua: "\u{1F1E8}\u{1F1F3}",
+  manhwa: "\u{1F1F0}\u{1F1F7}",
 };
 
-// ─── Page ─────────────────────────────────────────────────────────────────────
+// ─── Types ───────────────────────────────────────────────────────────────────
 
-export default function SeriesPage(props: { params: Promise<{ slug: string }> }) {
+interface SeriesDetail extends Series {
+  chapters: Chapter[];
+}
+
+// ─── Page ────────────────────────────────────────────────────────────────────
+
+export default function SeriesPage(props: {
+  params: Promise<{ slug: string }>;
+}) {
   const params = use(props.params);
   const router = useRouter();
   const [series, setSeries] = useState<SeriesDetail | null>(null);
@@ -61,29 +44,21 @@ export default function SeriesPage(props: { params: Promise<{ slug: string }> })
     (async () => {
       try {
         // Try local library first, then fall back to CopyManga
-        let res = await fetch(`${API}/library/${params.slug}`, {
-          signal: controller.signal,
-        });
-        if (res.ok) {
-          const data = await res.json();
-          setSeries(data);
-        } else {
-          // Fall back to CopyManga API
-          res = await fetch(`${API}/series/${params.slug}`, {
-            signal: controller.signal,
-          });
-          if (!res.ok) throw new Error(`API responded with ${res.status}`);
-          const data = await res.json();
-          // Transform CopyManga response to our format
+        try {
+          const data = await api.get(`/library/${params.slug}`);
+          setSeries(data as SeriesDetail);
+        } catch {
+          const data = await api.get(`/series/${params.slug}`);
+          const d = data as Record<string, unknown>;
           setSeries({
-            id: data.path_word,
-            slug: data.path_word,
-            title: data.name,
-            synopsis: data.brief,
-            cover_url: data.cover,
+            id: (d.path_word as string) ?? params.slug,
+            slug: (d.path_word as string) ?? params.slug,
+            title: (d.name as string) ?? "",
+            synopsis: (d.brief as string) ?? null,
+            cover_url: (d.cover as string) ?? null,
             cover_object_key: null,
-            content_type: "manhua", // Default, CopyManga doesn't specify
-            status: data.status || "ongoing",
+            content_type: "manhua",
+            status: ((d.status as string) || "ongoing") as SeriesDetail["status"],
             year: null,
             is_nsfw: false,
             chapters: [],
@@ -112,7 +87,9 @@ export default function SeriesPage(props: { params: Promise<{ slug: string }> })
   if (error || !series) {
     return (
       <div className="wrap" style={{ padding: 40, textAlign: "center" }}>
-        <p style={{ color: "var(--accent3)" }}>⚠ Error: {error || "Series not found"}</p>
+        <p style={{ color: "var(--accent3)" }}>
+          Error: {error || "Series not found"}
+        </p>
         <button
           className="btn"
           onClick={() => router.push("/")}
@@ -127,12 +104,12 @@ export default function SeriesPage(props: { params: Promise<{ slug: string }> })
   const coverUrl =
     series.cover_url ??
     (series.cover_object_key
-      ? `${API}/covers/${series.cover_object_key.split("/").map(encodeURIComponent).join("/")}`
+      ? `${API_BASE}/covers/${series.cover_object_key.split("/").map(encodeURIComponent).join("/")}`
       : null);
 
   // Sort chapters by number descending (newest first)
   const sortedChapters = [...(series.chapters || [])].sort(
-    (a, b) => b.number - a.number
+    (a, b) => b.number - a.number,
   );
 
   return (
@@ -196,7 +173,9 @@ export default function SeriesPage(props: { params: Promise<{ slug: string }> })
 
           {/* Info */}
           <div style={{ flex: 1, minWidth: 280 }}>
-            <h1 style={{ fontSize: "1.75rem", fontWeight: 700, marginBottom: 8 }}>
+            <h1
+              style={{ fontSize: "1.75rem", fontWeight: 700, marginBottom: 8 }}
+            >
               {series.title}
             </h1>
             <p style={{ color: "var(--text2)", marginBottom: 12 }}>
@@ -216,7 +195,9 @@ export default function SeriesPage(props: { params: Promise<{ slug: string }> })
 
         {/* Chapters */}
         <section>
-          <h2 style={{ fontSize: "1.25rem", fontWeight: 600, marginBottom: 16 }}>
+          <h2
+            style={{ fontSize: "1.25rem", fontWeight: 600, marginBottom: 16 }}
+          >
             Chapters ({sortedChapters.length})
           </h2>
           {sortedChapters.length === 0 ? (

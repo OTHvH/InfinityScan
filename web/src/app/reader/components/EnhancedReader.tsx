@@ -2,6 +2,8 @@
 
 import React, { use, useCallback, useEffect, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
+import { api, ApiError } from "@/lib/api";
+import { useAuthStore } from "@/stores/auth";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -25,8 +27,6 @@ type SpreadMode = "single" | "spread";
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
-const API = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
-const PRELOAD_THRESHOLD = 3;
 const PROGRESS_SAVE_INTERVAL = 3000;
 const ZOOM_MIN = 40;
 const ZOOM_MAX = 160;
@@ -38,18 +38,38 @@ function getStorageKey(seriesSlug: string, chapterUuid: string, mode: string): s
   return `infinityscan_${mode}_${seriesSlug}_${chapterUuid}`;
 }
 
-function saveProgress(seriesSlug: string, chapterUuid: string, page: number, readingMode: ReadingMode, zoom: number) {
+function saveProgressLocal(seriesSlug: string, chapterUuid: string, page: number, readingMode: ReadingMode, zoom: number) {
   localStorage.setItem(
     getStorageKey(seriesSlug, chapterUuid, "progress"),
     JSON.stringify({ page, readingMode, zoom, timestamp: Date.now() })
   );
 }
 
-function loadProgress(seriesSlug: string, chapterUuid: string): { page: number; readingMode: ReadingMode; zoom: number } | null {
+function loadProgressLocal(seriesSlug: string, chapterUuid: string): { page: number; readingMode: ReadingMode; zoom: number } | null {
   const data = localStorage.getItem(getStorageKey(seriesSlug, chapterUuid, "progress"));
   if (!data) return null;
   try {
     return JSON.parse(data);
+  } catch {
+    return null;
+  }
+}
+
+async function saveProgressServer(seriesSlug: string, chapterUuid: string, page: number): Promise<void> {
+  try {
+    await api.post(`/progress/${seriesSlug}/${chapterUuid}`, {
+      chapter_uuid: chapterUuid,
+      last_page: Math.max(0, page - 1),
+    });
+  } catch {
+    // Silently fail — localStorage remains authoritative
+  }
+}
+
+async function loadProgressServer(seriesSlug: string, chapterUuid: string): Promise<number | null> {
+  try {
+    const data = await api.get(`/progress/${seriesSlug}/${chapterUuid}`) as { last_page: number | null };
+    return data.last_page != null ? data.last_page + 1 : null;
   } catch {
     return null;
   }
@@ -442,21 +462,20 @@ export default function EnhancedReader(props: ReaderProps) {
       setError(null);
       
       try {
-        const res = await fetch(`${API}/library/${seriesSlug}/chapter/${chapterNumber}`);
-        if (!res.ok) throw new Error(`API error: ${res.status}`);
+        const data = await api.get(`/library/${seriesSlug}/chapter/${chapterNumber}`) as Record<string, unknown>;
         
-        const data = await res.json();
+        const pages = data.pages as Page[];
         
-        // Load saved progress
-        const saved = loadProgress(seriesSlug, data.chapter_uuid);
+        // Load saved progress from localStorage first
+        const saved = loadProgressLocal(seriesSlug, data.chapter_uuid as string);
         
         const chapterData = {
-          uuid: data.chapter_uuid,
-          name: data.chapter_name,
+          uuid: data.chapter_uuid as string,
+          name: data.chapter_name as string,
           index: 0,
-          pages: data.pages,
-          prev_chapter_uuid: data.prev_chapter_uuid,
-          next_chapter_uuid: data.next_chapter_uuid,
+          pages,
+          prev_chapter_uuid: (data.prev_chapter_uuid as string) ?? null,
+          next_chapter_uuid: (data.next_chapter_uuid as string) ?? null,
           chapter_number: parseFloat(chapterNumber),
         };
         
@@ -469,17 +488,28 @@ export default function EnhancedReader(props: ReaderProps) {
         
         // Initialize all pages for infinity scroll
         if (readingMode === "scroll") {
-          setAllPages(data.pages);
+          setAllPages(pages);
         }
         
-        // Restore saved state
-        if (saved) {
-          setCurrentPage(Math.min(saved.page, data.pages.length));
-          if (saved.readingMode) setReadingMode(saved.readingMode);
-          if (saved.zoom) setZoom(saved.zoom);
+        // Restore saved state: prefer server progress if authenticated
+        let restoredPage = saved?.page ?? 1;
+        const user = useAuthStore.getState().user;
+        if (user) {
+          const serverPage = await loadProgressServer(seriesSlug, data.chapter_uuid as string);
+          if (serverPage != null && serverPage > restoredPage) {
+            restoredPage = serverPage;
+          }
         }
+        
+        setCurrentPage(Math.min(restoredPage, pages.length));
+        if (saved?.readingMode) setReadingMode(saved.readingMode);
+        if (saved?.zoom) setZoom(saved.zoom);
       } catch (err) {
-        setError(err instanceof Error ? err.message : "Failed to load chapter");
+        if (err instanceof ApiError) {
+          setError(err.detail || "Failed to load chapter");
+        } else {
+          setError(err instanceof Error ? err.message : "Failed to load chapter");
+        }
       } finally {
         setLoading(false);
       }
@@ -496,28 +526,25 @@ export default function EnhancedReader(props: ReaderProps) {
     setIsLoadingMore(true);
     
     try {
-      const res = await fetch(`${API}/library/${seriesSlug}/chapter/${nextNum}`);
-      if (!res.ok) return; // No more chapters
-      
-      const data = await res.json();
+      const data = await api.get(`/library/${seriesSlug}/chapter/${nextNum}`) as Record<string, unknown>;
       
       // Append pages to allPages
-      setAllPages(prev => [...prev, ...data.pages]);
+      setAllPages(prev => [...prev, ...(data.pages as Page[])]);
       setLastChapterNum(nextNum);
       setCurrentChapterNum(nextNum);
       
       // Update chapter with new data
       setChapter({
-        uuid: data.chapter_uuid,
-        name: data.chapter_name,
+        uuid: data.chapter_uuid as string,
+        name: data.chapter_name as string,
         index: 0,
-        pages: data.pages,
-        prev_chapter_uuid: data.prev_chapter_uuid,
-        next_chapter_uuid: data.next_chapter_uuid,
+        pages: data.pages as Page[],
+        prev_chapter_uuid: (data.prev_chapter_uuid as string) ?? null,
+        next_chapter_uuid: (data.next_chapter_uuid as string) ?? null,
         chapter_number: nextNum,
       });
-    } catch (err) {
-      console.error("Failed to load next chapter:", err);
+    } catch {
+      // Silently fail — no more chapters or network error
     } finally {
       setIsLoadingMore(false);
     }
@@ -630,7 +657,12 @@ export default function EnhancedReader(props: ReaderProps) {
     }
     
     progressTimerRef.current = setInterval(() => {
-      saveProgress(seriesSlug, chapter.uuid, currentPage, readingMode, zoom);
+      saveProgressLocal(seriesSlug, chapter.uuid, currentPage, readingMode, zoom);
+      // Also sync to server if authenticated (fire-and-forget)
+      const user = useAuthStore.getState().user;
+      if (user) {
+        saveProgressServer(seriesSlug, chapter.uuid, currentPage);
+      }
     }, PROGRESS_SAVE_INTERVAL);
     
     return () => {
