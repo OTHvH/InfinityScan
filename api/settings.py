@@ -84,6 +84,7 @@ class Settings:
 
     # ── Password policy ─────────────────────────────────────────────────
     min_password_length: int = int(os.environ.get("MIN_PASSWORD_LENGTH", "8"))
+    max_password_length: int = int(os.environ.get("MAX_PASSWORD_LENGTH", "128"))
 
     # ── CORS ────────────────────────────────────────────────────────────
     cors_origins: list[str] = field(

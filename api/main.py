@@ -66,7 +66,7 @@ from auth import (
     hash_refresh_token,
     set_cookie,
     clear_cookie,
-    verify_password,
+    verify_and_update_password,
 )
 from auth.schemas import (
     LoginIn,
@@ -305,22 +305,21 @@ def register(
     body: RegisterIn = Body(...),
     db: Session = Depends(get_db),
 ) -> RegisterOut:
-    if len(body.password) < _cfg.min_password_length:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Password must be at least {_cfg.min_password_length} characters",
-        )
-
     if db.scalar(select(User).where(User.username == body.username)):
         raise HTTPException(status_code=400, detail="Username already registered")
 
     if body.email and db.scalar(select(User).where(User.email == body.email)):
         raise HTTPException(status_code=400, detail="Email already registered")
 
+    try:
+        hashed = hash_password(body.password)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
     user = User(
         username=body.username,
         email=body.email,
-        hashed_password=hash_password(body.password),
+        hashed_password=hashed,
         role=UserRole.user,
     )
     db.add(user)
@@ -339,11 +338,19 @@ def login(
     db: Session = Depends(get_db),
 ) -> LoginOut:
     user = db.scalar(select(User).where(User.username == body.username))
-    if not user or not verify_password(body.password, user.hashed_password):
+    if not user:
+        raise HTTPException(status_code=401, detail="Incorrect username or password")
+
+    success, new_hash = verify_and_update_password(body.password, user.hashed_password)
+    if not success:
         raise HTTPException(status_code=401, detail="Incorrect username or password")
 
     if not user.is_active:
         raise HTTPException(status_code=403, detail="User account is disabled")
+
+    if new_hash is not None:
+        user.hashed_password = new_hash
+        db.commit()
 
     access = create_access_token(user.id, user.role.value)
     raw_refresh = _issue_refresh_token(db, user)

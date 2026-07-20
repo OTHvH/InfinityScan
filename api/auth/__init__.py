@@ -1,8 +1,8 @@
 """Core authentication primitives.
 
-• Password hashing (bcrypt via passlib)
+• Password hashing (Argon2id via pwdlib, legacy bcrypt fallback)
 • JWT access-token creation / verification
-• Refresh-token random-secret generation + bcrypt hashing
+• Refresh-token random-secret generation + SHA-256 hashing
 • Cookie helpers (set / clear)
 • CSRF token generation / validation
 
@@ -18,22 +18,64 @@ import uuid
 from datetime import datetime, timedelta, timezone
 
 import jwt
-from passlib.context import CryptContext
 from starlette.responses import Response
 
 from settings import get_settings
 
 # ── Password hashing ────────────────────────────────────────────────────────
+#
+# Primary:  Argon2id  (via pwdlib)
+# Fallback: bcrypt    (legacy — for existing DB rows only)
+#
+# On a successful bcrypt verify-and-update we rehash to Argon2id and return
+# the new hash so the caller can persist it.
 
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+from pwdlib import PasswordHash
+from pwdlib.hashers.argon2 import Argon2Hasher
+from pwdlib.hashers.bcrypt import BcryptHasher
+
+_password_hasher = PasswordHash([Argon2Hasher(), BcryptHasher()])
 
 
 def hash_password(password: str) -> str:
-    return pwd_context.hash(password)
+    """Hash a *new* password with Argon2id.
+
+    Raises ``ValueError`` for passwords outside the configured length bounds.
+    """
+    cfg = get_settings()
+    if len(password) < cfg.min_password_length:
+        raise ValueError(
+            f"Password must be at least {cfg.min_password_length} characters"
+        )
+    if len(password) > cfg.max_password_length:
+        raise ValueError(
+            f"Password must not exceed {cfg.max_password_length} characters"
+        )
+    return _password_hasher.hash(password)
 
 
 def verify_password(plain: str, hashed: str) -> bool:
-    return pwd_context.verify(plain, hashed)
+    """Verify *plain* against *hashed* (Argon2id or legacy bcrypt).
+
+    Never logs the password or hash.  Returns ``False`` on any error.
+    """
+    try:
+        return _password_hasher.verify(plain, hashed)
+    except Exception:
+        return False
+
+
+def verify_and_update_password(plain: str, hashed: str) -> tuple[bool, str | None]:
+    """Verify and, if the hash is outdated (e.g. bcrypt), rehash to Argon2id.
+
+    Returns ``(success, new_hash_or_None)``.
+    * ``new_hash_or_None`` is non-``None`` only when the caller should update
+      the stored hash.
+    """
+    try:
+        return _password_hasher.verify_and_update(plain, hashed)
+    except Exception:
+        return False, None
 
 
 # ── JWT access tokens ───────────────────────────────────────────────────────

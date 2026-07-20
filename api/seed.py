@@ -27,9 +27,7 @@ from models import (
     Base, User, Series, Chapter, Page, 
     ContentType, ReadingMode, SeriesStatus, UserRole
 )
-from passlib.context import CryptContext
-
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+from auth import hash_password
 
 
 def create_tables():
@@ -58,7 +56,7 @@ def create_admin_user(session):
     admin = User(
         username=admin_username,
         email=admin_email,
-        hashed_password=pwd_context.hash(admin_password),
+        hashed_password=hash_password(admin_password),
         role=UserRole.admin,
         is_active=True,
     )
