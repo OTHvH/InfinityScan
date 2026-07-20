@@ -147,6 +147,9 @@ class User(Base):
     reading_progress: Mapped[list[ReadingProgress]] = relationship(
         "ReadingProgress", back_populates="user", cascade="all, delete-orphan"
     )
+    refresh_tokens: Mapped[list[RefreshToken]] = relationship(
+        "RefreshToken", back_populates="user", cascade="all, delete-orphan"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -248,6 +251,27 @@ class Page(Base):
 # ---------------------------------------------------------------------------
 # User activity tables
 # ---------------------------------------------------------------------------
+
+class RefreshToken(Base):
+    """A hashed refresh token tied to a specific user session.
+
+    Only the SHA-256 digest of the token is stored.  The raw token is
+    sent to the client inside an httpOnly cookie and never persisted.
+    """
+
+    __tablename__ = "refresh_tokens"
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    token_hash: Mapped[str] = mapped_column(String(64), nullable=False, unique=True, index=True)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    revoked: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    user: Mapped[User] = relationship("User", back_populates="refresh_tokens")
+
 
 class Bookmark(Base):
     """A user's bookmark on a series (library entry)."""

@@ -1,0 +1,121 @@
+"""Strict Pydantic schemas for request validation and response serialisation.
+
+Every schema uses ``model_config = ConfigDict(extra="forbid")`` so that
+unexpected fields are rejected at the boundary.  Tokens are never returned
+in JSON — the ``TokenResponse`` only carries user metadata.
+
+Note: Auth schemas (RegisterIn, LoginIn, UserOut, RegisterOut, LoginOut)
+are now in auth/schemas.py.
+"""
+
+from __future__ import annotations
+
+from datetime import datetime
+from typing import Optional
+from uuid import UUID
+
+from pydantic import BaseModel, ConfigDict, EmailStr, Field
+
+
+# ── Shared base ──────────────────────────────────────────────────────────────
+
+
+class _Strict(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+
+# ── Content schemas ─────────────────────────────────────────────────────────
+
+
+class ComicOut(_Strict):
+    path_word: str
+    name: str
+    alias: str | None
+    cover: str | None
+    status: dict | None
+    author: list[dict] | None
+    theme: list[dict] | None
+    brief: str | None
+    last_chapter: dict | None
+
+
+class LocalSeriesOut(_Strict):
+    id: str
+    slug: str
+    title: str
+    synopsis: str | None
+    cover_url: str | None
+    content_type: str
+    status: str
+    year: int | None
+    is_nsfw: bool
+
+
+class LocalChapterOut(_Strict):
+    id: str
+    number: float
+    title: str | None
+    page_count: int
+    published_at: str | None
+
+
+class LocalSeriesDetailOut(LocalSeriesOut):
+    chapters: list[LocalChapterOut] = []
+
+
+class ChapterItem(_Strict):
+    uuid: str
+    name: str
+    index: int
+    count: int
+
+
+class ChapterListOut(_Strict):
+    total: int
+    limit: int
+    offset: int
+    list: list[ChapterItem]
+
+
+class PageMeta(_Strict):
+    page_number: int
+    url: str
+
+
+class ChapterPagesOut(_Strict):
+    chapter_uuid: str
+    chapter_name: str
+    comic_path_word: str
+    pages: list[PageMeta]
+    prev_chapter_uuid: str | None
+    next_chapter_uuid: str | None
+
+
+class ReaderPayload(_Strict):
+    start_chapter_uuid: str
+    chapters: list[ChapterPagesOut]
+
+
+class BookmarkIn(_Strict):
+    series_path_word: str
+    series_name: str
+
+
+class BookmarkOut(_Strict):
+    id: UUID
+    series_path_word: str
+    series_name: str
+
+
+class ProgressIn(_Strict):
+    chapter_uuid: str
+    last_page: Optional[int] = None
+    scroll_position: Optional[float] = None
+    completed: bool = False
+
+
+class ProgressOut(_Strict):
+    chapter_uuid: str
+    last_page: Optional[int]
+    scroll_position: Optional[float]
+    completed: bool

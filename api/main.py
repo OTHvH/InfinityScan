@@ -6,12 +6,18 @@ User state (bookmarks, reading progress) is persisted in the local PostgreSQL da
 
 User identity
 -------------
-Pass a stable UUID as the ``X-User-ID`` request header.  If omitted a per-request
-anonymous UUID is used (state endpoints will therefore not be retrievable later).
+Authentication is cookie-based.  On login the server sets:
+  • ``is_access``  — short-lived httpOnly JWT cookie
+  • ``is_refresh`` — long-lived httpOnly opaque cookie (rotated on each use)
+  • ``is_csrf``    — non-httpOnly cookie read by the frontend and sent back as
+                     the ``X-CSRF-Token`` header on state-changing requests.
+
+X-User-ID is NOT used.  All identity derives from the session cookies.
 
 Environment variables
 ---------------------
 DATABASE_URL       postgresql+psycopg://user:pass@host:5432/db
+SECRET_KEY         HMAC signing key for JWTs (auto-generated if omitted)
 COPYMANGA_API      https://api.copymanga.tv  (default)
 COPYMANGA_TOKEN    optional bearer token for CopyManga (raises rate-limits)
 S3_PUBLIC_URL      https://cdn.example.com  (prefix used when building cover URLs)
@@ -19,20 +25,25 @@ CORS_ORIGINS       comma-separated list of allowed origins (default: http://loca
 """
 
 import os
-import secrets
 import sys
 import uuid
 from contextlib import asynccontextmanager
-from typing import Any, Optional
+from datetime import datetime, timedelta, timezone
+from typing import Annotated, Any
 
 import httpx
-from fastapi import Depends, FastAPI, Header, HTTPException, Path, Query, Request
+from fastapi import Body, Depends, FastAPI, HTTPException, Path, Query, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel
-from sqlalchemy import create_engine, func, select
-from sqlalchemy.orm import Session, joinedload, sessionmaker
+from sqlalchemy import func, select
+from sqlalchemy.orm import Session, joinedload
+from slowapi import Limiter
+from slowapi.errors import RateLimitExceeded
+from slowapi.middleware import SlowAPIMiddleware
+from slowapi.util import get_remote_address
 
+from settings import get_settings
+from database import get_db
 from models import (
     Bookmark,
     Chapter,
@@ -40,104 +51,67 @@ from models import (
     Page,
     ReadingMode,
     ReadingProgress,
+    RefreshToken,
     Series,
     SeriesStatus,
     User,
     UserRole,
 )
-
-# Auth imports
-from datetime import datetime, timedelta
-import jwt
-from passlib.context import CryptContext
-from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
-from slowapi import Limiter
-from slowapi.errors import RateLimitExceeded
-from slowapi.middleware import SlowAPIMiddleware
-from slowapi.util import get_remote_address
-
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
-oauth2_scheme = OAuth2PasswordBearer(tokenUrl="api/token")
-
-# JWT configuration
-SECRET_KEY = os.environ.get("SECRET_KEY")
-if not SECRET_KEY:
-    SECRET_KEY = secrets.token_hex(32)
-    print(
-        "WARNING: SECRET_KEY not set — generated ephemeral key for local dev. "
-        "Tokens will not survive restarts.",
-        file=sys.stderr,
-    )
-ALGORITHM = "HS256"
-ACCESS_TOKEN_EXPIRE_HOURS = 24
-
-
-def create_access_token(user_id: uuid.UUID) -> str:
-    """Create a JWT access token with expiration."""
-    expire = datetime.utcnow() + timedelta(hours=ACCESS_TOKEN_EXPIRE_HOURS)
-    to_encode = {"sub": str(user_id), "exp": expire}
-    return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
-
-
-def verify_token(token: str) -> uuid.UUID | None:
-    """Verify a JWT token and return the user ID if valid."""
-    try:
-        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-        user_id = payload.get("sub")
-        if user_id is None:
-            return None
-        return uuid.UUID(user_id)
-    except (jwt.PyJWTError, ValueError, AttributeError):
-        return None
+from auth import (
+    create_access_token,
+    decode_access_token,
+    generate_csrf_token,
+    generate_refresh_token,
+    hash_password,
+    hash_refresh_token,
+    set_cookie,
+    clear_cookie,
+    verify_password,
+)
+from auth.schemas import (
+    LoginIn,
+    LoginOut,
+    RegisterIn,
+    RegisterOut,
+    UserOut,
+)
+from deps import get_current_user, require_csrf, require_role
+from schemas import (
+    BookmarkIn,
+    BookmarkOut,
+    ChapterItem,
+    ChapterListOut,
+    ChapterPagesOut,
+    ComicOut,
+    LocalChapterOut,
+    LocalSeriesDetailOut,
+    LocalSeriesOut,
+    PageMeta,
+    ProgressIn,
+    ProgressOut,
+    ReaderPayload,
+)
 
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
 
-DATABASE_URL: str = os.environ.get("DATABASE_URL", "")
-COPYMANGA_API: str = os.environ.get("COPYMANGA_API", "https://api.copymanga.tv").rstrip("/")
-COPYMANGA_TOKEN: str = os.environ.get("COPYMANGA_TOKEN", "")
-S3_PUBLIC_URL: str = os.environ.get("S3_PUBLIC_URL", "").rstrip("/")
-CORS_ORIGINS: list[str] = [
-    o.strip()
-    for o in os.environ.get("CORS_ORIGINS", "http://localhost:3000").split(",")
-    if o.strip()
-]
+_cfg = get_settings()
+
+COPYMANGA_API: str = _cfg.copymanga_api
+S3_PUBLIC_URL: str = _cfg.s3_public_url
 
 _COPYMANGA_HEADERS: dict[str, str] = {
     "User-Agent": "Mozilla/5.0 (compatible; InfinityScan/1.0)",
     "Accept": "application/json",
 }
-if COPYMANGA_TOKEN:
-    _COPYMANGA_HEADERS["Authorization"] = f"Token {COPYMANGA_TOKEN}"
+if _cfg.copymanga_token:
+    _COPYMANGA_HEADERS["Authorization"] = f"Token {_cfg.copymanga_token}"
 
 # ---------------------------------------------------------------------------
-# Database
+# Database (imported from database.py)
 # ---------------------------------------------------------------------------
-
-engine = create_engine(DATABASE_URL, pool_pre_ping=True) if DATABASE_URL else None
-SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False) if engine else None
-
-
-def get_db() -> Session:  # type: ignore[return]
-    if SessionLocal is None:
-        raise HTTPException(status_code=503, detail="DATABASE_URL is not configured")
-    db: Session = SessionLocal()
-    try:
-        yield db  # type: ignore[misc]
-    finally:
-        db.close()
-
-
-def get_user_id(x_user_id: Optional[str] = Header(None)) -> uuid.UUID:
-    """Resolve caller UUID from ``X-User-ID`` header (falls back to a random UUID)."""
-    if x_user_id:
-        try:
-            return uuid.UUID(x_user_id)
-        except (ValueError, AttributeError):
-            pass  # Fall back to anonymous UUID for invalid headers
-    return uuid.uuid4()
-
+# SessionLocal is now accessed via database module
 
 # ---------------------------------------------------------------------------
 # HTTP client lifecycle
@@ -197,138 +171,11 @@ app.add_middleware(SlowAPIMiddleware)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=CORS_ORIGINS,
+    allow_origins=_cfg.cors_origins,
     allow_methods=["*"],
     allow_headers=["*"],
+    allow_credentials=True,
 )
-
-# ---------------------------------------------------------------------------
-# Output schemas
-# ---------------------------------------------------------------------------
-
-
-class ComicOut(BaseModel):
-    path_word: str
-    name: str
-    alias: str | None
-    cover: str | None
-    status: dict | None
-    author: list[dict] | None
-    theme: list[dict] | None
-    brief: str | None
-    last_chapter: dict | None
-
-
-class LocalSeriesOut(BaseModel):
-    """Local-library series row serialised for the browser."""
-
-    id: str
-    slug: str
-    title: str
-    synopsis: str | None
-    cover_url: str | None  # fully-resolved CDN / S3 URL
-    content_type: str
-    status: str
-    year: int | None
-    is_nsfw: bool
-
-
-class LocalChapterOut(BaseModel):
-    """Local-library chapter row."""
-
-    id: str
-    number: float
-    title: str | None
-    page_count: int
-    published_at: str | None
-
-
-class LocalSeriesDetailOut(LocalSeriesOut):
-    """Local-library series with chapters."""
-
-    chapters: list[LocalChapterOut] = []
-
-
-class ChapterItem(BaseModel):
-    uuid: str
-    name: str
-    index: int
-    count: int  # page count
-
-
-class ChapterListOut(BaseModel):
-    total: int
-    limit: int
-    offset: int
-    list: list[ChapterItem]
-
-
-class PageMeta(BaseModel):
-    page_number: int
-    url: str  # direct CDN / proxy URL
-
-
-class ChapterPagesOut(BaseModel):
-    chapter_uuid: str
-    chapter_name: str
-    comic_path_word: str
-    pages: list[PageMeta]
-    prev_chapter_uuid: str | None
-    next_chapter_uuid: str | None
-
-
-class ReaderPayload(BaseModel):
-    """Continuous reader response — starting chapter + look-ahead chunks."""
-
-    start_chapter_uuid: str
-    chapters: list[ChapterPagesOut]
-
-
-class BookmarkIn(BaseModel):
-    series_path_word: str
-    series_name: str
-
-
-class BookmarkOut(BaseModel):
-    id: uuid.UUID
-    series_path_word: str
-    series_name: str
-
-
-class ProgressIn(BaseModel):
-    chapter_uuid: str
-    last_page: Optional[int] = None
-    scroll_position: Optional[float] = None
-    completed: bool = False
-
-
-class ProgressOut(BaseModel):
-    chapter_uuid: str
-    last_page: Optional[int]
-    scroll_position: Optional[float]
-    completed: bool
-
-
-# ---------------------------------------------------------------------------# Auth schemas# ---------------------------------------------------------------------------
-
-class UserCreate(BaseModel):
-    username: str
-    email: Optional[str] = None
-    password: str
-
-
-class UserOut(BaseModel):
-    id: str
-    username: str
-    email: Optional[str]
-    role: str
-    is_active: bool
-
-
-class Token(BaseModel):
-    access_token: str
-    token_type: str
-    user: UserOut
 
 
 # ---------------------------------------------------------------------------
@@ -345,8 +192,7 @@ def _ensure_absolute_cover(url: str | None) -> str | None:
 
 
 def _page_url(raw_url: str) -> str:
-    """Return the page image URL, optionally rewriting to our proxy."""
-    return raw_url  # extend here to add signed URLs or proxy rewriting
+    return raw_url
 
 
 def _extract_chapters(raw_list: list[dict]) -> list[ChapterItem]:
@@ -384,6 +230,59 @@ async def _fetch_chapter_pages(path_word: str, chapter_uuid: str) -> ChapterPage
     )
 
 
+def _set_auth_cookies(response: Response, access_token: str, refresh_token: str) -> None:
+    """Set access, refresh, and CSRF cookies on *response*."""
+    cfg = get_settings()
+    set_cookie(response, cfg.access_cookie_name, access_token,
+               max_age=cfg.access_token_ttl_minutes * 60)
+    set_cookie(response, cfg.refresh_cookie_name, refresh_token,
+               max_age=cfg.refresh_token_ttl_days * 86400)
+    csrf = generate_csrf_token()
+    set_cookie(response, cfg.csrf_cookie_name, csrf,
+               max_age=cfg.refresh_token_ttl_days * 86400,
+               http_only=False)
+
+
+def _clear_auth_cookies(response: Response) -> None:
+    cfg = get_settings()
+    clear_cookie(response, cfg.access_cookie_name)
+    clear_cookie(response, cfg.refresh_cookie_name)
+    clear_cookie(response, cfg.csrf_cookie_name)
+
+
+def _user_to_out(user: User) -> UserOut:
+    return UserOut(
+        id=str(user.id),
+        username=user.username,
+        email=user.email,
+        role=user.role.value,
+        is_active=user.is_active,
+        created_at=user.created_at.isoformat() if user.created_at else "",
+    )
+
+
+def _issue_refresh_token(db: Session, user: User) -> str:
+    """Generate, hash, and store a refresh token.  Returns the raw token."""
+    raw = generate_refresh_token()
+    db.add(RefreshToken(
+        user_id=user.id,
+        token_hash=hash_refresh_token(raw),
+        expires_at=datetime.now(timezone.utc) + timedelta(days=get_settings().refresh_token_ttl_days),
+    ))
+    db.commit()
+    return raw
+
+
+def _revoke_all_refresh_tokens(db: Session, user: User) -> None:
+    from sqlalchemy import update
+    db.execute(
+        update(RefreshToken)
+        .where(RefreshToken.user_id == user.id, RefreshToken.revoked == False)  # noqa: E712
+        .values(revoked=True)
+    )
+    db.commit()
+
+
 # ---------------------------------------------------------------------------
 # Routes — health
 # ---------------------------------------------------------------------------
@@ -399,105 +298,129 @@ def health() -> dict:
 # ---------------------------------------------------------------------------
 
 
-@app.post("/register", response_model=UserOut, summary="Register new user")
-@limiter.limit("5/minute")
+@app.post("/register", response_model=RegisterOut, summary="Register new user")
+@limiter.limit(_cfg.register_rate_limit)
 def register(
     request: Request,
-    user_data: UserCreate,
+    body: RegisterIn = Body(...),
     db: Session = Depends(get_db),
-) -> UserOut:
-    # Validate password
-    if len(user_data.password) < 6:
-        raise HTTPException(status_code=400, detail="Password must be at least 6 characters")
-    
-    # Check if username exists
-    existing = db.scalar(select(User).where(User.username == user_data.username))
-    if existing:
+) -> RegisterOut:
+    if len(body.password) < _cfg.min_password_length:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Password must be at least {_cfg.min_password_length} characters",
+        )
+
+    if db.scalar(select(User).where(User.username == body.username)):
         raise HTTPException(status_code=400, detail="Username already registered")
-    
-    # Check if email exists
-    if user_data.email:
-        existing_email = db.scalar(select(User).where(User.email == user_data.email))
-        if existing_email:
-            raise HTTPException(status_code=400, detail="Email already registered")
-    
-    # Create user
-    hashed_password = pwd_context.hash(user_data.password)
+
+    if body.email and db.scalar(select(User).where(User.email == body.email)):
+        raise HTTPException(status_code=400, detail="Email already registered")
+
     user = User(
-        username=user_data.username,
-        email=user_data.email,
-        hashed_password=hashed_password,
+        username=body.username,
+        email=body.email,
+        hashed_password=hash_password(body.password),
         role=UserRole.user,
     )
     db.add(user)
     db.commit()
     db.refresh(user)
-    
-    return UserOut(
-        id=str(user.id),
-        username=user.username,
-        email=user.email,
-        role=user.role.value,
-        is_active=user.is_active,
-    )
+
+    return RegisterOut(user=_user_to_out(user))
 
 
-@app.post("/token", response_model=Token, summary="Login and get token")
-@limiter.limit("10/minute")
+@app.post("/token", response_model=LoginOut, summary="Login and set session cookies")
+@limiter.limit(_cfg.login_rate_limit)
 def login(
     request: Request,
-    form_data: OAuth2PasswordRequestForm = Depends(),
+    response: Response,
+    body: LoginIn = Body(...),
     db: Session = Depends(get_db),
-) -> Token:
-    user = db.scalar(select(User).where(User.username == form_data.username))
-    if not user or not pwd_context.verify(form_data.password, user.hashed_password):
+) -> LoginOut:
+    user = db.scalar(select(User).where(User.username == body.username))
+    if not user or not verify_password(body.password, user.hashed_password):
         raise HTTPException(status_code=401, detail="Incorrect username or password")
-    
+
     if not user.is_active:
         raise HTTPException(status_code=403, detail="User account is disabled")
-    
-    # Generate JWT token with expiration
-    access_token = create_access_token(user.id)
-    
-    return Token(
-        access_token=access_token,
-        token_type="bearer",
-        user=UserOut(
-            id=str(user.id),
-            username=user.username,
-            email=user.email,
-            role=user.role.value,
-            is_active=user.is_active,
-        ),
-    )
+
+    access = create_access_token(user.id, user.role.value)
+    raw_refresh = _issue_refresh_token(db, user)
+
+    _set_auth_cookies(response, access, raw_refresh)
+    return LoginOut(user=_user_to_out(user))
 
 
-@app.get("/me", response_model=UserOut, summary="Get current user")
-def get_current_user(
-    authorization: Optional[str] = Header(None),
+@app.post("/logout", summary="Clear session cookies and revoke refresh token")
+def logout(
+    request: Request,
+    response: Response,
+    user: User = Depends(get_current_user),
+    _csrf: None = Depends(require_csrf),
     db: Session = Depends(get_db),
-) -> UserOut:
-    if not authorization or not authorization.startswith("Bearer "):
-        raise HTTPException(status_code=401, detail="Not authenticated")
-    
-    token = authorization.replace("Bearer ", "")
-    
-    # Verify JWT token
-    user_id = verify_token(token)
-    if not user_id:
-        raise HTTPException(status_code=401, detail="Invalid or expired token")
-    
-    user = db.scalar(select(User).where(User.id == user_id))
-    if not user:
-        raise HTTPException(status_code=401, detail="User not found")
-    
-    return UserOut(
-        id=str(user.id),
-        username=user.username,
-        email=user.email,
-        role=user.role.value,
-        is_active=user.is_active,
-    )
+) -> dict:
+    cfg = get_settings()
+    raw_refresh: str | None = request.cookies.get(cfg.refresh_cookie_name)
+    if raw_refresh:
+        token_hash = hash_refresh_token(raw_refresh)
+        rt = db.scalar(select(RefreshToken).where(RefreshToken.token_hash == token_hash))
+        if rt:
+            rt.revoked = True
+            db.commit()
+
+    _clear_auth_cookies(response)
+    return {"detail": "Logged out"}
+
+
+@app.post("/refresh", summary="Rotate refresh token and issue new access token")
+def refresh_token(
+    request: Request,
+    response: Response,
+    db: Session = Depends(get_db),
+) -> dict:
+    cfg = get_settings()
+    raw_refresh: str | None = request.cookies.get(cfg.refresh_cookie_name)
+    if not raw_refresh:
+        raise HTTPException(status_code=401, detail="No refresh token")
+
+    token_hash = hash_refresh_token(raw_refresh)
+    rt = db.scalar(select(RefreshToken).where(RefreshToken.token_hash == token_hash))
+
+    if not rt or rt.revoked:
+        # Possible token reuse — revoke all tokens for this user
+        if rt:
+            _revoke_all_refresh_tokens(db, rt.user)
+        raise HTTPException(status_code=401, detail="Invalid refresh token")
+
+    expires = rt.expires_at
+    now_utc = datetime.now(timezone.utc)
+    if expires.tzinfo is None:
+        expires = expires.replace(tzinfo=timezone.utc)
+    if expires < now_utc:
+        rt.revoked = True
+        db.commit()
+        raise HTTPException(status_code=401, detail="Refresh token expired")
+
+    # Revoke the old token (rotation)
+    rt.revoked = True
+    db.commit()
+
+    user = db.scalar(select(User).where(User.id == rt.user_id))
+    if not user or not user.is_active:
+        _clear_auth_cookies(response)
+        raise HTTPException(status_code=401, detail="User not found or disabled")
+
+    access = create_access_token(user.id, user.role.value)
+    new_refresh = _issue_refresh_token(db, user)
+
+    _set_auth_cookies(response, access, new_refresh)
+    return {"detail": "Token refreshed"}
+
+
+@app.get("/me", response_model=UserOut, summary="Get current user from session cookie")
+def get_me(user: User = Depends(get_current_user)) -> UserOut:
+    return _user_to_out(user)
 
 
 # ---------------------------------------------------------------------------
@@ -507,7 +430,7 @@ def get_current_user(
 
 @app.get("/series", summary="List local library or search series on CopyManga")
 async def search_series(
-    q: Optional[str] = Query(
+    q: str | None = Query(
         None,
         min_length=1,
         description="Search query — omit to list the local library",
@@ -515,11 +438,6 @@ async def search_series(
     limit: int = Query(24, ge=1, le=100),
     offset: int = Query(0, ge=0),
 ) -> Any:
-    """
-    - **With** ``q``: proxy CopyManga search and return raw comic summaries.
-    - **Without** ``q``: return series rows from the local PostgreSQL database
-      (fields match :class:`LocalSeriesOut`).
-    """
     if q:
         results = await copymanga("search/comic", q=q, limit=limit, offset=offset, platform=1)
         comics = results.get("list") or []
@@ -532,17 +450,19 @@ async def search_series(
             "list": comics,
         }
 
-    # Local library listing
-    if SessionLocal is None:
-        raise HTTPException(status_code=503, detail="DATABASE_URL is not configured")
-    db: Session = SessionLocal()
+    from database import get_db
+    db_gen = get_db()
+    db: Session = next(db_gen)
     try:
         total: int = db.scalar(select(func.count()).select_from(Series)) or 0
         rows = list(
             db.scalars(select(Series).order_by(Series.title).offset(offset).limit(limit)).all()
         )
     finally:
-        db.close()
+        try:
+            next(db_gen)
+        except StopIteration:
+            pass
 
     return {
         "total": total,
@@ -572,15 +492,14 @@ def get_local_series(
     slug: str,
     db: Session = Depends(get_db),
 ) -> LocalSeriesDetailOut:
-    """Get a local series by slug with its chapters."""
     series = db.scalar(select(Series).where(Series.slug == slug))
     if not series:
         raise HTTPException(status_code=404, detail="Series not found")
-    
+
     chapters = list(db.scalars(
         select(Chapter).where(Chapter.series_id == series.id).order_by(Chapter.number)
     ).all())
-    
+
     return LocalSeriesDetailOut(
         id=str(series.id),
         slug=series.slug,
@@ -614,43 +533,38 @@ def get_local_chapter_pages(
     number: float,
     db: Session = Depends(get_db),
 ) -> ChapterPagesOut:
-    """Get pages for a local chapter by series slug and chapter number."""
-    from pathlib import Path
-    from fastapi.responses import FileResponse
-    
     API_BASE = os.environ.get("NEXT_PUBLIC_API_URL", "http://localhost:8000")
-    
+
     series = db.scalar(select(Series).where(Series.slug == slug))
     if not series:
         raise HTTPException(status_code=404, detail="Series not found")
-    
+
     chapter = db.scalar(
         select(Chapter).where(
             Chapter.series_id == series.id,
-            Chapter.number == number
+            Chapter.number == number,
         )
     )
     if not chapter:
         raise HTTPException(status_code=404, detail="Chapter not found")
-    
+
     pages = list(db.scalars(
         select(Page).where(Page.chapter_id == chapter.id).order_by(Page.page_number)
     ).all())
-    
-    # Get prev/next chapters
+
     prev_chapter = db.scalar(
         select(Chapter).where(
             Chapter.series_id == series.id,
-            Chapter.number < number
+            Chapter.number < number,
         ).order_by(Chapter.number.desc()).limit(1)
     )
     next_chapter = db.scalar(
         select(Chapter).where(
             Chapter.series_id == series.id,
-            Chapter.number > number
+            Chapter.number > number,
         ).order_by(Chapter.number).limit(1)
     )
-    
+
     return ChapterPagesOut(
         chapter_uuid=str(chapter.id),
         chapter_name=chapter.title or f"Chapter {chapter.number}",
@@ -676,47 +590,38 @@ def get_local_page(
     page_id: str,
     db: Session = Depends(get_db),
 ):
-    """Redirect to local page image."""
     from pathlib import Path
     from fastapi.responses import FileResponse
-    
+
     try:
         page_uuid = uuid.UUID(page_id)
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid page ID")
-    
+
     page = db.scalar(select(Page).where(Page.id == page_uuid))
     if not page:
         raise HTTPException(status_code=404, detail="Page not found")
-    
-    # For local files, we serve from the filesystem
-    # The object_key contains the path relative to the manga folder
-    # Configure via MANGA_LOCAL_PATH environment variable
+
     manga_base = Path(os.environ.get("MANGA_LOCAL_PATH", ""))
     if not manga_base:
         raise HTTPException(status_code=500, detail="MANGA_LOCAL_PATH not configured")
     object_key = page.object_key
-    
-    # Parse the object key to get the actual file path
-    # Format: "{series_slug}/{chapter_num}/{filename}"
+
     parts = object_key.split("/")
     if len(parts) >= 3:
-        # The filename contains the full path structure
         file_path = manga_base / parts[0] / parts[1] / parts[2]
     else:
-        # Try to find the file directly
         file_path = manga_base / object_key
-    
+
     if not file_path.exists():
         raise HTTPException(status_code=404, detail="Image file not found")
-    
-    # Determine content type
+
     content_type = "image/jpeg"
     if file_path.suffix.lower() == ".png":
         content_type = "image/png"
     elif file_path.suffix.lower() == ".webp":
         content_type = "image/webp"
-    
+
     return FileResponse(file_path, media_type=content_type)
 
 
@@ -784,12 +689,6 @@ async def get_reader_payload(
         description="How many subsequent chapters to pre-fetch (0–5)",
     ),
 ) -> ReaderPayload:
-    """
-    Returns the requested chapter's pages **plus** up to ``look_ahead`` next
-    chapters fetched sequentially from CopyManga (each chapter's UUID is
-    discovered from the previous chapter's ``next_id`` pointer).
-    """
-    # Fetch starting chapter first to discover next pointers.
     start = await _fetch_chapter_pages(path_word, chapter_uuid)
     chunks: list[ChapterPagesOut] = [start]
 
@@ -805,7 +704,7 @@ async def get_reader_payload(
 
 
 # ---------------------------------------------------------------------------
-# Routes — bookmarks (local DB)
+# Routes — bookmarks (local DB, user-isolated)
 # ---------------------------------------------------------------------------
 
 
@@ -813,13 +712,13 @@ async def get_reader_payload(
 def list_bookmarks(
     limit: int = Query(50, ge=1, le=200),
     offset: int = Query(0, ge=0),
-    user_id: uuid.UUID = Depends(get_user_id),
+    user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> list[BookmarkOut]:
     stmt = (
         select(Bookmark)
         .options(joinedload(Bookmark.series))
-        .where(Bookmark.user_id == user_id)
+        .where(Bookmark.user_id == user.id)
         .order_by(Bookmark.created_at.desc())
         .offset(offset)
         .limit(limit)
@@ -837,11 +736,11 @@ def list_bookmarks(
 
 @app.post("/bookmarks", response_model=BookmarkOut, status_code=201, summary="Add bookmark")
 def add_bookmark(
-    body: BookmarkIn,
-    user_id: uuid.UUID = Depends(get_user_id),
+    body: BookmarkIn = Body(...),
+    user: User = Depends(get_current_user),
+    _csrf: None = Depends(require_csrf),
     db: Session = Depends(get_db),
 ) -> BookmarkOut:
-    # Look up or create a local Series placeholder keyed by slug.
     series_row = db.scalar(select(Series).where(Series.slug == body.series_path_word))
     if series_row is None:
         series_row = Series(
@@ -852,12 +751,11 @@ def add_bookmark(
             status=SeriesStatus.ongoing,
         )
         db.add(series_row)
-        db.flush()  # assign series_row.id without a full commit
+        db.flush()
 
-    # Upsert — if bookmark exists return it.
     existing = db.scalar(
         select(Bookmark).where(
-            Bookmark.user_id == user_id,
+            Bookmark.user_id == user.id,
             Bookmark.series_id == series_row.id,
         )
     )
@@ -868,7 +766,7 @@ def add_bookmark(
             series_name=series_row.title,
         )
 
-    bm = Bookmark(user_id=user_id, series_id=series_row.id)
+    bm = Bookmark(user_id=user.id, series_id=series_row.id)
     db.add(bm)
     db.commit()
     db.refresh(bm)
@@ -882,38 +780,37 @@ def add_bookmark(
 @app.delete("/bookmarks/{path_word}", status_code=204, summary="Remove bookmark")
 def remove_bookmark(
     path_word: str = Path(...),
-    user_id: uuid.UUID = Depends(get_user_id),
+    user: User = Depends(get_current_user),
+    _csrf: None = Depends(require_csrf),
     db: Session = Depends(get_db),
 ):
+    from fastapi.responses import Response
+
     series_row = db.scalar(select(Series).where(Series.slug == path_word))
     if series_row is None:
-        from fastapi.responses import Response
         return Response(status_code=204)
 
     bm = db.scalar(
         select(Bookmark).where(
-            Bookmark.user_id == user_id,
+            Bookmark.user_id == user.id,
             Bookmark.series_id == series_row.id,
         )
     )
     if bm:
         db.delete(bm)
         db.commit()
-    from fastapi.responses import Response
     return Response(status_code=204)
 
 
 # ---------------------------------------------------------------------------
-# Routes — reading progress (local DB keyed by chapter UUID stored in chapter slug)
+# Routes — reading progress (local DB, user-isolated)
 # ---------------------------------------------------------------------------
 
 
 def _find_or_create_chapter(db: Session, chapter_uuid: str, path_word: str) -> Chapter:
-    """Return existing Chapter row or create a thin placeholder keyed by UUID."""
     row = db.scalar(select(Chapter).where(Chapter.id == uuid.UUID(chapter_uuid)))
     if row:
         return row
-    # Ensure Series placeholder exists.
     series_row = db.scalar(select(Series).where(Series.slug == path_word))
     if series_row is None:
         series_row = Series(
@@ -944,7 +841,7 @@ def _find_or_create_chapter(db: Session, chapter_uuid: str, path_word: str) -> C
 def get_progress(
     path_word: str = Path(...),
     chapter_uuid: str = Path(...),
-    user_id: uuid.UUID = Depends(get_user_id),
+    user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> ProgressOut:
     try:
@@ -953,7 +850,7 @@ def get_progress(
         raise HTTPException(status_code=400, detail="chapter_uuid must be a valid UUID")
     row = db.scalar(
         select(ReadingProgress).where(
-            ReadingProgress.user_id == user_id,
+            ReadingProgress.user_id == user.id,
             ReadingProgress.chapter_id == ch_id,
         )
     )
@@ -978,10 +875,11 @@ def get_progress(
     summary="Upsert reading progress for a chapter",
 )
 def upsert_progress(
-    body: ProgressIn,
+    body: ProgressIn = Body(...),
     path_word: str = Path(...),
     chapter_uuid: str = Path(...),
-    user_id: uuid.UUID = Depends(get_user_id),
+    user: User = Depends(get_current_user),
+    _csrf: None = Depends(require_csrf),
     db: Session = Depends(get_db),
 ) -> ProgressOut:
     try:
@@ -993,13 +891,13 @@ def upsert_progress(
 
     row = db.scalar(
         select(ReadingProgress).where(
-            ReadingProgress.user_id == user_id,
+            ReadingProgress.user_id == user.id,
             ReadingProgress.chapter_id == ch_id,
         )
     )
     if row is None:
         row = ReadingProgress(
-            user_id=user_id,
+            user_id=user.id,
             chapter_id=ch_id,
             last_page=body.last_page,
             scroll_position=body.scroll_position,
