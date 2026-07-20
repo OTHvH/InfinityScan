@@ -28,8 +28,8 @@ from auth import (
 )
 from auth.schemas import LoginIn, LoginOut, RegisterIn, RegisterOut, UserOut
 from database import get_db
-from deps import get_current_user, require_csrf
-from models import User, UserRole
+from deps import get_current_session, get_current_user, require_csrf
+from models import RefreshSession, User, UserRole
 from session import (
     issue_access_token,
     issue_refresh_session,
@@ -199,8 +199,6 @@ def refresh(
     new_raw, new_session_id = result
 
     # Look up user to get role for the new access token
-    from models import RefreshSession
-
     session = db.scalar(select(RefreshSession).where(RefreshSession.id == new_session_id))
     if not session:
         _clear_auth_cookies(response)
@@ -226,35 +224,19 @@ def refresh(
 def logout(
     request: Request,
     response: Response,
-    user: User = Depends(get_current_user),
+    session: RefreshSession = Depends(get_current_session),
     _csrf: None = Depends(require_csrf),
     db: Session = Depends(get_db),
 ) -> dict:
     cfg = get_settings()
 
-    # Extract session ID from access token to revoke that session
-    access_token: str | None = request.cookies.get(cfg.access_cookie_name)
-    if access_token:
-        import jwt as _jwt
-
-        try:
-            payload = _jwt.decode(
-                access_token,
-                cfg.secret_key,
-                algorithms=[cfg.jwt_algorithm],
-                options={"verify_exp": False},
-            )
-            session_id = payload.get("sid")
-            if session_id:
-                revoke_session(db, uuid.UUID(session_id))
-        except Exception:
-            pass
+    # Revoke the validated session (already confirmed active by dependency)
+    revoke_session(db, session.id)
 
     # Also revoke the refresh session directly if present
     raw_refresh: str | None = request.cookies.get(cfg.refresh_cookie_name)
     if raw_refresh:
         from auth import hash_refresh_token
-        from models import RefreshSession
 
         token_hash = hash_refresh_token(raw_refresh)
         rs = db.scalar(

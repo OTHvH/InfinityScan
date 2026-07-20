@@ -51,6 +51,7 @@ from models import (
     Page,
     ReadingMode,
     ReadingProgress,
+    RefreshSession,
     RefreshToken,
     Series,
     SeriesStatus,
@@ -75,6 +76,7 @@ from auth.schemas import (
     RegisterOut,
     UserOut,
 )
+from session import issue_access_token, issue_refresh_session, rotate_refresh_token
 from deps import get_current_user, require_csrf, require_role
 from schemas import (
     BookmarkIn,
@@ -371,8 +373,9 @@ def login(
         user.hashed_password = new_hash
         db.commit()
 
-    access = create_access_token(user.id, user.role.value)
-    raw_refresh = _issue_refresh_token(db, user)
+    user_agent = request.headers.get("User-Agent", "")
+    raw_refresh, session_id = issue_refresh_session(db, user_id=user.id, user_agent=user_agent)
+    access = issue_access_token(user.id, session_id, user.role.value)
 
     _set_auth_cookies(response, access, raw_refresh)
     return LoginOut(user=_user_to_out(user))
@@ -390,13 +393,14 @@ def logout(
     _csrf: None = Depends(require_csrf),
     db: Session = Depends(get_db),
 ) -> dict:
-    cfg = get_settings()
-    raw_refresh: str | None = request.cookies.get(cfg.refresh_cookie_name)
+    raw_refresh: str | None = request.cookies.get(_cfg.refresh_cookie_name)
     if raw_refresh:
         token_hash = hash_refresh_token(raw_refresh)
-        rt = db.scalar(select(RefreshToken).where(RefreshToken.token_hash == token_hash))
-        if rt:
-            rt.revoked = True
+        session = db.scalar(
+            select(RefreshSession).where(RefreshSession.token_hash == token_hash)
+        )
+        if session and session.revoked_at is None:
+            session.revoked_at = datetime.now(timezone.utc)
             db.commit()
 
     _clear_auth_cookies(response)
@@ -413,40 +417,29 @@ def refresh_token(
     response: Response,
     db: Session = Depends(get_db),
 ) -> dict:
-    cfg = get_settings()
-    raw_refresh: str | None = request.cookies.get(cfg.refresh_cookie_name)
+    raw_refresh: str | None = request.cookies.get(_cfg.refresh_cookie_name)
     if not raw_refresh:
         raise HTTPException(status_code=401, detail="No refresh token")
 
+    user_agent = request.headers.get("User-Agent", "")
+    result = rotate_refresh_token(db, raw_refresh, user_agent=user_agent)
+
+    if result is None:
+        _clear_auth_cookies(response)
+        raise HTTPException(status_code=401, detail="Invalid or expired refresh token")
+
+    new_raw, new_session_id = result
     token_hash = hash_refresh_token(raw_refresh)
-    rt = db.scalar(select(RefreshToken).where(RefreshToken.token_hash == token_hash))
-
-    if not rt or rt.revoked:
-        if rt:
-            _revoke_all_refresh_tokens(db, rt.user)
-        raise HTTPException(status_code=401, detail="Invalid refresh token")
-
-    expires = rt.expires_at
-    now_utc = datetime.now(timezone.utc)
-    if expires.tzinfo is None:
-        expires = expires.replace(tzinfo=timezone.utc)
-    if expires < now_utc:
-        rt.revoked = True
-        db.commit()
-        raise HTTPException(status_code=401, detail="Refresh token expired")
-
-    rt.revoked = True
-    db.commit()
-
-    user = db.scalar(select(User).where(User.id == rt.user_id))
+    old_session = db.scalar(
+        select(RefreshSession).where(RefreshSession.token_hash == token_hash)
+    )
+    user = db.scalar(select(User).where(User.id == old_session.user_id))
     if not user or not user.is_active:
         _clear_auth_cookies(response)
         raise HTTPException(status_code=401, detail="User not found or disabled")
 
-    access = create_access_token(user.id, user.role.value)
-    new_refresh = _issue_refresh_token(db, user)
-
-    _set_auth_cookies(response, access, new_refresh)
+    access = issue_access_token(user.id, new_session_id, user.role.value)
+    _set_auth_cookies(response, access, new_raw)
     return {"detail": "Token refreshed"}
 
 

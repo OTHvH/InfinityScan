@@ -221,16 +221,17 @@ class TestLogout:
         user_factory(username="revokeuser", password="pass12345")
         client.post("/token", json={"username": "revokeuser", "password": "pass12345"})
 
-        # Find the refresh token in DB
-        rt = db.scalar(select(RefreshToken).limit(1))
+        # Find the refresh session in DB
+        from models import RefreshSession
+        rt = db.scalar(select(RefreshSession).limit(1))
         assert rt is not None
-        assert rt.revoked is False
+        assert rt.revoked_at is None
 
         csrf = client.cookies.get("is_csrf")
         client.post("/logout", headers={"X-CSRF-Token": csrf})
 
         db.refresh(rt)
-        assert rt.revoked is True
+        assert rt.revoked_at is not None
 
 
 # ═════════════════════════════════════════════════════════════════════════════
