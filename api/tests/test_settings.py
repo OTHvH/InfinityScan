@@ -67,6 +67,7 @@ class TestValidProductionConfig:
         with patch.dict(os.environ, {
             "APP_ENV": "production",
             "JWT_SECRET_KEY": "a-very-long-secret-key-for-production",
+            "CSRF_SECRET_KEY": "a-separate-csrf-secret-key-for-production",
             "DATABASE_URL": "postgresql+psycopg://user:pass@host/db",
             "COOKIE_SECURE": "true",
             "COOKIE_SAME_SITE": "lax",
@@ -81,6 +82,7 @@ class TestValidProductionConfig:
         with patch.dict(os.environ, {
             "APP_ENV": "production",
             "SECRET_KEY": "another-long-secret-key",
+            "CSRF_SECRET_KEY": "another-csrf-secret-key",
             "DATABASE_URL": "postgresql+psycopg://user:pass@host/db",
         }):
             reset_settings()

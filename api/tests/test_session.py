@@ -22,8 +22,10 @@ from sqlalchemy import select
 
 from models import RefreshSession, User, UserRole
 from auth import (
+    generate_csrf_token,
     hash_password,
     hash_refresh_token,
+    _PREAUTH_SESSION_ID,
 )
 from session import (
     issue_access_token,
@@ -34,6 +36,32 @@ from session import (
     rotate_refresh_token,
 )
 from settings import get_settings
+
+
+def _set_preauth_csrf(client) -> None:
+    """Set a pre-auth CSRF cookie on the test client."""
+    cfg = get_settings()
+    client.cookies.delete(cfg.csrf_cookie_name)
+    csrf = generate_csrf_token(_PREAUTH_SESSION_ID)
+    client.cookies.set(cfg.csrf_cookie_name, csrf)
+
+
+def _do_login(client, username: str, password: str = "strongpassword123"):
+    """POST /auth/login with pre-auth CSRF and clean up cookie jar after."""
+    cfg = get_settings()
+    csrf = client.cookies.get(cfg.csrf_cookie_name)
+    resp = client.post(
+        "/auth/login",
+        json={"username": username, "password": password},
+        headers={"X-CSRF-Token": csrf},
+    )
+    # After login, server sets a session-bound CSRF cookie.
+    # Clean up any duplicate is_csrf cookies by keeping only the response one.
+    resp_csrf = resp.cookies.get(cfg.csrf_cookie_name)
+    client.cookies.delete(cfg.csrf_cookie_name)
+    if resp_csrf:
+        client.cookies.set(cfg.csrf_cookie_name, resp_csrf)
+    return resp
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -366,9 +394,11 @@ class TestIsSessionActive:
 
 class TestAuthRegister:
     def test_register_success(self, client):
+        _set_preauth_csrf(client)
         resp = client.post(
             "/auth/register",
             json={"username": "newuser", "password": "strongpassword123"},
+            headers={"X-CSRF-Token": client.cookies.get("is_csrf")},
         )
         assert resp.status_code == 201
         data = resp.json()
@@ -378,21 +408,26 @@ class TestAuthRegister:
 
     def test_register_duplicate_username(self, client, user_factory):
         user_factory(username="dupeuser")
+        _set_preauth_csrf(client)
         resp = client.post(
             "/auth/register",
             json={"username": "dupeuser", "password": "strongpassword123"},
+            headers={"X-CSRF-Token": client.cookies.get("is_csrf")},
         )
         assert resp.status_code == 400
         assert "already registered" in resp.json()["detail"]
 
     def test_register_weak_password(self, client):
+        _set_preauth_csrf(client)
         resp = client.post(
             "/auth/register",
             json={"username": "newuser", "password": "short"},
+            headers={"X-CSRF-Token": client.cookies.get("is_csrf")},
         )
         assert resp.status_code == 422
 
     def test_register_with_email(self, client):
+        _set_preauth_csrf(client)
         resp = client.post(
             "/auth/register",
             json={
@@ -400,11 +435,13 @@ class TestAuthRegister:
                 "password": "strongpassword123",
                 "email": "test@example.com",
             },
+            headers={"X-CSRF-Token": client.cookies.get("is_csrf")},
         )
         assert resp.status_code == 201
         assert resp.json()["user"]["email"] == "test@example.com"
 
     def test_register_rejects_extra_fields(self, client):
+        _set_preauth_csrf(client)
         resp = client.post(
             "/auth/register",
             json={
@@ -412,6 +449,7 @@ class TestAuthRegister:
                 "password": "strongpassword123",
                 "extra_field": "not_allowed",
             },
+            headers={"X-CSRF-Token": client.cookies.get("is_csrf")},
         )
         assert resp.status_code == 422
 
@@ -419,9 +457,11 @@ class TestAuthRegister:
 class TestAuthLogin:
     def test_login_success(self, client, user_factory):
         user_factory(username="logintest")
+        _set_preauth_csrf(client)
         resp = client.post(
             "/auth/login",
             json={"username": "logintest", "password": "strongpassword123"},
+            headers={"X-CSRF-Token": client.cookies.get("is_csrf")},
         )
         assert resp.status_code == 200
         data = resp.json()
@@ -433,16 +473,20 @@ class TestAuthLogin:
 
     def test_login_wrong_password(self, client, user_factory):
         user_factory(username="logintest")
+        _set_preauth_csrf(client)
         resp = client.post(
             "/auth/login",
             json={"username": "logintest", "password": "wrongpassword"},
+            headers={"X-CSRF-Token": client.cookies.get("is_csrf")},
         )
         assert resp.status_code == 401
 
     def test_login_nonexistent_user(self, client):
+        _set_preauth_csrf(client)
         resp = client.post(
             "/auth/login",
             json={"username": "nobody", "password": "strongpassword123"},
+            headers={"X-CSRF-Token": client.cookies.get("is_csrf")},
         )
         assert resp.status_code == 401
 
@@ -455,18 +499,22 @@ class TestAuthLogin:
         )
         db.add(user)
         db.commit()
+        _set_preauth_csrf(client)
 
         resp = client.post(
             "/auth/login",
             json={"username": "disabled", "password": "strongpassword123"},
+            headers={"X-CSRF-Token": client.cookies.get("is_csrf")},
         )
         assert resp.status_code == 403
 
     def test_login_sets_session_in_db(self, client, user_factory, db):
         user_factory(username="sessiontest")
+        _set_preauth_csrf(client)
         resp = client.post(
             "/auth/login",
             json={"username": "sessiontest", "password": "strongpassword123"},
+            headers={"X-CSRF-Token": client.cookies.get("is_csrf")},
         )
         assert resp.status_code == 200
 
@@ -483,10 +531,8 @@ class TestAuthLogin:
 class TestAuthRefresh:
     def _login(self, client, user_factory, username: str = "refreshtest"):
         user_factory(username=username)
-        resp = client.post(
-            "/auth/login",
-            json={"username": username, "password": "strongpassword123"},
-        )
+        _set_preauth_csrf(client)
+        resp = _do_login(client, username)
         assert resp.status_code == 200
         return resp
 
@@ -494,8 +540,9 @@ class TestAuthRefresh:
         self._login(client, user_factory)
         refresh_cookie = client.cookies.get("is_refresh")
         assert refresh_cookie
+        csrf = client.cookies.get("is_csrf")
 
-        resp = client.post("/auth/refresh")
+        resp = client.post("/auth/refresh", headers={"X-CSRF-Token": csrf})
         assert resp.status_code == 200
 
         new_refresh = client.cookies.get("is_refresh")
@@ -505,8 +552,9 @@ class TestAuthRefresh:
     def test_refresh_old_token_revoked(self, client, user_factory, db):
         self._login(client, user_factory)
         old_refresh = client.cookies.get("is_refresh")
+        csrf = client.cookies.get("is_csrf")
 
-        client.post("/auth/refresh")
+        client.post("/auth/refresh", headers={"X-CSRF-Token": csrf})
 
         old_hash = hash_refresh_token(old_refresh)
         rs = db.scalar(select(RefreshSession).where(RefreshSession.token_hash == old_hash))
@@ -519,19 +567,36 @@ class TestAuthRefresh:
     def test_refresh_reuse_detection(self, client, user_factory, db):
         self._login(client, user_factory)
         refresh1 = client.cookies.get("is_refresh")
+        csrf = client.cookies.get("is_csrf")
 
-        resp = client.post("/auth/refresh")
+        resp = client.post("/auth/refresh", headers={"X-CSRF-Token": csrf})
         assert resp.status_code == 200
 
-        client.cookies.set("is_refresh", refresh1)
-        resp = client.post("/auth/refresh")
+        # After refresh, extract the new CSRF from the Set-Cookie header directly
+        cfg = get_settings()
+        new_csrf = None
+        for raw in resp.headers.get_list("set-cookie"):
+            if raw.startswith(cfg.csrf_cookie_name + "="):
+                new_csrf = raw.split("=", 1)[1].split(";")[0]
+                break
+        assert new_csrf is not None
+
+        # Clean up jar
+        client.cookies.delete(cfg.csrf_cookie_name)
+        client.cookies.set(cfg.csrf_cookie_name, new_csrf)
+
+        # Restore the old refresh token but use the new CSRF token
+        client.cookies.delete(cfg.refresh_cookie_name)
+        client.cookies.set(cfg.refresh_cookie_name, refresh1)
+        resp = client.post("/auth/refresh", headers={"X-CSRF-Token": new_csrf})
         assert resp.status_code == 401
 
     def test_refresh_sets_new_access_token(self, client, user_factory):
         self._login(client, user_factory)
         old_access = client.cookies.get("is_access")
+        csrf = client.cookies.get("is_csrf")
 
-        resp = client.post("/auth/refresh")
+        resp = client.post("/auth/refresh", headers={"X-CSRF-Token": csrf})
         assert resp.status_code == 200
 
         new_access = client.cookies.get("is_access")
@@ -541,10 +606,8 @@ class TestAuthRefresh:
 class TestAuthLogout:
     def _login(self, client, user_factory, username: str = "logouttest"):
         user_factory(username=username)
-        resp = client.post(
-            "/auth/login",
-            json={"username": username, "password": "strongpassword123"},
-        )
+        _set_preauth_csrf(client)
+        resp = _do_login(client, username)
         assert resp.status_code == 200
         return resp
 
@@ -595,14 +658,12 @@ class TestAuthLogout:
 class TestAuthLogoutAll:
     def _login(self, client, user_factory, username: str = "logoutalltest"):
         user_factory(username=username)
-        client.post(
-            "/auth/login",
-            json={"username": username, "password": "strongpassword123"},
-        )
-        client.post(
-            "/auth/login",
-            json={"username": username, "password": "strongpassword123"},
-        )
+        _set_preauth_csrf(client)
+        resp = _do_login(client, username)
+        assert resp.status_code == 200
+        _set_preauth_csrf(client)
+        resp = _do_login(client, username)
+        assert resp.status_code == 200
 
     def test_logout_all_revokes_everything(self, client, user_factory, db):
         self._login(client, user_factory)
@@ -641,10 +702,8 @@ class TestAuthLogoutAll:
 class TestAuthMe:
     def _login(self, client, user_factory, username: str = "metest"):
         user_factory(username=username)
-        resp = client.post(
-            "/auth/login",
-            json={"username": username, "password": "strongpassword123"},
-        )
+        _set_preauth_csrf(client)
+        resp = _do_login(client, username)
         assert resp.status_code == 200
 
     def test_me_returns_user(self, client, user_factory):

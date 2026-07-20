@@ -72,7 +72,12 @@ class Settings:
     cookie_path: str = "/"
 
     # ── CSRF ────────────────────────────────────────────────────────────
+    csrf_secret_key: str = field(
+        default_factory=lambda: os.environ.get("CSRF_SECRET_KEY")
+        or secrets.token_hex(32)
+    )
     csrf_header_name: str = "x-csrf-token"
+    csrf_token_ttl_seconds: int = int(os.environ.get("CSRF_TOKEN_TTL_SECONDS", "3600"))
 
     # ── Rate limits ─────────────────────────────────────────────────────
     register_rate_limit: str = field(
@@ -134,6 +139,11 @@ def _validate_settings(s: Settings) -> None:
         if not os.environ.get("JWT_SECRET_KEY") and not os.environ.get("SECRET_KEY"):
             raise ValueError(
                 "JWT_SECRET_KEY (or SECRET_KEY) must be explicitly set in production. "
+                "Auto-generated keys are not allowed in production."
+            )
+        if not os.environ.get("CSRF_SECRET_KEY"):
+            raise ValueError(
+                "CSRF_SECRET_KEY must be explicitly set in production. "
                 "Auto-generated keys are not allowed in production."
             )
 

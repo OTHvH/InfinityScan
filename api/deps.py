@@ -45,6 +45,7 @@ Design rules:
 
 from __future__ import annotations
 
+import hmac
 import uuid
 from dataclasses import dataclass
 from typing import Annotated
@@ -53,7 +54,7 @@ from fastapi import Depends, HTTPException, Request
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from auth import decode_access_token, validate_csrf
+from auth import decode_access_token, generate_csrf_token, validate_csrf_token
 from database import get_db
 from models import RefreshSession, User
 from settings import get_settings
@@ -272,21 +273,60 @@ def require_admin(
     return user
 
 
-# ── CSRF double-submit validation ───────────────────────────────────────────
+# ── CSRF signed-token validation ─────────────────────────────────────────────
 
 
 def require_csrf(
     request: Request,
+    session: RefreshSession = Depends(get_current_session),
     x_csrf_token: str | None = None,
 ) -> None:
-    """Validate the CSRF double-submit cookie pattern.
+    """Validate the signed, session-bound CSRF token.
 
-    The header value is read from ``request.headers`` using the configured
-    header name.  ``x_csrf_token`` is intentionally left as a plain
-    parameter so that FastAPI does **not** inject it from query / body.
+    1. Reads the CSRF token from the ``X-CSRF-Token`` header.
+    2. Reads the CSRF token from the ``is_csrf`` cookie.
+    3. Compares them with constant-time comparison.
+    4. Validates the HMAC signature bound to the current session ID.
+    5. Checks token expiry.
+
+    The ``x_csrf_token`` parameter is intentionally a plain parameter
+    so that FastAPI does **not** inject it from query / body.
     """
     cfg = get_settings()
     csrf_cookie: str | None = request.cookies.get(cfg.csrf_cookie_name)
     header_val = x_csrf_token or request.headers.get(cfg.csrf_header_name)
-    if not validate_csrf(csrf_cookie, header_val):
+
+    # Both cookie and header must be present and equal
+    if not csrf_cookie or not header_val:
+        raise HTTPException(status_code=403, detail="CSRF validation failed")
+    if not hmac.compare_digest(csrf_cookie, header_val):
+        raise HTTPException(status_code=403, detail="CSRF validation failed")
+
+    # Validate the signed token bound to this session
+    if not validate_csrf_token(csrf_cookie, session.id):
+        raise HTTPException(status_code=403, detail="CSRF validation failed")
+
+
+def require_preauth_csrf(
+    request: Request,
+    x_csrf_token: str | None = None,
+) -> None:
+    """Validate the pre-authentication CSRF token (login / register).
+
+    Same as ``require_csrf`` but validates against the deterministic
+    pre-auth session ID instead of a real session.
+    """
+    cfg = get_settings()
+    csrf_cookie: str | None = request.cookies.get(cfg.csrf_cookie_name)
+    header_val = x_csrf_token or request.headers.get(cfg.csrf_header_name)
+
+    if not csrf_cookie or not header_val:
+        raise HTTPException(status_code=403, detail="CSRF validation failed")
+    if not hmac.compare_digest(csrf_cookie, header_val):
+        raise HTTPException(status_code=403, detail="CSRF validation failed")
+
+    # Validate the signed token bound to the pre-auth session ID
+    from auth import _PREAUTH_SESSION_ID
+
+    if not validate_csrf_token(csrf_cookie, _PREAUTH_SESSION_ID):
         raise HTTPException(status_code=403, detail="CSRF validation failed")

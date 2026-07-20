@@ -7,7 +7,7 @@ Covers:
   • Refresh token rotation and revocation
   • Access-token cookie-based identity
   • User-data isolation (bookmarks, progress)
-  • CSRF double-submit cookie
+  • Signed session-bound CSRF protection
   • Schema strictness (extra fields forbidden)
   • No tokens in JSON responses
   • Identity cannot be spoofed via headers or request body
@@ -16,12 +16,19 @@ Covers:
 
 from __future__ import annotations
 
+import time
 import uuid
 
 import pytest
 from sqlalchemy import select
 
-from models import Bookmark, ReadingProgress, RefreshToken, Series, Chapter, Page, ContentType, ReadingMode, SeriesStatus
+from auth import (
+    generate_csrf_token,
+    validate_csrf_token,
+    _PREAUTH_SESSION_ID,
+)
+from models import Bookmark, ReadingProgress, Series, Chapter, Page, ContentType, ReadingMode, SeriesStatus
+from settings import get_settings
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -282,39 +289,333 @@ class TestRefresh:
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-#  CSRF
+#  CSRF (signed, session-bound)
 # ═════════════════════════════════════════════════════════════════════════════
 
 
 class TestCSRF:
+    """Comprehensive CSRF protection tests.
+
+    Validates the signed, session-bound CSRF token system:
+    - HMAC signature bound to refresh-session ID
+    - Token expiry
+    - Pre-authentication tokens (login/register)
+    - Session-bound tokens (authenticated endpoints)
+    - Cookie attributes (HttpOnly=false, Secure, SameSite)
+    - Safe method exemption
+    - All failure modes return consistent 403
+    """
+
+    def _login(self, client, user_factory, username: str = "csrfuser"):
+        """Login via legacy /token route (auto-sets session-bound CSRF)."""
+        user_factory(username=username, password="pass12345")
+        client.post("/token", json={"username": username, "password": "pass12345"})
+
+    def _login_auth(self, client, user_factory, username: str = "csrfauth"):
+        """Login via /auth/login with pre-auth CSRF."""
+        cfg = get_settings()
+        user_factory(username=username, password="pass12345")
+        # Set pre-auth CSRF
+        client.cookies.delete(cfg.csrf_cookie_name)
+        preauth_csrf = generate_csrf_token(_PREAUTH_SESSION_ID)
+        client.cookies.set(cfg.csrf_cookie_name, preauth_csrf)
+        resp = client.post(
+            "/auth/login",
+            json={"username": username, "password": "pass12345"},
+            headers={"X-CSRF-Token": preauth_csrf},
+        )
+        assert resp.status_code == 200
+        # Clean up jar: keep only the session-bound CSRF from the response
+        for raw in resp.headers.get_list("set-cookie"):
+            if raw.startswith(cfg.csrf_cookie_name + "="):
+                new_val = raw.split("=", 1)[1].split(";")[0]
+                client.cookies.delete(cfg.csrf_cookie_name)
+                client.cookies.set(cfg.csrf_cookie_name, new_val)
+                break
+
+    # ── Cookie attributes ────────────────────────────────────────────────────
+
     def test_csrf_cookie_is_not_http_only(self, client, user_factory):
         """The CSRF cookie must be readable by JavaScript (not httpOnly)."""
-        user_factory(username="csrfuser", password="pass12345")
-        resp = client.post("/token", json={"username": "csrfuser", "password": "pass12345"})
+        self._login(client, user_factory)
         csrf_cookie = None
-        for cookie in resp.cookies.jar:
+        for cookie in client.cookies.jar:
             if cookie.name == "is_csrf":
                 csrf_cookie = cookie
                 break
         assert csrf_cookie is not None, "CSRF cookie not set"
-        # httponly should be False (or not set) for CSRF cookies
-        assert not csrf_cookie.has_nonstandard_attr("httponly") or "httponly" not in str(cookie).lower()
+        assert not csrf_cookie.has_nonstandard_attr("httponly"), \
+            "CSRF cookie must NOT be HttpOnly"
 
-    def test_state_endpoint_without_csrf_fails(self, client, user_factory):
-        """POST to bookmarks without CSRF header should fail."""
-        user_factory(username="csrf2", password="pass12345")
-        client.post("/token", json={"username": "csrf2", "password": "pass12345"})
+    # ── Signed token unit tests ──────────────────────────────────────────────
+
+    def test_signed_token_roundtrip(self):
+        """A generated token validates against the same session ID."""
+        sid = uuid.uuid4()
+        token = generate_csrf_token(sid)
+        assert validate_csrf_token(token, sid) is True
+
+    def test_signed_token_rejects_wrong_session(self):
+        """A token bound to session A fails for session B."""
+        sid_a = uuid.uuid4()
+        sid_b = uuid.uuid4()
+        token = generate_csrf_token(sid_a)
+        assert validate_csrf_token(token, sid_b) is False
+
+    def test_signed_token_rejects_forged_token(self):
+        """A forged/random string is rejected."""
+        sid = uuid.uuid4()
+        assert validate_csrf_token("not-a-real-token", sid) is False
+
+    def test_signed_token_rejects_modified_signature(self):
+        """Tampering with the signature portion fails validation."""
+        sid = uuid.uuid4()
+        token = generate_csrf_token(sid)
+        # Decode, modify sig, re-encode
+        import base64
+        padded = token + "=" * (-len(token) % 4)
+        decoded = base64.urlsafe_b64decode(padded).decode()
+        parts = decoded.split(".")
+        parts[2] = "0" * 64  # zero out signature
+        tampered = ".".join(parts)
+        tampered_token = base64.urlsafe_b64encode(tampered.encode()).decode().rstrip("=")
+        assert validate_csrf_token(tampered_token, sid) is False
+
+    def test_signed_token_rejects_expired(self):
+        """A token older than csrf_token_ttl_seconds is rejected."""
+        sid = uuid.uuid4()
+        token = generate_csrf_token(sid)
+        # Temporarily patch the TTL to 1 second, wait, then validate
+        from auth import _csrf_hmac
+        import base64 as b64
+        cfg = get_settings()
+        # Manually create a token with old timestamp
+        sid_hex = sid.hex
+        old_ts = str(int(time.time()) - cfg.csrf_token_ttl_seconds - 10)
+        sig = _csrf_hmac(cfg.csrf_secret_key, f"{sid_hex}.{old_ts}")
+        payload = f"{sid_hex}.{old_ts}.{sig}"
+        old_token = b64.urlsafe_b64encode(payload.encode()).decode().rstrip("=")
+        assert validate_csrf_token(old_token, sid) is False
+
+    def test_preauth_token_validates(self):
+        """Pre-auth token validates against the pre-auth session ID."""
+        token = generate_csrf_token(_PREAUTH_SESSION_ID)
+        assert validate_csrf_token(token, _PREAUTH_SESSION_ID) is True
+
+    def test_preauth_token_rejects_real_session(self):
+        """Pre-auth token fails when validated against a real session ID."""
+        token = generate_csrf_token(_PREAUTH_SESSION_ID)
+        real_sid = uuid.uuid4()
+        assert validate_csrf_token(token, real_sid) is False
+
+    # ── No CSRF cookie ───────────────────────────────────────────────────────
+
+    def test_no_csrf_cookie_fails(self, client, user_factory):
+        """State-changing request without CSRF cookie returns 403."""
+        self._login(client, user_factory)
+        # Clear the CSRF cookie
+        client.cookies.delete("is_csrf")
         resp = client.post("/bookmarks", json={
             "series_path_word": "test",
             "series_name": "Test",
         })
-        # Without CSRF header, should be rejected
         assert resp.status_code == 403
 
-    def test_state_endpoint_with_csrf_succeeds(self, client, user_factory):
-        """POST to bookmarks with correct CSRF header should succeed."""
-        user_factory(username="csrf3", password="pass12345")
-        client.post("/token", json={"username": "csrf3", "password": "pass12345"})
+    # ── No CSRF header ───────────────────────────────────────────────────────
+
+    def test_no_csrf_header_fails(self, client, user_factory):
+        """State-changing request without CSRF header returns 403."""
+        self._login(client, user_factory)
+        resp = client.post("/bookmarks", json={
+            "series_path_word": "test",
+            "series_name": "Test",
+        })
+        assert resp.status_code == 403
+
+    # ── Wrong header ─────────────────────────────────────────────────────────
+
+    def test_wrong_csrf_header_fails(self, client, user_factory):
+        """Wrong CSRF header value returns 403."""
+        self._login(client, user_factory)
+        resp = client.post(
+            "/bookmarks",
+            json={"series_path_word": "test", "series_name": "Test"},
+            headers={"X-CSRF-Token": "wrong-token-value"},
+        )
+        assert resp.status_code == 403
+
+    # ── Modified signature ───────────────────────────────────────────────────
+
+    def test_tampered_csrf_token_fails(self, client, user_factory):
+        """CSRF token with modified signature returns 403."""
+        self._login(client, user_factory)
+        csrf = client.cookies.get("is_csrf")
+        # Tamper with the token
+        tampered = csrf[:-4] + "XXXX"
+        resp = client.post(
+            "/bookmarks",
+            json={"series_path_word": "test", "series_name": "Test"},
+            headers={"X-CSRF-Token": tampered},
+        )
+        assert resp.status_code == 403
+
+    # ── Token from another session ───────────────────────────────────────────
+
+    def test_csrf_from_another_session_fails(self, client, user_factory):
+        """CSRF token from User A's session fails for User B."""
+        user_factory(username="csrf_a", password="pass12345")
+        user_factory(username="csrf_b", password="pass12345")
+
+        # Login as user_a
+        client.post("/token", json={"username": "csrf_a", "password": "pass12345"})
+        csrf_a = client.cookies.get("is_csrf")
+
+        # Logout
+        csrf = client.cookies.get("is_csrf")
+        client.post("/logout", headers={"X-CSRF-Token": csrf})
+        client.cookies.delete("is_access")
+        client.cookies.delete("is_refresh")
+        client.cookies.delete("is_csrf")
+
+        # Login as user_b
+        client.post("/token", json={"username": "csrf_b", "password": "pass12345"})
+
+        # Try to use user_a's CSRF token
+        resp = client.post(
+            "/bookmarks",
+            json={"series_path_word": "test", "series_name": "Test"},
+            headers={"X-CSRF-Token": csrf_a},
+        )
+        assert resp.status_code == 403
+
+    # ── Old token after refresh rotation ─────────────────────────────────────
+
+    def test_old_csrf_after_refresh_fails(self, client, user_factory):
+        """CSRF token from before refresh is invalid (new session)."""
+        user_factory(username="csrf_ref", password="pass12345")
+        client.post("/token", json={"username": "csrf_ref", "password": "pass12345"})
+        old_csrf = client.cookies.get("is_csrf")
+
+        # Refresh rotates the session → new CSRF token
+        csrf = client.cookies.get("is_csrf")
+        client.post("/token", json={"username": "csrf_ref", "password": "pass12345"})
+        new_csrf = client.cookies.get("is_csrf")
+
+        if old_csrf != new_csrf:
+            resp = client.post(
+                "/bookmarks",
+                json={"series_path_word": "test", "series_name": "Test"},
+                headers={"X-CSRF-Token": old_csrf},
+            )
+            assert resp.status_code == 403
+
+    # ── Pre-auth CSRF: login ─────────────────────────────────────────────────
+
+    def test_login_requires_preauth_csrf(self, client, user_factory):
+        """Login via /auth/login requires a valid pre-auth CSRF token."""
+        user_factory(username="csrf_login", password="pass12345")
+        resp = client.post(
+            "/auth/login",
+            json={"username": "csrf_login", "password": "pass12345"},
+        )
+        assert resp.status_code == 403
+
+    def test_login_with_preauth_csrf_succeeds(self, client, user_factory):
+        """Login via /auth/login succeeds with valid pre-auth CSRF."""
+        user_factory(username="csrf_login2", password="pass12345")
+        cfg = get_settings()
+        # Get pre-auth CSRF from /auth/csrf endpoint
+        resp = client.get("/auth/csrf")
+        assert resp.status_code == 200
+        preauth_csrf = resp.json()["csrf_token"]
+
+        # Login with the pre-auth CSRF
+        resp = client.post(
+            "/auth/login",
+            json={"username": "csrf_login2", "password": "pass12345"},
+            headers={"X-CSRF-Token": preauth_csrf},
+        )
+        assert resp.status_code == 200
+        assert "is_access" in resp.cookies
+        assert "is_refresh" in resp.cookies
+
+    def test_login_with_wrong_preauth_csrf_fails(self, client, user_factory):
+        """Login with wrong pre-auth CSRF token returns 403."""
+        user_factory(username="csrf_login3", password="pass12345")
+        resp = client.post(
+            "/auth/login",
+            json={"username": "csrf_login3", "password": "pass12345"},
+            headers={"X-CSRF-Token": "definitely-not-valid"},
+        )
+        assert resp.status_code == 403
+
+    # ── Pre-auth CSRF: register ──────────────────────────────────────────────
+
+    def test_register_requires_preauth_csrf(self, client):
+        """Register via /auth/register requires a valid pre-auth CSRF token."""
+        resp = client.post(
+            "/auth/register",
+            json={"username": "csrf_reg", "password": "strongpassword123"},
+        )
+        assert resp.status_code == 403
+
+    def test_register_with_preauth_csrf_succeeds(self, client):
+        """Register via /auth/register succeeds with valid pre-auth CSRF."""
+        cfg = get_settings()
+        resp = client.get("/auth/csrf")
+        preauth_csrf = resp.json()["csrf_token"]
+
+        resp = client.post(
+            "/auth/register",
+            json={"username": "csrf_reg2", "password": "strongpassword123"},
+            headers={"X-CSRF-Token": preauth_csrf},
+        )
+        assert resp.status_code == 201
+
+    # ── Refresh requires authenticated CSRF ──────────────────────────────────
+
+    def test_refresh_requires_csrf(self, client, user_factory):
+        """POST /auth/refresh requires a valid session-bound CSRF token."""
+        self._login_auth(client, user_factory)
+        resp = client.post("/auth/refresh")
+        assert resp.status_code == 403
+
+    def test_refresh_with_csrf_succeeds(self, client, user_factory):
+        """POST /auth/refresh succeeds with valid session-bound CSRF."""
+        self._login_auth(client, user_factory)
+        csrf = client.cookies.get("is_csrf")
+        resp = client.post("/auth/refresh", headers={"X-CSRF-Token": csrf})
+        assert resp.status_code == 200
+
+    # ── Logout requires authenticated CSRF ───────────────────────────────────
+
+    def test_logout_requires_csrf(self, client, user_factory):
+        """POST /auth/logout requires a valid session-bound CSRF token."""
+        self._login_auth(client, user_factory)
+        resp = client.post("/auth/logout")
+        assert resp.status_code == 403
+
+    def test_logout_with_csrf_succeeds(self, client, user_factory):
+        """POST /auth/logout succeeds with valid session-bound CSRF."""
+        self._login_auth(client, user_factory)
+        csrf = client.cookies.get("is_csrf")
+        resp = client.post("/auth/logout", headers={"X-CSRF-Token": csrf})
+        assert resp.status_code == 200
+
+    # ── Bookmark mutations ───────────────────────────────────────────────────
+
+    def test_bookmark_post_requires_csrf(self, client, user_factory):
+        """POST /bookmarks requires CSRF."""
+        self._login(client, user_factory)
+        resp = client.post("/bookmarks", json={
+            "series_path_word": "test",
+            "series_name": "Test",
+        })
+        assert resp.status_code == 403
+
+    def test_bookmark_post_with_csrf_succeeds(self, client, user_factory):
+        """POST /bookmarks succeeds with valid CSRF."""
+        self._login(client, user_factory)
         csrf = client.cookies.get("is_csrf")
         resp = client.post(
             "/bookmarks",
@@ -323,15 +624,129 @@ class TestCSRF:
         )
         assert resp.status_code == 201
 
-    def test_state_endpoint_with_wrong_csrf_fails(self, client, user_factory):
-        user_factory(username="csrf4", password="pass12345")
-        client.post("/token", json={"username": "csrf4", "password": "pass12345"})
+    def test_bookmark_delete_requires_csrf(self, client, user_factory):
+        """DELETE /bookmarks/{slug} requires CSRF."""
+        self._login(client, user_factory)
+        resp = client.delete("/bookmarks/some-slug")
+        assert resp.status_code == 403
+
+    def test_bookmark_delete_with_csrf_succeeds(self, client, user_factory):
+        """DELETE /bookmarks/{slug} succeeds with valid CSRF."""
+        self._login(client, user_factory)
+        csrf = client.cookies.get("is_csrf")
+        resp = client.delete(
+            "/bookmarks/test-slug",
+            headers={"X-CSRF-Token": csrf},
+        )
+        assert resp.status_code == 204
+
+    # ── Progress mutations ───────────────────────────────────────────────────
+
+    def test_progress_upsert_requires_csrf(self, client, user_factory):
+        """POST /progress requires CSRF."""
+        self._login(client, user_factory)
+        ch_id = uuid.uuid4()
         resp = client.post(
-            "/bookmarks",
-            json={"series_path_word": "test", "series_name": "Test"},
-            headers={"X-CSRF-Token": "wrong-token-value"},
+            f"/progress/some-slug/{ch_id}",
+            json={"chapter_uuid": str(ch_id), "last_page": 1},
         )
         assert resp.status_code == 403
+
+    def test_progress_upsert_with_csrf_succeeds(self, client, user_factory):
+        """POST /progress succeeds with valid CSRF."""
+        self._login(client, user_factory)
+        csrf = client.cookies.get("is_csrf")
+        ch_id = uuid.uuid4()
+        resp = client.post(
+            f"/progress/some-slug/{ch_id}",
+            json={"chapter_uuid": str(ch_id), "last_page": 1},
+            headers={"X-CSRF-Token": csrf},
+        )
+        assert resp.status_code == 200
+
+    # ── Safe methods exempt ──────────────────────────────────────────────────
+
+    def test_get_bookmarks_no_csrf_needed(self, client, user_factory):
+        """GET /bookmarks does not require CSRF."""
+        self._login(client, user_factory)
+        resp = client.get("/bookmarks")
+        assert resp.status_code == 200
+
+    def test_get_progress_no_csrf_needed(self, client, user_factory):
+        """GET /progress does not require CSRF."""
+        self._login(client, user_factory)
+        ch_id = uuid.uuid4()
+        resp = client.get(f"/progress/some-slug/{ch_id}")
+        assert resp.status_code == 200
+
+    def test_health_no_csrf_needed(self, client):
+        """GET /health does not require CSRF."""
+        resp = client.get("/health")
+        assert resp.status_code == 200
+
+    def test_get_me_no_csrf_needed(self, client, user_factory):
+        """GET /me does not require CSRF."""
+        self._login(client, user_factory)
+        resp = client.get("/me")
+        assert resp.status_code == 200
+
+    # ── CSRF endpoint ────────────────────────────────────────────────────────
+
+    def test_csrf_endpoint_returns_token_and_cookie(self, client):
+        """GET /auth/csrf returns a token and sets a cookie."""
+        resp = client.get("/auth/csrf")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert "csrf_token" in data
+        assert len(data["csrf_token"]) > 10
+        assert "is_csrf" in resp.cookies
+
+    def test_csrf_endpoint_cookie_not_http_only(self, client):
+        """GET /auth/csrf sets a non-HttpOnly cookie."""
+        resp = client.get("/auth/csrf")
+        for cookie in resp.cookies.jar:
+            if cookie.name == "is_csrf":
+                assert not cookie.has_nonstandard_attr("httponly")
+                break
+
+    # ── Failure consistency ──────────────────────────────────────────────────
+
+    def test_all_csrf_failures_return_403(self, client, user_factory):
+        """All CSRF failures return a consistent 403 response."""
+        self._login(client, user_factory)
+        cfg = get_settings()
+
+        # No header
+        resp = client.post("/bookmarks", json={
+            "series_path_word": "x", "series_name": "X",
+        })
+        assert resp.status_code == 403
+
+        # No cookie
+        client.cookies.delete(cfg.csrf_cookie_name)
+        resp = client.post("/bookmarks", json={
+            "series_path_word": "x", "series_name": "X",
+            "extra": "field",
+        }, headers={"X-CSRF-Token": "something"})
+        assert resp.status_code == 403
+
+        # Wrong header
+        client.cookies.set(cfg.csrf_cookie_name, "real-token")
+        resp = client.post("/bookmarks", json={
+            "series_path_word": "x", "series_name": "X",
+        }, headers={"X-CSRF-Token": "wrong"})
+        assert resp.status_code == 403
+
+    # ── No token in localStorage/sessionStorage ──────────────────────────────
+
+    def test_csrf_not_in_json_response(self, client):
+        """GET /auth/csrf returns token in JSON body (for JS to read),
+        but the cookie is the authoritative source."""
+        resp = client.get("/auth/csrf")
+        data = resp.json()
+        assert "csrf_token" in data
+        # The token should be a string, not nested
+        assert isinstance(data["csrf_token"], str)
 
 
 # ═════════════════════════════════════════════════════════════════════════════

@@ -24,11 +24,12 @@ from auth import (
     generate_csrf_token,
     hash_password,
     set_cookie,
+    validate_csrf_token,
     verify_and_update_password,
 )
 from auth.schemas import LoginIn, LoginOut, RegisterIn, RegisterOut, UserOut
 from database import get_db
-from deps import get_current_session, get_current_user, require_csrf
+from deps import get_current_session, get_current_user, require_csrf, require_preauth_csrf
 from models import RefreshSession, User, UserRole
 from session import (
     issue_access_token,
@@ -63,8 +64,9 @@ def _set_auth_cookies(
     response: Response,
     access_token: str,
     refresh_token: str,
+    session_id: uuid.UUID,
 ) -> None:
-    """Set access, refresh, and CSRF cookies on *response*."""
+    """Set access, refresh, and session-bound CSRF cookies on *response*."""
     cfg = get_settings()
     set_cookie(
         response,
@@ -78,12 +80,12 @@ def _set_auth_cookies(
         refresh_token,
         max_age=cfg.refresh_token_ttl_days * 86400,
     )
-    csrf = generate_csrf_token()
+    csrf = generate_csrf_token(session_id)
     set_cookie(
         response,
         cfg.csrf_cookie_name,
         csrf,
-        max_age=cfg.refresh_token_ttl_days * 86400,
+        max_age=cfg.csrf_token_ttl_seconds,
         http_only=False,
     )
 
@@ -107,6 +109,7 @@ def _clear_auth_cookies(response: Response) -> None:
 def register(
     request: Request,
     body: RegisterIn = Body(...),
+    _csrf: None = Depends(require_preauth_csrf),
     db: Session = Depends(get_db),
 ) -> RegisterOut:
     if db.scalar(select(User).where(User.username == body.username)):
@@ -145,6 +148,7 @@ def login(
     request: Request,
     response: Response,
     body: LoginIn = Body(...),
+    _csrf: None = Depends(require_preauth_csrf),
     db: Session = Depends(get_db),
 ) -> LoginOut:
     user = db.scalar(select(User).where(User.username == body.username))
@@ -168,7 +172,7 @@ def login(
     )
     access = issue_access_token(user.id, session_id, user.role.value)
 
-    _set_auth_cookies(response, access, raw_refresh)
+    _set_auth_cookies(response, access, raw_refresh, session_id)
     return LoginOut(user=_user_to_out(user))
 
 
@@ -182,6 +186,7 @@ def login(
 def refresh(
     request: Request,
     response: Response,
+    _csrf: None = Depends(require_csrf),
     db: Session = Depends(get_db),
 ) -> dict:
     cfg = get_settings()
@@ -210,7 +215,7 @@ def refresh(
         raise HTTPException(status_code=401, detail="User not found or disabled")
 
     access = issue_access_token(user.id, new_session_id, user.role.value)
-    _set_auth_cookies(response, access, new_raw)
+    _set_auth_cookies(response, access, new_raw, new_session_id)
     return {"detail": "Token refreshed"}
 
 
@@ -287,19 +292,47 @@ def me(user: User = Depends(get_current_user)) -> UserOut:
     "/csrf",
     summary="Issue a new CSRF token",
 )
-def csrf(response: Response) -> dict:
+def csrf(
+    request: Request,
+    response: Response,
+    db: Session = Depends(get_db),
+) -> dict:
     """Set a new CSRF cookie and return the token value.
 
-    The client must read the cookie and send the value back in the
-    ``X-CSRF-Token`` header on state-changing requests.
+    If the user has an active session, the token is bound to that session.
+    Otherwise, a pre-authentication token is issued (for login / register).
     """
     cfg = get_settings()
-    csrf_value = generate_csrf_token()
+
+    # Try to resolve the current session
+    from auth import decode_access_token, _PREAUTH_SESSION_ID
+
+    token: str | None = request.cookies.get(cfg.access_cookie_name)
+    session_id = _PREAUTH_SESSION_ID
+
+    if token:
+        payload = decode_access_token(token)
+        if payload:
+            session_id_str = payload.get("sid")
+            if session_id_str:
+                try:
+                    session_id = uuid.UUID(session_id_str)
+                    # Verify session is still active
+                    from sqlalchemy import select as sa_select
+                    session = db.scalar(
+                        sa_select(RefreshSession).where(RefreshSession.id == session_id)
+                    )
+                    if session is None or session.revoked_at is not None:
+                        session_id = _PREAUTH_SESSION_ID
+                except (ValueError, Exception):
+                    session_id = _PREAUTH_SESSION_ID
+
+    csrf_value = generate_csrf_token(session_id)
     set_cookie(
         response,
         cfg.csrf_cookie_name,
         csrf_value,
-        max_age=cfg.refresh_token_ttl_days * 86400,
+        max_age=cfg.csrf_token_ttl_seconds,
         http_only=False,
     )
     return {"csrf_token": csrf_value}

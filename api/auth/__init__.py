@@ -4,16 +4,18 @@
 • JWT access-token creation / verification
 • Refresh-token random-secret generation + SHA-256 hashing
 • Cookie helpers (set / clear)
-• CSRF token generation / validation
+• Signed session-bound CSRF token generation / validation
 
 No secrets, passwords, hashes, or tokens are ever written to logs.
 """
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import hmac
 import secrets
+import time
 import uuid
 from datetime import datetime, timedelta, timezone
 
@@ -130,22 +132,97 @@ def hash_refresh_token(token: str) -> str:
     return hashlib.sha256(token.encode()).hexdigest()
 
 
-# ── CSRF ────────────────────────────────────────────────────────────────────
+# ── CSRF (signed, session-bound) ──────────────────────────────────────────
 #
-# We use the double-submit cookie pattern:
-#   1. Server generates a random value and sets it in a *non-httpOnly* cookie.
-#   2. The client reads the cookie and sends it back in a request header.
-#   3. Server compares the cookie value with the header value via hmac.compare_digest.
+# The CSRF token is an HMAC-signed, base64url-encoded value that binds the
+# token to a specific refresh-session ID.  Format:
+#
+#   base64url(session_id_hex + "." + timestamp_str + "." + hmac_hex)
+#
+# The HMAC is computed over ``session_id_hex.timestamp_str`` using the
+# dedicated ``CSRF_SECRET_KEY``.  This prevents:
+#   - Cross-session token reuse
+#   - Token forgery without the CSRF secret
+#   - Replay attacks beyond the configured TTL
+#
+# For pre-authentication endpoints (login, register) a deterministic
+# "pre-auth" session ID is derived from the CSRF secret so that the
+# same validation logic applies before a session exists.
 
-def generate_csrf_token() -> str:
-    return secrets.token_urlsafe(32)
+_PREAUTH_SESSION_ID = uuid.UUID("00000000-0000-0000-0000-000000000000")
 
 
-def validate_csrf(cookie_value: str | None, header_value: str | None) -> bool:
-    """Constant-time comparison of CSRF cookie vs header."""
-    if not cookie_value or not header_value:
+def _csrf_hmac(key: str, message: str) -> str:
+    """Compute HMAC-SHA256 and return the hex digest."""
+    return hmac.new(key.encode(), message.encode(), hashlib.sha256).hexdigest()
+
+
+def generate_csrf_token(session_id: uuid.UUID | None = None) -> str:
+    """Generate a signed CSRF token bound to *session_id*.
+
+    If *session_id* is ``None`` the pre-auth session ID is used (for
+    login / register flows before a session exists).
+    """
+    cfg = get_settings()
+    sid = session_id or _PREAUTH_SESSION_ID
+    sid_hex = sid.hex
+    ts_str = str(int(time.time()))
+    sig = _csrf_hmac(cfg.csrf_secret_key, f"{sid_hex}.{ts_str}")
+    payload = f"{sid_hex}.{ts_str}.{sig}"
+    return base64.urlsafe_b64encode(payload.encode()).decode().rstrip("=")
+
+
+def validate_csrf_token(
+    token: str,
+    session_id: uuid.UUID | None = None,
+) -> bool:
+    """Validate a signed CSRF token.
+
+    Checks:
+      1. Token can be decoded.
+      2. HMAC signature is valid.
+      3. Session ID matches the expected value.
+      4. Token has not expired (``csrf_token_ttl_seconds``).
+
+    Returns ``True`` only if all checks pass.
+    """
+    cfg = get_settings()
+    expected_sid = session_id or _PREAUTH_SESSION_ID
+
+    try:
+        # Re-add padding if needed
+        padded = token + "=" * (-len(token) % 4)
+        decoded = base64.urlsafe_b64decode(padded).decode()
+        parts = decoded.split(".")
+        if len(parts) != 3:
+            return False
+        sid_hex, ts_str, sig = parts
+    except Exception:
         return False
-    return hmac.compare_digest(cookie_value, header_value)
+
+    # Verify session ID
+    try:
+        sid = uuid.UUID(hex=sid_hex)
+    except ValueError:
+        return False
+    if sid != expected_sid:
+        return False
+
+    # Verify HMAC
+    expected_sig = _csrf_hmac(cfg.csrf_secret_key, f"{sid_hex}.{ts_str}")
+    if not hmac.compare_digest(sig, expected_sig):
+        return False
+
+    # Verify expiry
+    try:
+        issued_at = int(ts_str)
+    except ValueError:
+        return False
+    now = int(time.time())
+    if now - issued_at > cfg.csrf_token_ttl_seconds:
+        return False
+
+    return True
 
 
 # ── Cookie helpers ──────────────────────────────────────────────────────────

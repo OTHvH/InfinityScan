@@ -218,7 +218,7 @@ def _login_user(
     cfg = get_settings()
     raw, sid = issue_refresh_session(_TestSession(), user.id, family_id=family_id)
     access = issue_access_token(user.id, sid, user.role.value)
-    csrf = generate_csrf_token()
+    csrf = generate_csrf_token(sid)
     client.cookies.set(cfg.access_cookie_name, access)
     client.cookies.set(cfg.refresh_cookie_name, raw)
     client.cookies.set(cfg.csrf_cookie_name, csrf)
@@ -581,7 +581,7 @@ class TestCSRF:
         user = user_factory()
         sid = _login_user(client, user)
         cfg = get_settings()
-        csrf = generate_csrf_token()
+        csrf = generate_csrf_token(sid)
         client.cookies.set(cfg.csrf_cookie_name, csrf)
         resp = client.post("/csrf-protected", headers={"x-csrf-token": csrf})
         assert resp.status_code == 200

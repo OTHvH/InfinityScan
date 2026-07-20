@@ -241,16 +241,16 @@ async def _fetch_chapter_pages(path_word: str, chapter_uuid: str) -> ChapterPage
     )
 
 
-def _set_auth_cookies(response: Response, access_token: str, refresh_token: str) -> None:
-    """Set access, refresh, and CSRF cookies on *response*."""
+def _set_auth_cookies(response: Response, access_token: str, refresh_token: str, session_id: uuid.UUID) -> None:
+    """Set access, refresh, and session-bound CSRF cookies on *response*."""
     cfg = get_settings()
     set_cookie(response, cfg.access_cookie_name, access_token,
                max_age=cfg.access_token_ttl_minutes * 60)
     set_cookie(response, cfg.refresh_cookie_name, refresh_token,
                max_age=cfg.refresh_token_ttl_days * 86400)
-    csrf = generate_csrf_token()
+    csrf = generate_csrf_token(session_id)
     set_cookie(response, cfg.csrf_cookie_name, csrf,
-               max_age=cfg.refresh_token_ttl_days * 86400,
+               max_age=cfg.csrf_token_ttl_seconds,
                http_only=False)
 
 
@@ -377,7 +377,7 @@ def login(
     raw_refresh, session_id = issue_refresh_session(db, user_id=user.id, user_agent=user_agent)
     access = issue_access_token(user.id, session_id, user.role.value)
 
-    _set_auth_cookies(response, access, raw_refresh)
+    _set_auth_cookies(response, access, raw_refresh, session_id)
     return LoginOut(user=_user_to_out(user))
 
 
@@ -439,7 +439,7 @@ def refresh_token(
         raise HTTPException(status_code=401, detail="User not found or disabled")
 
     access = issue_access_token(user.id, new_session_id, user.role.value)
-    _set_auth_cookies(response, access, new_raw)
+    _set_auth_cookies(response, access, new_raw, new_session_id)
     return {"detail": "Token refreshed"}
 
 
