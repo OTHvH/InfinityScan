@@ -93,7 +93,11 @@ def _origin_is_allowed(origin: str, allowed: list[str]) -> bool:
         allowed_parsed = urlparse(allowed_entry)
         allowed_netloc = allowed_parsed.netloc
 
-        # Exact match
+        # Scheme must match
+        if parsed.scheme != allowed_parsed.scheme:
+            continue
+
+        # Exact netloc match
         if origin_netloc == allowed_netloc:
             return True
 

@@ -10,8 +10,6 @@ Endpoints:
 - GET  /auth/csrf       — issue a new CSRF token (sets cookie + returns value)
 """
 
-from __future__ import annotations
-
 import logging
 import uuid
 
@@ -46,10 +44,10 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 
+_cfg = get_settings()
 
 # ── Rate limiter (shared with main.py) ──────────────────────────────────────
-# Import the limiter from main to avoid duplication
-from main import limiter  # noqa: E402
+from limiter import limiter  # noqa: E402
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
@@ -112,7 +110,7 @@ def _clear_auth_cookies(response: Response) -> None:
     status_code=201,
     summary="Register a new user account",
 )
-@limiter.limit("5/minute")
+@limiter.limit(_cfg.register_rate_limit)
 def register(
     request: Request,
     body: RegisterIn = Body(...),
@@ -151,7 +149,7 @@ def register(
     response_model=LoginOut,
     summary="Authenticate and set session cookies",
 )
-@limiter.limit("10/minute")
+@limiter.limit(_cfg.login_rate_limit)
 def login(
     request: Request,
     response: Response,
@@ -191,7 +189,7 @@ def login(
     "/refresh",
     summary="Rotate refresh token and issue new access token",
 )
-@limiter.limit("20/minute")
+@limiter.limit(_cfg.refresh_rate_limit)
 def refresh(
     request: Request,
     response: Response,
@@ -235,7 +233,7 @@ def refresh(
     "/logout",
     summary="Revoke current session and clear cookies",
 )
-@limiter.limit("20/minute")
+@limiter.limit(_cfg.logout_rate_limit)
 def logout(
     request: Request,
     response: Response,
@@ -271,7 +269,7 @@ def logout(
     "/logout-all",
     summary="Revoke all sessions for the current user",
 )
-@limiter.limit("20/minute")
+@limiter.limit(_cfg.logout_rate_limit)
 def logout_all(
     request: Request,
     response: Response,
@@ -303,7 +301,7 @@ def me(user: User = Depends(get_current_user)) -> UserOut:
     "/csrf",
     summary="Issue a new CSRF token",
 )
-@limiter.limit("30/minute")
+@limiter.limit(_cfg.csrf_rate_limit)
 def csrf(
     request: Request,
     response: Response,

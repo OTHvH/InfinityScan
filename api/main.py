@@ -39,10 +39,10 @@ from fastapi.responses import JSONResponse
 from starlette.middleware.base import BaseHTTPMiddleware
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session, joinedload
-from slowapi import Limiter
 from slowapi.errors import RateLimitExceeded
 from slowapi.middleware import SlowAPIMiddleware
-from slowapi.util import get_remote_address
+
+from limiter import limiter
 
 from settings import get_settings
 from database import get_db
@@ -159,7 +159,6 @@ async def copymanga(path: str, **params: Any) -> Any:
 app = FastAPI(title="InfinityScan API", version="0.2.0", lifespan=lifespan)
 
 # Rate limiter
-limiter = Limiter(key_func=get_remote_address)
 app.state.limiter = limiter
 
 

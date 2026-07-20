@@ -23,6 +23,7 @@ os.environ["REFRESH_RATE_LIMIT"] = "999999/second"
 os.environ["LOGOUT_RATE_LIMIT"] = "999999/second"
 os.environ["BOOKMARK_WRITE_RATE_LIMIT"] = "999999/second"
 os.environ["PROGRESS_WRITE_RATE_LIMIT"] = "999999/second"
+os.environ["TRUSTED_HOSTS"] = "localhost,127.0.0.1,testserver"
 
 import uuid
 from datetime import datetime, timezone

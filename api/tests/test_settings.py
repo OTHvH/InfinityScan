@@ -81,9 +81,10 @@ class TestValidProductionConfig:
         """Production should accept SECRET_KEY as alternative env var."""
         with patch.dict(os.environ, {
             "APP_ENV": "production",
-            "SECRET_KEY": "another-long-secret-key",
-            "CSRF_SECRET_KEY": "another-csrf-secret-key",
+            "SECRET_KEY": "a" * 64,
+            "CSRF_SECRET_KEY": "c" * 64,
             "DATABASE_URL": "postgresql+psycopg://user:pass@host/db",
+            "COOKIE_SECURE": "true",
         }):
             reset_settings()
             settings = get_settings()
@@ -107,6 +108,73 @@ class TestProductionSecretRequired:
                 reset_settings()
                 with pytest.raises(ValueError, match="JWT_SECRET_KEY"):
                     get_settings()
+
+    def test_production_weak_jwt_secret_raises(self):
+        """Production with JWT secret < 32 bytes should raise."""
+        with patch.dict(os.environ, {
+            "APP_ENV": "production",
+            "JWT_SECRET_KEY": "short",
+            "CSRF_SECRET_KEY": "a" * 64,
+            "DATABASE_URL": "postgresql+psycopg://user:pass@host/db",
+            "COOKIE_SECURE": "true",
+        }):
+            reset_settings()
+            with pytest.raises(ValueError, match="too weak"):
+                get_settings()
+
+    def test_production_missing_csrf_secret_raises(self):
+        """Production without CSRF_SECRET_KEY should raise."""
+        env = os.environ.copy()
+        env["APP_ENV"] = "production"
+        env["JWT_SECRET_KEY"] = "a" * 64
+        env["DATABASE_URL"] = "postgresql+psycopg://user:pass@host/db"
+        env["COOKIE_SECURE"] = "true"
+        env.pop("CSRF_SECRET_KEY", None)
+        with patch.dict(os.environ, env, clear=True):
+            reset_settings()
+            with pytest.raises(ValueError, match="CSRF_SECRET_KEY"):
+                get_settings()
+
+    def test_production_cookie_secure_false_raises(self):
+        """Production with COOKIE_SECURE=false should raise."""
+        with patch.dict(os.environ, {
+            "APP_ENV": "production",
+            "JWT_SECRET_KEY": "a" * 64,
+            "CSRF_SECRET_KEY": "a" * 64,
+            "DATABASE_URL": "postgresql+psycopg://user:pass@host/db",
+            "COOKIE_SECURE": "false",
+        }):
+            reset_settings()
+            with pytest.raises(ValueError, match="COOKIE_SECURE"):
+                get_settings()
+
+    def test_production_wildcard_cors_raises(self):
+        """Production with wildcard CORS origins should raise."""
+        with patch.dict(os.environ, {
+            "APP_ENV": "production",
+            "JWT_SECRET_KEY": "a" * 64,
+            "CSRF_SECRET_KEY": "a" * 64,
+            "DATABASE_URL": "postgresql+psycopg://user:pass@host/db",
+            "COOKIE_SECURE": "true",
+            "CORS_ORIGINS": "*",
+        }):
+            reset_settings()
+            with pytest.raises(ValueError, match="Wildcard.*CORS"):
+                get_settings()
+
+    def test_production_wildcard_allowed_origins_raises(self):
+        """Production with wildcard ALLOWED_ORIGINS should raise."""
+        with patch.dict(os.environ, {
+            "APP_ENV": "production",
+            "JWT_SECRET_KEY": "a" * 64,
+            "CSRF_SECRET_KEY": "a" * 64,
+            "DATABASE_URL": "postgresql+psycopg://user:pass@host/db",
+            "COOKIE_SECURE": "true",
+            "ALLOWED_ORIGINS": "*",
+        }):
+            reset_settings()
+            with pytest.raises(ValueError, match="ALLOWED_ORIGINS"):
+                get_settings()
 
 
 class TestCookieValidation:
@@ -203,11 +271,54 @@ class TestEnvironmentVariables:
         env = os.environ.copy()
         env.pop("REGISTER_RATE_LIMIT", None)
         env.pop("LOGIN_RATE_LIMIT", None)
+        env.pop("CSRF_RATE_LIMIT", None)
+        env.pop("REFRESH_RATE_LIMIT", None)
+        env.pop("LOGOUT_RATE_LIMIT", None)
+        env.pop("BOOKMARK_WRITE_RATE_LIMIT", None)
+        env.pop("PROGRESS_WRITE_RATE_LIMIT", None)
         with patch.dict(os.environ, env, clear=True):
             reset_settings()
             settings = get_settings()
             assert settings.register_rate_limit == "5/minute"
             assert settings.login_rate_limit == "10/minute"
+            assert settings.csrf_rate_limit == "30/minute"
+            assert settings.refresh_rate_limit == "20/minute"
+            assert settings.logout_rate_limit == "20/minute"
+            assert settings.bookmark_write_rate_limit == "30/minute"
+            assert settings.progress_write_rate_limit == "60/minute"
+
+    def test_cors_methods_and_headers_defaults(self):
+        """CORS methods and headers should have sensible defaults."""
+        settings = get_settings()
+        assert "GET" in settings.cors_allow_methods
+        assert "POST" in settings.cors_allow_methods
+        assert "content-type" in settings.cors_allow_headers
+        assert "x-csrf-token" in settings.cors_allow_headers
+
+    def test_max_body_bytes_default(self):
+        """MAX_BODY_BYTES should default to 1MB."""
+        settings = get_settings()
+        assert settings.max_body_bytes == 1024 * 1024
+
+    def test_max_body_bytes_from_env(self):
+        """MAX_BODY_BYTES should be configurable."""
+        with patch.dict(os.environ, {"MAX_BODY_BYTES": "2097152"}):
+            reset_settings()
+            settings = get_settings()
+            assert settings.max_body_bytes == 2097152
+
+    def test_allowed_origins_default(self):
+        """ALLOWED_ORIGINS should have a default."""
+        settings = get_settings()
+        assert isinstance(settings.allowed_origins, list)
+        assert len(settings.allowed_origins) > 0
+
+    def test_allowed_origins_parsing(self):
+        """ALLOWED_ORIGINS should be comma-separated list."""
+        with patch.dict(os.environ, {"ALLOWED_ORIGINS": "http://a.com,http://b.com"}):
+            reset_settings()
+            settings = get_settings()
+            assert settings.allowed_origins == ["http://a.com", "http://b.com"]
 
     def test_copymanga_api_default(self):
         """COPYMANGA_API should have default value."""

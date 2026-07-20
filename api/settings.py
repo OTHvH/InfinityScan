@@ -126,7 +126,9 @@ class Settings:
     )
 
     # ── Request body limit ──────────────────────────────────────────────
-    max_body_bytes: int = int(os.environ.get("MAX_BODY_BYTES", str(1024 * 1024)))  # 1 MB default
+    max_body_bytes: int = field(
+        default_factory=lambda: int(os.environ.get("MAX_BODY_BYTES", str(1024 * 1024)))
+    )
 
     # ── Origin validation ───────────────────────────────────────────────
     allowed_origins: list[str] = field(
