@@ -1,85 +1,26 @@
 "use client";
 
-import React, { use, useCallback, useEffect, useRef, useState } from "react";
+import { startTransition, use, useCallback, useEffect, useState, useSyncExternalStore } from "react";
+import { Virtuoso, type ListRange } from "react-virtuoso";
 import { useRouter } from "next/navigation";
-import { api, ApiError } from "@/lib/api";
 import { useAuthStore } from "@/stores/auth";
+import { fetchReaderChunk } from "@/features/reader/api";
+import { ReaderFeedController } from "@/features/reader/feed";
+import { loadLocalProgress, loadServerProgress, saveLocalProgress, saveServerProgress } from "@/features/reader/progress";
+import type { ReaderDirection, ReaderItem, ReaderPage, ReadingMode } from "@/features/reader/types";
 
-// ─── Types ────────────────────────────────────────────────────────────────────
-
-interface Page {
-  page_number: number;
-  url: string;
-}
-
-interface Chapter {
-  uuid: string;
-  name: string;
-  index: number;
-  pages: Page[];
-  prev_chapter_uuid: string | null;
-  next_chapter_uuid: string | null;
-  chapter_number: number;
-}
-
-type ReadingMode = "vertical" | "horizontal" | "scroll";
 type SpreadMode = "single" | "spread";
-
-// ─── Constants ────────────────────────────────────────────────────────────────
 
 const PROGRESS_SAVE_INTERVAL = 3000;
 const ZOOM_MIN = 40;
 const ZOOM_MAX = 160;
 const ZOOM_STEP = 10;
 
-// ─── Helper Functions ────────────────────────────────────────────────────────
-
-function getStorageKey(seriesSlug: string, chapterUuid: string, mode: string): string {
-  return `infinityscan_${mode}_${seriesSlug}_${chapterUuid}`;
-}
-
-function saveProgressLocal(seriesSlug: string, chapterUuid: string, page: number, readingMode: ReadingMode, zoom: number) {
-  localStorage.setItem(
-    getStorageKey(seriesSlug, chapterUuid, "progress"),
-    JSON.stringify({ page, readingMode, zoom, timestamp: Date.now() })
-  );
-}
-
-function loadProgressLocal(seriesSlug: string, chapterUuid: string): { page: number; readingMode: ReadingMode; zoom: number } | null {
-  const data = localStorage.getItem(getStorageKey(seriesSlug, chapterUuid, "progress"));
-  if (!data) return null;
-  try {
-    return JSON.parse(data);
-  } catch {
-    return null;
-  }
-}
-
-async function saveProgressServer(seriesSlug: string, chapterUuid: string, page: number): Promise<void> {
-  try {
-    await api.post(`/progress/${seriesSlug}/${chapterUuid}`, {
-      chapter_uuid: chapterUuid,
-      last_page: Math.max(0, page - 1),
-    });
-  } catch {
-    // Silently fail — localStorage remains authoritative
-  }
-}
-
-async function loadProgressServer(seriesSlug: string, chapterUuid: string): Promise<number | null> {
-  try {
-    const data = await api.get(`/progress/${seriesSlug}/${chapterUuid}`) as { last_page: number | null };
-    return data.last_page != null ? data.last_page + 1 : null;
-  } catch {
-    return null;
-  }
-}
-
-// ─── Components ────────────────────────────────────────────────────────────────
+type RenderPage = Extract<ReaderItem, { kind: "page" }>;
 
 interface TopBarProps {
   title: string;
-  currentPage: number;
+  page: number;
   totalPages: number;
   readingMode: ReadingMode;
   spreadMode: SpreadMode;
@@ -88,746 +29,322 @@ interface TopBarProps {
   hasNext: boolean;
   onBack: () => void;
   onModeChange: (mode: ReadingMode) => void;
-  onSpreadChange: (spread: SpreadMode) => void;
+  onSpreadChange: (mode: SpreadMode) => void;
   onZoomChange: (zoom: number) => void;
-  onPrevChapter: () => void;
-  onNextChapter: () => void;
+  onPrev: () => void;
+  onNext: () => void;
 }
 
-function TopBar({ 
-  title, 
-  currentPage, 
-  totalPages,
-  readingMode,
-  spreadMode,
-  zoom,
-  hasPrev,
-  hasNext,
-  onBack,
-  onModeChange,
-  onSpreadChange,
-  onZoomChange,
-  onPrevChapter,
-  onNextChapter,
-}: TopBarProps) {
+function TopBar(props: TopBarProps) {
   return (
-    <div className="reader-top-bar" style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: '8px', padding: '8px 12px' }}>
-      <button className="btn ghost small" onClick={onBack}>← Back</button>
-      <span className="chapter-title">{title}</span>
-      <span className="page-indicator">{currentPage} / {totalPages}</span>
-      
-      {/* Mode controls in top bar */}
-      <div className="control-group" style={{ borderRight: 'none', marginLeft: 'auto' }}>
-        <button
-          className={`btn tiny ${readingMode === "vertical" ? "active" : "ghost"}`}
-          onClick={() => onModeChange("vertical")}
-          title="Vertical"
-        >
-          ↓
-        </button>
-        <button
-          className={`btn tiny ${readingMode === "horizontal" ? "active" : "ghost"}`}
-          onClick={() => onModeChange("horizontal")}
-          title="Horizontal"
-        >
-          →
-        </button>
-        <button
-          className={`btn tiny ${readingMode === "scroll" ? "active" : "ghost"}`}
-          onClick={() => onModeChange("scroll")}
-          title="Scroll"
-        >
-          ☰
-        </button>
-        {(readingMode === "horizontal" || readingMode === "scroll") && (
+    <div className="reader-top-bar">
+      <button className="btn ghost small" onClick={props.onBack}>← Back</button>
+      <span className="chapter-title">{props.title}</span>
+      <span className="page-indicator">{props.page} / {props.totalPages}</span>
+      <div className="control-group">
+        {(["vertical", "horizontal", "scroll"] as ReadingMode[]).map((mode) => (
+          <button
+            key={mode}
+            className={`btn tiny ${props.readingMode === mode ? "active" : "ghost"}`}
+            onClick={() => props.onModeChange(mode)}
+            title={mode}
+          >
+            {mode === "vertical" ? "↓" : mode === "horizontal" ? "→" : "☰"}
+          </button>
+        ))}
+        {(props.readingMode === "horizontal" || props.readingMode === "scroll") && (
           <>
-            <button
-              className={`btn tiny ${spreadMode === "single" ? "active" : "ghost"}`}
-              onClick={() => onSpreadChange("single")}
-              title="Single"
-            >
-              1
-            </button>
-            <button
-              className={`btn tiny ${spreadMode === "spread" ? "active" : "ghost"}`}
-              onClick={() => onSpreadChange("spread")}
-              title="Spread"
-            >
-              2
-            </button>
+            <button className={`btn tiny ${props.spreadMode === "single" ? "active" : "ghost"}`} onClick={() => props.onSpreadChange("single")}>1</button>
+            <button className={`btn tiny ${props.spreadMode === "spread" ? "active" : "ghost"}`} onClick={() => props.onSpreadChange("spread")}>2</button>
           </>
         )}
       </div>
-      
-      {/* Zoom controls */}
-      <div className="control-group zoom-controls" style={{ borderRight: 'none' }}>
-        <button
-          className="btn ghost tiny"
-          onClick={() => onZoomChange(Math.max(40, zoom - 10))}
-          title="Zoom -"
-        >
-          −
-        </button>
-        <span className="zoom-value" style={{ fontSize: '11px', minWidth: '32px' }}>{zoom}%</span>
-        <button
-          className="btn ghost tiny"
-          onClick={() => onZoomChange(Math.min(160, zoom + 10))}
-          title="Zoom +"
-        >
-          +
-        </button>
+      <div className="control-group zoom-controls">
+        <button className="btn ghost tiny" onClick={() => props.onZoomChange(Math.max(ZOOM_MIN, props.zoom - ZOOM_STEP))}>−</button>
+        <span className="zoom-value">{props.zoom}%</span>
+        <button className="btn ghost tiny" onClick={() => props.onZoomChange(Math.min(ZOOM_MAX, props.zoom + ZOOM_STEP))}>+</button>
       </div>
-      
-      {/* Chapter navigation */}
-      <div className="control-group" style={{ borderRight: 'none' }}>
-        {hasPrev && (
-          <button className="btn ghost tiny" onClick={onPrevChapter}>
-            ← Prev
-          </button>
-        )}
-        {hasNext && (
-          <button className="btn ghost tiny" onClick={onNextChapter}>
-            Next →
-          </button>
-        )}
+      <div className="control-group">
+        {props.hasPrev && <button className="btn ghost tiny" onClick={props.onPrev}>← Prev</button>}
+        {props.hasNext && <button className="btn ghost tiny" onClick={props.onNext}>Next →</button>}
       </div>
     </div>
   );
 }
 
-interface BottomControlsProps {
-  readingMode: ReadingMode;
-  spreadMode: SpreadMode;
-  zoom: number;
-  currentPage: number;
-  totalPages: number;
-  hasPrev: boolean;
-  hasNext: boolean;
-  onModeChange: (mode: ReadingMode) => void;
-  onSpreadChange: (spread: SpreadMode) => void;
-  onZoomChange: (zoom: number) => void;
-  onPageChange: (page: number) => void;
-  onPrevChapter: () => void;
-  onNextChapter: () => void;
-}
-
-function BottomControls({
-  readingMode,
-  spreadMode,
-  zoom,
-  currentPage,
-  totalPages,
-  hasPrev,
-  hasNext,
-  onModeChange,
-  onSpreadChange,
-  onZoomChange,
-  onPageChange,
-  onPrevChapter,
-  onNextChapter,
-}: BottomControlsProps) {
-  const progress = Math.round((currentPage / totalPages) * 100);
-  
-  return (
-    <>
-      <div className="progress-wrap">
-        <div className="progress-bar" style={{ width: `${progress}%` }} />
-      </div>
-      <div className="reader-controls">
-        {/* Reading Mode */}
-        <div className="control-group">
-          <button
-            className={`btn small ${readingMode === "vertical" ? "active" : "ghost"}`}
-            onClick={() => onModeChange("vertical")}
-            title="Vertical scroll"
-          >
-            ↓ Vertical
-          </button>
-          <button
-            className={`btn small ${readingMode === "horizontal" ? "active" : "ghost"}`}
-            onClick={() => onModeChange("horizontal")}
-            title="Horizontal RTL"
-          >
-            → Horizontal
-          </button>
-          <button
-            className={`btn small ${readingMode === "scroll" ? "active" : "ghost"}`}
-            onClick={() => onModeChange("scroll")}
-            title="Continuous scroll"
-          >
-            ☰ Scroll
-          </button>
-        </div>
-
-        {/* Spread Mode */}
-        {(readingMode === "horizontal" || readingMode === "scroll") && (
-          <div className="control-group">
-            <button
-              className={`btn small ${spreadMode === "single" ? "active" : "ghost"}`}
-              onClick={() => onSpreadChange("single")}
-              title="Single page"
-            >
-              1
-            </button>
-            <button
-              className={`btn small ${spreadMode === "spread" ? "active" : "ghost"}`}
-              onClick={() => onSpreadChange("spread")}
-              title="Book spread (2 pages)"
-            >
-              2
-            </button>
-          </div>
-        )}
-
-        {/* Zoom Controls */}
-        <div className="control-group zoom-controls">
-          <button
-            className="btn ghost small"
-            onClick={() => onZoomChange(Math.max(ZOOM_MIN, zoom - ZOOM_STEP))}
-            disabled={zoom <= ZOOM_MIN}
-          >
-            −
-          </button>
-          <span className="zoom-value">{zoom}%</span>
-          <button
-            className="btn ghost small"
-            onClick={() => onZoomChange(Math.min(ZOOM_MAX, zoom + ZOOM_STEP))}
-            disabled={zoom >= ZOOM_MAX}
-          >
-            +
-          </button>
-          <button
-            className="btn ghost small"
-            onClick={() => onZoomChange(100)}
-            title="Reset zoom"
-          >
-            ⟲
-          </button>
-          <button
-            className="btn ghost small"
-            onClick={() => onZoomChange(-1)}
-            title="Fit width"
-          >
-            ↔
-          </button>
-        </div>
-
-        {/* Page Navigation */}
-        <div className="control-group">
-          {hasPrev && (
-            <button className="btn ghost small" onClick={onPrevChapter}>
-              ← Prev
-            </button>
-          )}
-          <input
-            type="number"
-            min={1}
-            max={totalPages}
-            value={currentPage}
-            onChange={(e) => onPageChange(Math.min(Math.max(1, parseInt(e.target.value) || 1), totalPages))}
-            className="page-input"
-          />
-          {hasNext && (
-            <button className="btn ghost small" onClick={onNextChapter}>
-              Next →
-            </button>
-          )}
-        </div>
-      </div>
-    </>
-  );
-}
-
 interface PageImageProps {
-  page: Page;
+  page: ReaderPage;
   zoom: number;
   fitWidth: boolean;
 }
 
 function PageImage({ page, zoom, fitWidth }: PageImageProps) {
   const [loaded, setLoaded] = useState(false);
-  const [error, setError] = useState(false);
-  
-  const style: React.CSSProperties = {
-    transform: fitWidth ? undefined : `scale(${zoom / 100})`,
-    transformOrigin: "top center",
-    maxWidth: fitWidth ? "100%" : `${zoom}%`,
-    width: fitWidth ? "100%" : "auto",
-    transition: "transform 0.2s ease, opacity 0.2s ease",
-    opacity: loaded ? 1 : 0.3,
-  };
-  
-  if (error) {
-    return (
-      <div className="page-error">
-        <span>Failed to load page {page.page_number}</span>
-      </div>
-    );
+  const [failed, setFailed] = useState(false);
+  if (failed) {
+    return <div className="page-error">Failed to load page {page.pageNumber}</div>;
   }
-  
   return (
     <div className="page">
       <img
-        src={page.url}
-        alt={`Page ${page.page_number}`}
-        style={style}
-        onLoad={() => setLoaded(true)}
-        onError={() => setError(true)}
+        src={page.mediaPath}
+        alt={`Page ${page.pageNumber}`}
         loading="lazy"
+        onLoad={() => setLoaded(true)}
+        onError={() => setFailed(true)}
+        style={{
+          transform: fitWidth ? undefined : `scale(${zoom / 100})`,
+          transformOrigin: "top center",
+          maxWidth: fitWidth ? "100%" : `${zoom}%`,
+          width: fitWidth ? "100%" : "auto",
+          opacity: loaded ? 1 : 0.3,
+        }}
       />
     </div>
   );
 }
 
-interface SpreadProps {
-  leftPage: Page;
-  rightPage: Page | null;
-  zoom: number;
-}
-
-function Spread({ leftPage, rightPage, zoom }: SpreadProps) {
+function Spread({ left, right }: { left: ReaderPage; right?: ReaderPage }) {
   return (
-    <div className="spread-container" style={{ display: "flex", gap: 4 }}>
-      <div className="spread-page">
-        <img src={leftPage.url} alt={`Page ${leftPage.page_number}`} style={{ height: "calc(100vh - 120px)", width: "auto" }} />
-      </div>
-      {rightPage && (
-        <div className="spread-page">
-          <img src={rightPage.url} alt={`Page ${rightPage.page_number}`} style={{ height: "calc(100vh - 120px)", width: "auto" }} />
-        </div>
-      )}
+    <div className="spread-container">
+      <div className="spread-page"><img src={left.mediaPath} alt={`Page ${left.pageNumber}`} style={{ height: "calc(100vh - 120px)", width: "auto", maxWidth: "48vw" }} /></div>
+      {right && <div className="spread-page"><img src={right.mediaPath} alt={`Page ${right.pageNumber}`} style={{ height: "calc(100vh - 120px)", width: "auto", maxWidth: "48vw" }} /></div>}
     </div>
   );
 }
 
-interface KeyboardHintProps {
-  visible: boolean;
-}
-
-function KeyboardHint({ visible }: KeyboardHintProps) {
+function KeyboardHint({ visible }: { visible: boolean }) {
   if (!visible) return null;
-  return (
-    <div className="keyboard-hint">
-      <span>↑↓ Scroll</span>
-      <span>←→ Prev/Next</span>
-      <span>Space Next</span>
-      <span>+/- Zoom</span>
-      <span>0 Reset</span>
-      <span>F Fit</span>
-      <span>M Mag</span>
-      <span>[ ] Chapter</span>
-    </div>
-  );
+  return <div className="keyboard-hint"><span>←→ Pages</span><span>Space Next</span><span>[ ] Chapters</span><span>? Help</span></div>;
 }
 
-// ─── Main Reader Component ───────────────────────────────────────────────────
+interface VirtualizedPagesProps {
+  pages: RenderPage[];
+  firstItemIndex: number;
+  zoom: number;
+  fitWidth: boolean;
+  onEndReached: () => void;
+  onStartReached: () => void;
+  onRangeChanged: (range: ListRange) => void;
+}
+
+function VirtualizedPages(props: VirtualizedPagesProps) {
+  return (
+    <Virtuoso
+      data={props.pages}
+      firstItemIndex={props.firstItemIndex}
+      increaseViewportBy={{ top: 700, bottom: 1200 }}
+      computeItemKey={(_, page) => page.key}
+      itemContent={(_, page) => <PageImage page={{ id: page.pageId, pageNumber: page.pageNumber, mediaPath: page.mediaPath, width: page.width, height: page.height, aspectRatio: page.aspectRatio }} zoom={props.zoom} fitWidth={props.fitWidth} />}
+      endReached={props.onEndReached}
+      startReached={props.onStartReached}
+      rangeChanged={props.onRangeChanged}
+      style={{ height: "100%", paddingTop: 56, paddingBottom: 60 }}
+    />
+  );
+}
 
 interface ReaderProps {
   params: Promise<{ slug: string; chapter: string }>;
 }
 
-export default function EnhancedReader(props: ReaderProps) {
-  const params = use(props.params);
+export default function EnhancedReader({ params }: ReaderProps) {
+  const { slug: seriesSlug, chapter: chapterId } = use(params);
   const router = useRouter();
-  const { slug: seriesSlug, chapter: chapterNumber } = params;
-  
-  const [chapter, setChapter] = useState<Chapter | null>(null);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
-  
+  const [feed] = useState(() => new ReaderFeedController(fetchReaderChunk));
+  const feedState = useSyncExternalStore(feed.subscribe, feed.getState, feed.getState);
+  const [currentChapterId, setCurrentChapterId] = useState(chapterId);
   const [currentPage, setCurrentPage] = useState(1);
   const [readingMode, setReadingMode] = useState<ReadingMode>("vertical");
   const [spreadMode, setSpreadMode] = useState<SpreadMode>("single");
   const [zoom, setZoom] = useState(100);
   const [fitWidth, setFitWidth] = useState(false);
-  const [showControls, setShowControls] = useState(true);
   const [showHint, setShowHint] = useState(false);
-  const [magnifier, setMagnifier] = useState(false);
-  
-  // Infinity scroll state - stores all loaded pages
-  const [allPages, setAllPages] = useState<Page[]>([]);
-  const [isLoadingMore, setIsLoadingMore] = useState(false);
-  const [currentChapterNum, setCurrentChapterNum] = useState<number>(0);
-  const [lastChapterNum, setLastChapterNum] = useState<number>(0);
-  
-  const viewportRef = useRef<HTMLDivElement>(null);
-  const progressTimerRef = useRef<NodeJS.Timeout | null>(null);
 
-  // Load chapter data
   useEffect(() => {
-    if (!seriesSlug || !chapterNumber) return;
-    
-    const loadChapter = async () => {
-      setLoading(true);
-      setError(null);
-      
-      try {
-        const data = await api.get(`/library/${seriesSlug}/chapter/${chapterNumber}`) as Record<string, unknown>;
-        
-        const pages = data.pages as Page[];
-        
-        // Load saved progress from localStorage first
-        const saved = loadProgressLocal(seriesSlug, data.chapter_uuid as string);
-        
-        const chapterData = {
-          uuid: data.chapter_uuid as string,
-          name: data.chapter_name as string,
-          index: 0,
-          pages,
-          prev_chapter_uuid: (data.prev_chapter_uuid as string) ?? null,
-          next_chapter_uuid: (data.next_chapter_uuid as string) ?? null,
-          chapter_number: parseFloat(chapterNumber),
-        };
-        
-        setChapter(chapterData);
-        
-        // For infinity scroll mode, store all pages
-        const chapterNum = parseFloat(chapterNumber);
-        setCurrentChapterNum(chapterNum);
-        setLastChapterNum(data.next_chapter_uuid ? chapterNum + 1 : chapterNum);
-        
-        // Initialize all pages for infinity scroll
-        if (readingMode === "scroll") {
-          setAllPages(pages);
-        }
-        
-        // Restore saved state: prefer server progress if authenticated
-        let restoredPage = saved?.page ?? 1;
-        const user = useAuthStore.getState().user;
-        if (user) {
-          const serverPage = await loadProgressServer(seriesSlug, data.chapter_uuid as string);
-          if (serverPage != null && serverPage > restoredPage) {
-            restoredPage = serverPage;
-          }
-        }
-        
-        setCurrentPage(Math.min(restoredPage, pages.length));
-        if (saved?.readingMode) setReadingMode(saved.readingMode);
-        if (saved?.zoom) setZoom(saved.zoom);
-      } catch (err) {
-        if (err instanceof ApiError) {
-          setError(err.detail || "Failed to load chapter");
-        } else {
-          setError(err instanceof Error ? err.message : "Failed to load chapter");
-        }
-      } finally {
-        setLoading(false);
-      }
-    };
-    
-    loadChapter();
-  }, [seriesSlug, chapterNumber]);
+    startTransition(() => {
+      setCurrentChapterId(chapterId);
+      setCurrentPage(1);
+    });
+    void feed.loadInitial(seriesSlug, chapterId).catch(() => undefined);
+    return () => feed.dispose();
+  }, [chapterId, feed, seriesSlug]);
 
-  // Load next chapter for infinity scroll
-  const loadNextChapter = useCallback(async () => {
-    if (isLoadingMore || !chapter?.next_chapter_uuid) return;
-    
-    const nextNum = currentChapterNum + 1;
-    setIsLoadingMore(true);
-    
-    try {
-      const data = await api.get(`/library/${seriesSlug}/chapter/${nextNum}`) as Record<string, unknown>;
-      
-      // Append pages to allPages
-      setAllPages(prev => [...prev, ...(data.pages as Page[])]);
-      setLastChapterNum(nextNum);
-      setCurrentChapterNum(nextNum);
-      
-      // Update chapter with new data
-      setChapter({
-        uuid: data.chapter_uuid as string,
-        name: data.chapter_name as string,
-        index: 0,
-        pages: data.pages as Page[],
-        prev_chapter_uuid: (data.prev_chapter_uuid as string) ?? null,
-        next_chapter_uuid: (data.next_chapter_uuid as string) ?? null,
-        chapter_number: nextNum,
-      });
-    } catch {
-      // Silently fail — no more chapters or network error
-    } finally {
-      setIsLoadingMore(false);
-    }
-  }, [seriesSlug, chapter, currentChapterNum, isLoadingMore]);
+  const loadMore = (direction: ReaderDirection) => {
+    const request = direction === "next" ? feed.loadNext() : feed.loadPrevious();
+    void request?.catch(() => undefined);
+  };
 
-  // Scroll detection for infinity scroll
-  useEffect(() => {
-    if (readingMode !== "scroll" || !viewportRef.current) return;
-    
-    const viewport = viewportRef.current;
-    
-    const handleScroll = () => {
-      const scrollTop = viewport.scrollTop;
-      const scrollHeight = viewport.scrollHeight;
-      const clientHeight = viewport.clientHeight;
-      
-      // Load more when within 500px of bottom
-      const threshold = 500;
-      if (scrollHeight - scrollTop - clientHeight < threshold) {
-        loadNextChapter();
-      }
-    };
-    
-    viewport.addEventListener("scroll", handleScroll);
-    return () => viewport.removeEventListener("scroll", handleScroll);
-  }, [readingMode, loadNextChapter]);
+  const activeChapter = feedState.chaptersById[currentChapterId]
+    ?? (feedState.orderedChapterIds[0] ? feedState.chaptersById[feedState.orderedChapterIds[0]] : undefined);
+  const activePages = activeChapter?.pages ?? [];
+  const continuousPages = feedState.items.filter((item): item is RenderPage => item.kind === "page");
+  const loadingMore = feedState.loadingNext || feedState.loadingPrevious;
 
-  // Keyboard shortcuts
-  useEffect(() => {
-    const handleKeyDown = (e: KeyboardEvent) => {
-      // Ignore if in input
-      if (["INPUT", "TEXTAREA", "SELECT"].includes((e.target as HTMLElement).tagName)) {
-        return;
-      }
-      
-      if (!chapter) return;
-      
-      switch (e.key) {
-        case "ArrowUp":
-        case "ArrowDown":
-          // Vertical scroll handled by browser
-          break;
-        case "ArrowLeft":
-          if (readingMode === "horizontal") {
-            setCurrentPage(p => Math.max(1, p - (spreadMode === "spread" ? 2 : 1)));
-          }
-          break;
-        case "ArrowRight":
-          if (readingMode === "horizontal") {
-            setCurrentPage(p => Math.min(chapter.pages.length, p + (spreadMode === "spread" ? 2 : 1)));
-          }
-          break;
-        case " ":
-          e.preventDefault();
-          if (readingMode === "vertical") {
-            setCurrentPage(p => Math.min(chapter.pages.length, p + 1));
-          }
-          break;
-        case "+":
-        case "=":
-          setZoom(z => Math.min(ZOOM_MAX, z + ZOOM_STEP));
-          break;
-        case "-":
-          setZoom(z => Math.max(ZOOM_MIN, z - ZOOM_STEP));
-          break;
-        case "0":
-          setZoom(100);
-          setFitWidth(false);
-          break;
-        case "f":
-        case "F":
-          setFitWidth(f => !f);
-          break;
-        case "m":
-        case "M":
-          setMagnifier(m => !m);
-          break;
-        case "[":
-          if (chapter.prev_chapter_uuid) {
-            window.location.href = `/reader/${seriesSlug}/${parseFloat(chapterNumber) - 1}`;
-          }
-          break;
-        case "]":
-          if (chapter.next_chapter_uuid) {
-            window.location.href = `/reader/${seriesSlug}/${parseFloat(chapterNumber) + 1}`;
-          }
-          break;
-        case "Home":
-          setCurrentPage(1);
-          break;
-        case "End":
-          setCurrentPage(chapter.pages.length);
-          break;
-        case "?":
-          setShowHint(h => !h);
-          break;
-      }
-    };
-    
-    window.addEventListener("keydown", handleKeyDown);
-    return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [chapter, readingMode, spreadMode, seriesSlug, chapterNumber]);
-
-  // Auto-save progress
-  useEffect(() => {
-    if (!chapter) return;
-    
-    if (progressTimerRef.current) {
-      clearInterval(progressTimerRef.current);
-    }
-    
-    progressTimerRef.current = setInterval(() => {
-      saveProgressLocal(seriesSlug, chapter.uuid, currentPage, readingMode, zoom);
-      // Also sync to server if authenticated (fire-and-forget)
-      const user = useAuthStore.getState().user;
-      if (user) {
-        saveProgressServer(seriesSlug, chapter.uuid, currentPage);
-      }
-    }, PROGRESS_SAVE_INTERVAL);
-    
-    return () => {
-      if (progressTimerRef.current) {
-        clearInterval(progressTimerRef.current);
-      }
-    };
-  }, [chapter, currentPage, readingMode, zoom, seriesSlug]);
-
-  // Scroll to current page in vertical mode
-  useEffect(() => {
-    if (readingMode !== "vertical" || !viewportRef.current) return;
-    
-    const viewport = viewportRef.current;
-    const pageElements = viewport.querySelectorAll(".page");
-    const pageElement = pageElements[currentPage - 1];
-    
-    if (pageElement) {
-      pageElement.scrollIntoView({ behavior: "smooth", block: "start" });
-    }
-  }, [currentPage, readingMode]);
-
-  // Navigation handlers
   const goToPage = useCallback((page: number) => {
-    setCurrentPage(Math.max(1, Math.min(page, chapter?.pages.length || 1)));
-  }, [chapter]);
+    setCurrentPage(Math.min(Math.max(1, page), Math.max(1, activePages.length)));
+  }, [activePages.length]);
 
-  const handlePrevChapter = useCallback(() => {
-    if (chapter?.prev_chapter_uuid) {
-      router.push(`/reader/${seriesSlug}/${parseFloat(chapterNumber) - 1}`);
+  const navigateToChapter = useCallback((id: string | null) => {
+    if (id) router.push(`/reader/${encodeURIComponent(seriesSlug)}/${encodeURIComponent(id)}`);
+  }, [router, seriesSlug]);
+
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (["INPUT", "TEXTAREA", "SELECT"].includes((event.target as HTMLElement).tagName)) return;
+      if (!activeChapter) return;
+      if (event.key === "ArrowLeft" && readingMode === "horizontal") goToPage(currentPage - (spreadMode === "spread" ? 2 : 1));
+      if (event.key === "ArrowRight" && readingMode === "horizontal") goToPage(currentPage + (spreadMode === "spread" ? 2 : 1));
+      if (event.key === " " && readingMode !== "scroll") { event.preventDefault(); goToPage(currentPage + 1); }
+      if (event.key === "[") navigateToChapter(activeChapter.previousChapterId);
+      if (event.key === "]") navigateToChapter(activeChapter.nextChapterId);
+      if (event.key === "Home") goToPage(1);
+      if (event.key === "End") goToPage(activePages.length);
+      if (event.key === "?") setShowHint((visible) => !visible);
+      if (event.key === "+" || event.key === "=") setZoom((value) => Math.min(ZOOM_MAX, value + ZOOM_STEP));
+      if (event.key === "-") setZoom((value) => Math.max(ZOOM_MIN, value - ZOOM_STEP));
+      if (event.key === "0") { setZoom(100); setFitWidth(false); }
+      if (event.key.toLowerCase() === "f") setFitWidth((value) => !value);
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [activeChapter, activePages.length, currentPage, goToPage, navigateToChapter, readingMode, spreadMode]);
+
+  useEffect(() => {
+    if (!activeChapter) return;
+    const saved = loadLocalProgress(seriesSlug, activeChapter.id);
+    if (saved) {
+      startTransition(() => {
+        setCurrentPage(Math.min(saved.page, Math.max(1, activePages.length)));
+        if (saved.readingMode) setReadingMode(saved.readingMode);
+        if (saved.zoom) setZoom(saved.zoom);
+      });
     }
-  }, [chapter, router, seriesSlug, chapterNumber]);
-
-  const handleNextChapter = useCallback(() => {
-    if (chapter?.next_chapter_uuid) {
-      router.push(`/reader/${seriesSlug}/${parseFloat(chapterNumber) + 1}`);
+    let active = true;
+    if (useAuthStore.getState().user) {
+      void loadServerProgress(seriesSlug, activeChapter.id).then((serverPage) => {
+        if (active && serverPage != null) setCurrentPage(Math.min(serverPage, Math.max(1, activePages.length)));
+      });
     }
-  }, [chapter, router, seriesSlug, chapterNumber]);
+    return () => { active = false; };
+  }, [activeChapter, activePages.length, seriesSlug]);
 
-  // Loading state
-  if (loading) {
-    return (
-      <div className="reader-loading">
-        <div className="spinner" />
-        <p>Loading chapter...</p>
-      </div>
-    );
-  }
+  useEffect(() => {
+    if (!activeChapter) return;
+    const save = () => {
+      saveLocalProgress(seriesSlug, activeChapter.id, { page: currentPage, readingMode, zoom });
+      if (useAuthStore.getState().user) void saveServerProgress(seriesSlug, activeChapter.id, currentPage);
+    };
+    const timer = window.setInterval(save, PROGRESS_SAVE_INTERVAL);
+    return () => window.clearInterval(timer);
+  }, [activeChapter, currentPage, readingMode, seriesSlug, zoom]);
 
-  // Error state
-  if (error || !chapter) {
+  const onRangeChanged = useCallback((range: ListRange) => {
+    const page = continuousPages[range.startIndex];
+    if (!page) return;
+    setCurrentChapterId(page.chapterId);
+    setCurrentPage(page.pageNumber);
+    feed.setVisibleChapterId(page.chapterId);
+  }, [continuousPages, feed]);
+
+  if (feedState.loadingInitial) return <div className="reader-loading"><div className="spinner" /><p>Loading chapter...</p></div>;
+  if (feedState.error || !activeChapter || activePages.length === 0) {
     return (
       <div className="reader-error">
-        <p>⚠️ {error || "Chapter not found"}</p>
-        <button className="btn" onClick={() => router.push(`/series/${seriesSlug}`)}>
-          Go to Series
-        </button>
+        <p>{feedState.error || (activeChapter ? "No verified pages available" : "Chapter not found")}</p>
+        {feedState.retryState && <button className="btn" onClick={() => void feed.retry()?.catch(() => undefined)}>Retry</button>}
+        <button className="btn" onClick={() => router.push(`/series/${seriesSlug}`)}>Go to Series</button>
       </div>
     );
   }
 
+  const progress = activePages.length ? Math.round((currentPage / activePages.length) * 100) : 0;
   return (
     <div className={`reader ${readingMode}`}>
+      <div className="progress-wrap"><div className="progress-bar" style={{ width: `${progress}%` }} /></div>
       <TopBar
-        title={chapter.name}
-        currentPage={currentPage}
-        totalPages={chapter.pages.length}
+        title={activeChapter.title ?? `Chapter ${activeChapter.number}`}
+        page={currentPage}
+        totalPages={activePages.length}
         readingMode={readingMode}
         spreadMode={spreadMode}
         zoom={zoom}
-        hasPrev={!!chapter.prev_chapter_uuid}
-        hasNext={!!chapter.next_chapter_uuid}
+        hasPrev={!!activeChapter.previousChapterId || feedState.hasMorePrevious}
+        hasNext={!!activeChapter.nextChapterId || feedState.hasMoreNext}
         onBack={() => router.push(`/series/${seriesSlug}`)}
         onModeChange={setReadingMode}
         onSpreadChange={setSpreadMode}
         onZoomChange={setZoom}
-        onPrevChapter={handlePrevChapter}
-        onNextChapter={handleNextChapter}
+        onPrev={() => navigateToChapter(activeChapter.previousChapterId)}
+        onNext={() => navigateToChapter(activeChapter.nextChapterId)}
       />
-
-      <div 
-        ref={viewportRef}
+      <div
         className="reader-viewport"
-        onClick={(e) => {
-          // Click to advance page in horizontal mode
-          if (readingMode === "horizontal" && e.target === e.currentTarget) {
-            const rect = e.currentTarget.getBoundingClientRect();
-            const clickX = e.clientX - rect.left;
-            const isLeftHalf = clickX < rect.width / 2;
-            
-            if (isLeftHalf) {
-              goToPage(currentPage - (spreadMode === "spread" ? 2 : 1));
-            } else {
-              goToPage(currentPage + (spreadMode === "spread" ? 2 : 1));
-            }
-          }
+        onClick={(event) => {
+          if (readingMode !== "horizontal" || event.target !== event.currentTarget) return;
+          const rect = event.currentTarget.getBoundingClientRect();
+          goToPage(currentPage + (event.clientX - rect.left < rect.width / 2 ? -1 : 1));
         }}
       >
-        {readingMode === "vertical" ? (
-          <div className="pages-vertical">
-            {chapter.pages.map((page, idx) => (
-              <PageImage
-                key={page.page_number}
-                page={page}
-                zoom={zoom}
-                fitWidth={fitWidth}
-              />
-            ))}
-          </div>
-        ) : readingMode === "scroll" ? (
-          <div className="pages-vertical">
-            {allPages.map((page, idx) => (
-              <PageImage
-                key={`${page.page_number}-${idx}`}
-                page={page}
-                zoom={zoom}
-                fitWidth={true}
-              />
-            ))}
-            {isLoadingMore && (
-              <div style={{ padding: '20px', textAlign: 'center', color: 'var(--muted)' }}>
-                Loading more...
-              </div>
-            )}
-          </div>
+        {readingMode === "scroll" ? (
+          <VirtualizedPages
+            pages={continuousPages}
+            firstItemIndex={feedState.firstItemIndex}
+            zoom={zoom}
+            fitWidth
+            onEndReached={() => loadMore("next")}
+            onStartReached={() => loadMore("previous")}
+            onRangeChanged={onRangeChanged}
+          />
+        ) : readingMode === "vertical" ? (
+          <VirtualizedPages
+            pages={activePages.map((page) => ({
+              kind: "page" as const,
+              key: `page:${page.id}`,
+              chapterId: activeChapter.id,
+              chapterNumber: activeChapter.number,
+              pageId: page.id,
+              pageNumber: page.pageNumber,
+              mediaPath: page.mediaPath,
+              width: page.width,
+              height: page.height,
+              aspectRatio: page.aspectRatio,
+            }))}
+            firstItemIndex={0}
+            zoom={zoom}
+            fitWidth={fitWidth}
+            onEndReached={() => undefined}
+            onStartReached={() => undefined}
+            onRangeChanged={(range) => {
+              const page = activePages[range.startIndex];
+              if (page) setCurrentPage(page.pageNumber);
+            }}
+          />
         ) : spreadMode === "spread" ? (
-          <div className="pages-spread">
-            {chapter.pages.reduce((acc: React.ReactNode[], page, idx) => {
-              if (idx % 2 === 0) {
-                acc.push(
-                  <Spread
-                    key={page.page_number}
-                    leftPage={page}
-                    rightPage={chapter.pages[idx + 1] || null}
-                    zoom={zoom}
-                  />
-                );
-              }
-              return acc;
-            }, [] as React.ReactNode[])}
-          </div>
+          <Spread left={activePages[currentPage - 1]} right={activePages[currentPage]} />
         ) : (
           <div className="pages-horizontal">
-            {chapter.pages.map((page) => (
-              <PageImage
-                key={page.page_number}
-                page={page}
-                zoom={zoom}
-                fitWidth={fitWidth}
-              />
-            ))}
+            <PageImage page={activePages[currentPage - 1]} zoom={zoom} fitWidth={fitWidth} />
           </div>
         )}
       </div>
-
+      {loadingMore && <div className="preload-banner">Loading chapters...</div>}
+      <div className="reader-controls">
+        <span>{activeChapter.title ?? `Chapter ${activeChapter.number}`}</span>
+        <input
+          className="page-input"
+          type="number"
+          min={1}
+          max={activePages.length}
+          value={currentPage}
+          onChange={(event) => goToPage(Number.parseInt(event.target.value, 10) || 1)}
+        />
+        <button className="btn ghost small" onClick={() => goToPage(currentPage - 1)}>Prev page</button>
+        <button className="btn ghost small" onClick={() => goToPage(currentPage + 1)}>Next page</button>
+        <button className="btn ghost small" onClick={() => { setZoom(100); setFitWidth(false); }}>Reset</button>
+      </div>
       <KeyboardHint visible={showHint} />
-
-      {/* Floating Home Button */}
-      <button
-        className="fab-home"
-        onClick={() => router.push("/")}
-        title="Go Home"
-      >
-        ∞
-      </button>
+      <button className="fab-home" onClick={() => router.push("/")} title="Go Home">∞</button>
     </div>
   );
 }

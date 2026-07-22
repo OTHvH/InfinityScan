@@ -18,6 +18,25 @@ import type { User } from "./types";
 
 const API_BASE = process.env.NEXT_PUBLIC_API_URL ?? "";
 
+const MEDIA_PATH_PREFIX = "/media/pages/";
+
+/** Resolve only same-API, root-relative media paths returned by the server. */
+export function resolveMediaUrl(path: string): string {
+  if (
+    typeof path !== "string" ||
+    !path.startsWith(MEDIA_PATH_PREFIX) ||
+    path.startsWith("//") ||
+    path.includes("://") ||
+    path.includes("?") ||
+    path.includes("#")
+  ) {
+    throw new Error("Invalid reader media path");
+  }
+  if (API_BASE) return `${API_BASE.replace(/\/$/, "")}${path}`;
+  if (typeof window !== "undefined") return `${window.location.origin}${path}`;
+  return path;
+}
+
 // ── CSRF cookie reader ───────────────────────────────────────────────────────
 
 function readCsrfCookie(): string | null {
@@ -154,8 +173,8 @@ async function request<T = unknown>(
 // ── Typed helpers ────────────────────────────────────────────────────────────
 
 export const api = {
-  get<T = unknown>(path: string): Promise<T> {
-    return request<T>(path);
+  get<T = unknown>(path: string, options: RequestInit = {}): Promise<T> {
+    return request<T>(path, options);
   },
 
   post<T = unknown>(path: string, data?: unknown): Promise<T> {

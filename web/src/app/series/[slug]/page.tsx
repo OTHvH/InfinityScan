@@ -3,7 +3,7 @@
 import { use, useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
 import { api } from "@/lib/api";
-import type { Series, Chapter } from "@/lib/types";
+import { compareDecimalStrings, type Series, type Chapter } from "@/lib/types";
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -109,7 +109,7 @@ export default function SeriesPage(props: {
 
   // Sort chapters by number descending (newest first)
   const sortedChapters = [...(series.chapters || [])].sort(
-    (a, b) => b.number - a.number,
+    (a, b) => compareDecimalStrings(b.number, a.number),
   );
 
   return (
@@ -213,7 +213,7 @@ export default function SeriesPage(props: {
               {sortedChapters.map((chapter) => (
                 <a
                   key={chapter.id}
-                  href={`/reader/${series.slug}/${chapter.number}`}
+                  href={`/reader/${series.slug}/${chapter.id}`}
                   style={{
                     display: "block",
                     padding: 16,
