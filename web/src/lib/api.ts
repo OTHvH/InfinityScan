@@ -177,8 +177,9 @@ export const api = {
     return request<T>(path, options);
   },
 
-  post<T = unknown>(path: string, data?: unknown): Promise<T> {
+  post<T = unknown>(path: string, data?: unknown, options: RequestInit = {}): Promise<T> {
     return request<T>(path, {
+      ...options,
       method: "POST",
       body: data !== undefined ? JSON.stringify(data) : undefined,
     });

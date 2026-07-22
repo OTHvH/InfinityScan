@@ -164,3 +164,4 @@ class ProgressOut(_Strict):
     last_page: Optional[int]
     scroll_position: Optional[float]
     completed: bool
+    updated_at: Optional[datetime] = None

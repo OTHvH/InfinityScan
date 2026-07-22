@@ -1,18 +1,26 @@
 "use client";
 
-import { startTransition, use, useCallback, useEffect, useState, useSyncExternalStore } from "react";
+import { startTransition, use, useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import { Virtuoso, type ListRange } from "react-virtuoso";
 import { useRouter } from "next/navigation";
 import { useAuthStore } from "@/stores/auth";
 import { fetchReaderChunk } from "@/features/reader/api";
 import { ContinuousReader } from "@/features/reader/components/ContinuousReader";
 import { ReaderFeedController } from "@/features/reader/feed";
-import { loadLocalProgress, loadServerProgress, saveLocalProgress, saveServerProgress } from "@/features/reader/progress";
+import {
+  ReaderProgressController,
+  attachProgressFlushListeners,
+  chooseNewestProgress,
+  clampProgress,
+  loadLocalProgress,
+  loadServerProgress,
+  type ProgressStatus,
+} from "@/features/reader/progress";
+import { ReaderUrlSynchronizer, selectViewportCenterPage } from "@/features/reader/synchronization";
 import type { ReaderItem, ReaderPage, ReadingMode } from "@/features/reader/types";
 
 type SpreadMode = "single" | "spread";
 
-const PROGRESS_SAVE_INTERVAL = 3000;
 const ZOOM_MIN = 40;
 const ZOOM_MAX = 160;
 const ZOOM_STEP = 10;
@@ -127,6 +135,7 @@ interface VirtualizedPagesProps {
   onEndReached: () => void;
   onStartReached: () => void;
   onRangeChanged: (range: ListRange) => void;
+  initialTopMostItemIndex?: number;
 }
 
 function VirtualizedPages(props: VirtualizedPagesProps) {
@@ -134,6 +143,7 @@ function VirtualizedPages(props: VirtualizedPagesProps) {
     <Virtuoso
       data={props.pages}
       firstItemIndex={props.firstItemIndex}
+      initialTopMostItemIndex={props.initialTopMostItemIndex}
       increaseViewportBy={{ top: 700, bottom: 1200 }}
       computeItemKey={(_, page) => page.key}
       itemContent={(_, page) => <PageImage page={{ id: page.pageId, pageNumber: page.pageNumber, mediaPath: page.mediaPath, width: page.width, height: page.height, aspectRatio: page.aspectRatio }} zoom={props.zoom} fitWidth={props.fitWidth} />}
@@ -152,24 +162,40 @@ interface ReaderProps {
 export default function EnhancedReader({ params }: ReaderProps) {
   const { slug: seriesSlug, chapter: chapterId } = use(params);
   const router = useRouter();
+  const user = useAuthStore((state) => state.user);
+  const authInitializing = useAuthStore((state) => state.isInitializing);
+  const [requestedChapterId] = useState(chapterId);
   const [feed] = useState(() => new ReaderFeedController(fetchReaderChunk));
   const feedState = useSyncExternalStore(feed.subscribe, feed.getState, feed.getState);
-  const [currentChapterId, setCurrentChapterId] = useState(chapterId);
+  const [currentChapterId, setCurrentChapterId] = useState(requestedChapterId);
   const [currentPage, setCurrentPage] = useState(1);
+  const [currentPageId, setCurrentPageId] = useState<string | null>(null);
+  const [currentScrollRatio, setCurrentScrollRatio] = useState(0);
   const [readingMode, setReadingMode] = useState<ReadingMode>("vertical");
   const [spreadMode, setSpreadMode] = useState<SpreadMode>("single");
   const [zoom, setZoom] = useState(100);
   const [fitWidth, setFitWidth] = useState(false);
   const [showHint, setShowHint] = useState(false);
+  const [resumeReady, setResumeReady] = useState(false);
+  const [progressStatus, setProgressStatus] = useState<ProgressStatus>("saved");
+  const resumeStarted = useRef(false);
+  const [urlSynchronizer] = useState(
+    () => new ReaderUrlSynchronizer(router, seriesSlug, requestedChapterId),
+  );
+  const [progressController] = useState(() => new ReaderProgressController({
+    seriesSlug,
+    authenticated: !!useAuthStore.getState().user,
+    onStatus: setProgressStatus,
+  }));
 
   useEffect(() => {
-    startTransition(() => {
-      setCurrentChapterId(chapterId);
-      setCurrentPage(1);
-    });
-    void feed.loadInitial(seriesSlug, chapterId).catch(() => undefined);
+    void feed.loadInitial(seriesSlug, requestedChapterId).catch(() => undefined);
     return () => feed.dispose();
-  }, [chapterId, feed, seriesSlug]);
+  }, [feed, requestedChapterId, seriesSlug]);
+
+  useEffect(() => {
+    progressController.setAuthenticated(!!user);
+  }, [progressController, user]);
 
   const loadNext = useCallback(() => feed.loadNext(), [feed]);
   const loadPrevious = useCallback(() => feed.loadPrevious(), [feed]);
@@ -181,11 +207,15 @@ export default function EnhancedReader({ params }: ReaderProps) {
 
   const activeChapter = feedState.chaptersById[currentChapterId]
     ?? (feedState.orderedChapterIds[0] ? feedState.chaptersById[feedState.orderedChapterIds[0]] : undefined);
-  const activePages = activeChapter?.pages ?? [];
+  const activePages = useMemo(() => activeChapter?.pages ?? [], [activeChapter]);
 
   const goToPage = useCallback((page: number) => {
-    setCurrentPage(Math.min(Math.max(1, page), Math.max(1, activePages.length)));
-  }, [activePages.length]);
+    const nextPage = Math.min(Math.max(1, page), Math.max(1, activePages.length));
+    const pageData = activePages.find((item) => item.pageNumber === nextPage) ?? activePages[nextPage - 1];
+    setCurrentPage(nextPage);
+    setCurrentPageId(pageData?.id ?? null);
+    setCurrentScrollRatio(activePages.length <= 1 ? 0 : Math.min(1, Math.max(0, (nextPage - 1) / (activePages.length - 1))));
+  }, [activePages]);
 
   const navigateToChapter = useCallback((id: string | null) => {
     if (id) router.push(`/reader/${encodeURIComponent(seriesSlug)}/${encodeURIComponent(id)}`);
@@ -213,49 +243,82 @@ export default function EnhancedReader({ params }: ReaderProps) {
   }, [activeChapter, activePages.length, currentPage, goToPage, navigateToChapter, readingMode, spreadMode]);
 
   useEffect(() => {
-    if (!activeChapter) return;
-    feed.setChapterProtected(activeChapter.id, true);
-    return () => feed.setChapterProtected(activeChapter.id, false);
-  }, [activeChapter?.id, feed]);
+    const activeChapterId = activeChapter?.id;
+    if (!activeChapterId) return;
+    feed.setChapterProtected(activeChapterId, true);
+    return () => feed.setChapterProtected(activeChapterId, false);
+  }, [activeChapter, feed]);
 
   useEffect(() => {
-    if (!activeChapter) return;
-    const saved = loadLocalProgress(seriesSlug, activeChapter.id);
-    if (saved) {
-      startTransition(() => {
-        setCurrentPage(Math.min(saved.page, Math.max(1, activePages.length)));
-        if (saved.readingMode) setReadingMode(saved.readingMode);
-        if (saved.zoom) setZoom(saved.zoom);
-      });
-    }
+    const requestedChapter = feedState.chaptersById[requestedChapterId];
+    if (resumeStarted.current || authInitializing || !requestedChapter || feedState.loadingInitial) return;
+    resumeStarted.current = true;
     let active = true;
-    if (useAuthStore.getState().user) {
-      void loadServerProgress(seriesSlug, activeChapter.id).then((serverPage) => {
-        if (active && serverPage != null) setCurrentPage(Math.min(serverPage, Math.max(1, activePages.length)));
+    void (async () => {
+      const server = user ? await loadServerProgress(seriesSlug, requestedChapterId) : null;
+      const local = loadLocalProgress(seriesSlug, requestedChapterId);
+      const selected = chooseNewestProgress(server, local, seriesSlug, requestedChapterId);
+      const resumed = selected ? clampProgress(selected, requestedChapter.pages.length) : null;
+      if (!active) return;
+      const page = resumed?.page ?? 1;
+      const pageData = requestedChapter.pages.find((item) => item.pageNumber === page)
+        ?? requestedChapter.pages[Math.max(0, page - 1)];
+      startTransition(() => {
+        setCurrentChapterId(requestedChapterId);
+        setCurrentPage(pageData?.pageNumber ?? 1);
+        setCurrentPageId(pageData?.id ?? null);
+        setCurrentScrollRatio(resumed?.scrollRatio ?? 0);
+        if (local?.readingMode) setReadingMode(local.readingMode);
+        if (local?.zoom) setZoom(local.zoom);
+        setResumeReady(true);
       });
-    }
+      feed.setVisibleChapterId(requestedChapterId);
+    })();
     return () => { active = false; };
-  }, [activeChapter, activePages.length, seriesSlug]);
+  }, [authInitializing, feed, feedState.chaptersById, feedState.loadingInitial, requestedChapterId, seriesSlug, user]);
 
   useEffect(() => {
-    if (!activeChapter) return;
-    const save = () => {
-      saveLocalProgress(seriesSlug, activeChapter.id, { page: currentPage, readingMode, zoom });
-      if (useAuthStore.getState().user) void saveServerProgress(seriesSlug, activeChapter.id, currentPage);
+    if (!resumeReady) return;
+    urlSynchronizer.update(currentChapterId);
+  }, [currentChapterId, resumeReady, urlSynchronizer]);
+
+  useEffect(() => {
+    if (!resumeReady || !activeChapter || !currentPageId) return;
+    progressController.update({
+      seriesSlug,
+      chapterId: activeChapter.id,
+      page: currentPage,
+      scrollRatio: currentScrollRatio,
+      updatedAt: Date.now(),
+      readingMode,
+      zoom,
+    });
+  }, [activeChapter, currentPage, currentPageId, currentScrollRatio, progressController, readingMode, resumeReady, seriesSlug, zoom]);
+
+  useEffect(() => {
+    const removeProgressListeners = attachProgressFlushListeners(progressController);
+    return () => {
+      removeProgressListeners();
+      urlSynchronizer.dispose();
     };
-    const timer = window.setInterval(save, PROGRESS_SAVE_INTERVAL);
-    return () => window.clearInterval(timer);
-  }, [activeChapter, currentPage, readingMode, seriesSlug, zoom]);
+  }, [progressController, urlSynchronizer]);
 
   const onRangeChanged = useCallback((range: ListRange) => {
-    const item = feedState.items[range.startIndex];
-    if (!item) return;
-    setCurrentChapterId(item.chapterId);
-    feed.setVisibleChapterId(item.chapterId);
-    if (item.kind === "page") setCurrentPage(item.pageNumber);
-  }, [feed, feedState.items]);
+    const visible = selectViewportCenterPage(
+      feedState.items,
+      range,
+      feedState.firstItemIndex,
+      feedState.chaptersById,
+    );
+    if (!visible) return;
+    setCurrentChapterId(visible.chapterId);
+    setCurrentPageId(visible.pageId);
+    setCurrentPage(visible.pageNumber);
+    setCurrentScrollRatio(visible.scrollRatio);
+    feed.setVisibleChapterId(visible.chapterId);
+  }, [feed, feedState.chaptersById, feedState.firstItemIndex, feedState.items]);
 
-  if (feedState.loadingInitial) return <div className="reader-loading"><div className="spinner" /><p>Loading chapter...</p></div>;
+  if (feedState.loadingInitial || !resumeReady) return <div className="reader-loading"><div className="spinner" /><p>Loading chapter...</p></div>;
   if (!activeChapter || activePages.length === 0) {
     return (
       <div className="reader-error">
@@ -267,6 +330,10 @@ export default function EnhancedReader({ params }: ReaderProps) {
   }
 
   const progress = activePages.length ? Math.round((currentPage / activePages.length) * 100) : 0;
+  const continuousInitialIndex = feedState.items.findIndex((item) =>
+    item.kind === "page" && item.chapterId === currentChapterId && item.pageId === currentPageId,
+  );
+  const verticalInitialIndex = activePages.findIndex((page) => page.id === currentPageId);
   return (
     <div className={`reader ${readingMode}`}>
       <div className="progress-wrap"><div className="progress-bar" style={{ width: `${progress}%` }} /></div>
@@ -309,6 +376,9 @@ export default function EnhancedReader({ params }: ReaderProps) {
             onLoadPrevious={loadPrevious}
             onRetry={retryFeed}
             onRangeChanged={onRangeChanged}
+            initialTopMostItemIndex={continuousInitialIndex < 0
+              ? undefined
+              : feedState.firstItemIndex + continuousInitialIndex}
             registerPageCleanup={registerPageCleanup}
           />
         ) : readingMode === "vertical" ? (
@@ -330,9 +400,25 @@ export default function EnhancedReader({ params }: ReaderProps) {
             fitWidth={fitWidth}
             onEndReached={() => undefined}
             onStartReached={() => undefined}
+            initialTopMostItemIndex={verticalInitialIndex < 0 ? undefined : verticalInitialIndex}
             onRangeChanged={(range) => {
-              const page = activePages[range.startIndex];
-              if (page) setCurrentPage(page.pageNumber);
+              const items = activePages.map((page) => ({
+                kind: "page" as const,
+                key: `page:${page.id}`,
+                chapterId: activeChapter.id,
+                chapterNumber: activeChapter.number,
+                pageId: page.id,
+                pageNumber: page.pageNumber,
+                mediaPath: page.mediaPath,
+                width: page.width,
+                height: page.height,
+                aspectRatio: page.aspectRatio,
+              }));
+              const visible = selectViewportCenterPage(items, range, 0, feedState.chaptersById);
+              if (!visible) return;
+              setCurrentPage(visible.pageNumber);
+              setCurrentPageId(visible.pageId);
+              setCurrentScrollRatio(visible.scrollRatio);
             }}
           />
         ) : spreadMode === "spread" ? (
@@ -345,6 +431,7 @@ export default function EnhancedReader({ params }: ReaderProps) {
       </div>
       <div className="reader-controls">
         <span>{activeChapter.title ?? `Chapter ${activeChapter.number}`}</span>
+        <span className="reader-save-status" role="status">{progressStatus}</span>
         <input
           className="page-input"
           type="number"

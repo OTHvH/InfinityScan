@@ -22,6 +22,7 @@ interface ContinuousReaderProps {
   onLoadPrevious: () => Promise<unknown> | null;
   onRetry: () => Promise<unknown> | null;
   onRangeChanged: (range: ListRange) => void;
+  initialTopMostItemIndex?: number;
   registerPageCleanup?: (pageId: string, cleanup: () => void) => () => void;
 }
 
@@ -74,6 +75,7 @@ function ContinuousReaderView(props: ContinuousReaderProps) {
     <Virtuoso
       data={props.items}
       firstItemIndex={props.firstItemIndex}
+      initialTopMostItemIndex={props.initialTopMostItemIndex}
       increaseViewportBy={{ top: 700, bottom: 1200 }}
       computeItemKey={(_, item) => item.key}
       scrollSeekConfiguration={{

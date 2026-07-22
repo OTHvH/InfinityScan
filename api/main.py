@@ -828,12 +828,14 @@ def get_progress(
             last_page=None,
             scroll_position=None,
             completed=False,
+            updated_at=None,
         )
     return ProgressOut(
         chapter_uuid=chapter_uuid,
         last_page=row.last_page,
         scroll_position=row.scroll_position,
         completed=row.completed,
+        updated_at=row.updated_at,
     )
 
 
@@ -888,6 +890,7 @@ def upsert_progress(
         last_page=row.last_page,
         scroll_position=row.scroll_position,
         completed=row.completed,
+        updated_at=row.updated_at,
     )
 
 

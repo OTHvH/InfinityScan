@@ -257,6 +257,12 @@ a {
   flex-wrap: wrap;
   box-shadow: 0 12px 44px rgba(0, 0, 0, 0.3);
 }
+
+.reader-save-status {
+  color: var(--muted);
+  font-family: var(--font-mono, ui-monospace, monospace);
+  font-size: 11px;
+}
 .pages { margin-top: 14px; display: flex; flex-direction: column; gap: 12px; align-items: center; }
 .page { width: 100%; display: flex; justify-content: center; }
 .page img {
