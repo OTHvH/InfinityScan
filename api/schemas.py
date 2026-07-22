@@ -15,7 +15,7 @@ from decimal import Decimal
 from typing import Optional
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, EmailStr, Field
+from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_serializer
 
 
 # ── Shared base ──────────────────────────────────────────────────────────────
@@ -56,6 +56,10 @@ class ProviderChapterItemOut(_Strict):
     page_count: int = 0
     published_at: str | None = None
 
+    @field_serializer("number")
+    def serialize_number(self, value: Decimal) -> str:
+        return format(value.normalize(), "f")
+
 
 class ProviderChapterListOut(_Strict):
     total: int
@@ -94,6 +98,10 @@ class LocalChapterOut(_Strict):
     title: str | None
     page_count: int
     published_at: str | None
+
+    @field_serializer("number")
+    def serialize_number(self, value: Decimal) -> str:
+        return format(value.normalize(), "f")
 
 
 class LocalSeriesDetailOut(LocalSeriesOut):

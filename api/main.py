@@ -175,8 +175,10 @@ app.add_middleware(OriginValidationMiddleware)
 # ---------------------------------------------------------------------------
 
 from routes.auth import router as auth_router
+from routes.reader import router as reader_router
 
 app.include_router(auth_router)
+app.include_router(reader_router)
 
 
 # ---------------------------------------------------------------------------
