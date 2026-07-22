@@ -6,6 +6,7 @@ import { useRouter } from "next/navigation";
 import { useAuthStore } from "@/stores/auth";
 import { fetchReaderChunk } from "@/features/reader/api";
 import { ContinuousReader } from "@/features/reader/components/ContinuousReader";
+import { ReaderPage as ResilientReaderPage } from "@/features/reader/components/ReaderPage";
 import { ReaderFeedController } from "@/features/reader/feed";
 import {
   ReaderProgressController,
@@ -17,7 +18,7 @@ import {
   type ProgressStatus,
 } from "@/features/reader/progress";
 import { ReaderUrlSynchronizer, selectViewportCenterPage } from "@/features/reader/synchronization";
-import type { ReaderItem, ReaderPage, ReadingMode } from "@/features/reader/types";
+import type { ReaderItem, ReaderPage as ReaderPageData, ReadingMode } from "@/features/reader/types";
 
 type SpreadMode = "single" | "spread";
 
@@ -82,42 +83,38 @@ function TopBar(props: TopBarProps) {
 }
 
 interface PageImageProps {
-  page: ReaderPage;
+  page: ReaderPageData;
+  chapterId: string;
+  chapterNumber: string;
   zoom: number;
   fitWidth: boolean;
 }
 
-function PageImage({ page, zoom, fitWidth }: PageImageProps) {
-  const [loaded, setLoaded] = useState(false);
-  const [failed, setFailed] = useState(false);
-  if (failed) {
-    return <div className="page-error">Failed to load page {page.pageNumber}</div>;
-  }
-  return (
-    <div className="page">
-      <img
-        src={page.mediaPath}
-        alt={`Page ${page.pageNumber}`}
-        loading="lazy"
-        onLoad={() => setLoaded(true)}
-        onError={() => setFailed(true)}
-        style={{
-          transform: fitWidth ? undefined : `scale(${zoom / 100})`,
-          transformOrigin: "top center",
-          maxWidth: fitWidth ? "100%" : `${zoom}%`,
-          width: fitWidth ? "100%" : "auto",
-          opacity: loaded ? 1 : 0.3,
-        }}
-      />
-    </div>
-  );
+function PageImage({ page, chapterId, chapterNumber, zoom, fitWidth }: PageImageProps) {
+  return <ResilientReaderPage item={{
+    kind: "page",
+    key: `page:${page.id}`,
+    chapterId,
+    chapterNumber,
+    pageId: page.id,
+    pageNumber: page.pageNumber,
+    mediaPath: page.mediaPath,
+    width: page.width,
+    height: page.height,
+    aspectRatio: page.aspectRatio,
+  }} zoom={zoom} fitWidth={fitWidth} />;
 }
 
-function Spread({ left, right }: { left: ReaderPage; right?: ReaderPage }) {
+function Spread({ left, right, chapterId, chapterNumber }: {
+  left: ReaderPageData;
+  right?: ReaderPageData;
+  chapterId: string;
+  chapterNumber: string;
+}) {
   return (
     <div className="spread-container">
-      <div className="spread-page"><img src={left.mediaPath} alt={`Page ${left.pageNumber}`} style={{ height: "calc(100vh - 120px)", width: "auto", maxWidth: "48vw" }} /></div>
-      {right && <div className="spread-page"><img src={right.mediaPath} alt={`Page ${right.pageNumber}`} style={{ height: "calc(100vh - 120px)", width: "auto", maxWidth: "48vw" }} /></div>}
+      <div className="spread-page"><PageImage page={left} chapterId={chapterId} chapterNumber={chapterNumber} zoom={100} fitWidth /></div>
+      {right && <div className="spread-page"><PageImage page={right} chapterId={chapterId} chapterNumber={chapterNumber} zoom={100} fitWidth /></div>}
     </div>
   );
 }
@@ -146,7 +143,7 @@ function VirtualizedPages(props: VirtualizedPagesProps) {
       initialTopMostItemIndex={props.initialTopMostItemIndex}
       increaseViewportBy={{ top: 700, bottom: 1200 }}
       computeItemKey={(_, page) => page.key}
-      itemContent={(_, page) => <PageImage page={{ id: page.pageId, pageNumber: page.pageNumber, mediaPath: page.mediaPath, width: page.width, height: page.height, aspectRatio: page.aspectRatio }} zoom={props.zoom} fitWidth={props.fitWidth} />}
+      itemContent={(_, page) => <PageImage page={{ id: page.pageId, pageNumber: page.pageNumber, mediaPath: page.mediaPath, width: page.width, height: page.height, aspectRatio: page.aspectRatio }} chapterId={page.chapterId} chapterNumber={page.chapterNumber} zoom={props.zoom} fitWidth={props.fitWidth} />}
       endReached={props.onEndReached}
       startReached={props.onStartReached}
       rangeChanged={props.onRangeChanged}
@@ -422,10 +419,10 @@ export default function EnhancedReader({ params }: ReaderProps) {
             }}
           />
         ) : spreadMode === "spread" ? (
-          <Spread left={activePages[currentPage - 1]} right={activePages[currentPage]} />
+          <Spread left={activePages[currentPage - 1]} right={activePages[currentPage]} chapterId={activeChapter.id} chapterNumber={activeChapter.number} />
         ) : (
           <div className="pages-horizontal">
-            <PageImage page={activePages[currentPage - 1]} zoom={zoom} fitWidth={fitWidth} />
+            <PageImage page={activePages[currentPage - 1]} chapterId={activeChapter.id} chapterNumber={activeChapter.number} zoom={zoom} fitWidth={fitWidth} />
           </div>
         )}
       </div>

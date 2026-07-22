@@ -37,6 +37,32 @@ export function resolveMediaUrl(path: string): string {
   return path;
 }
 
+/** Build a request URL for the same validated page endpoint, optionally cache-busting a retry. */
+export function resolvePageMediaRequest(path: string, attempt = 1): string {
+  const origin = typeof window !== "undefined" ? window.location.origin : "http://localhost";
+  const marker = "__infinityscan_page__";
+  const expected = new URL(resolveMediaUrl(`${MEDIA_PATH_PREFIX}${marker}`), origin);
+  const candidate = new URL(path.startsWith("/") ? resolveMediaUrl(path) : path, origin);
+  const expectedPrefix = expected.pathname.slice(0, -marker.length);
+  const pageId = candidate.pathname.slice(expectedPrefix.length);
+  if (
+    candidate.origin !== expected.origin
+    || !!candidate.username
+    || !!candidate.password
+    || !candidate.pathname.startsWith(expectedPrefix)
+    || !pageId
+    || pageId.includes("/")
+    || candidate.search
+    || candidate.hash
+    || !Number.isInteger(attempt)
+    || attempt < 1
+  ) {
+    throw new Error("Invalid reader media path");
+  }
+  if (attempt > 1) candidate.searchParams.set("attempt", String(attempt));
+  return candidate.toString();
+}
+
 // ── CSRF cookie reader ───────────────────────────────────────────────────────
 
 function readCsrfCookie(): string | null {

@@ -458,6 +458,55 @@ input[type="range"] { accent-color: var(--accent); }
   background: rgba(0, 0, 0, 0.2);
 }
 
+.reader-page-frame {
+  position: relative;
+  min-width: 0;
+  overflow: hidden;
+  background: rgba(10, 5, 18, 0.55);
+}
+
+.reader-page-skeleton {
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(105deg, rgba(255, 255, 255, 0.025) 30%, rgba(184, 77, 255, 0.1) 45%, rgba(255, 255, 255, 0.025) 60%);
+  background-size: 220% 100%;
+  animation: reader-page-shimmer 1.5s ease-in-out infinite;
+}
+
+@keyframes reader-page-shimmer {
+  from { background-position: 100% 0; }
+  to { background-position: -100% 0; }
+}
+
+.reader-page-image {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  transform: none;
+  max-width: none;
+  border-radius: 8px;
+  transition: opacity 180ms ease;
+}
+
+.reader-page-image.pending { opacity: 0; }
+.reader-page-image.loaded { opacity: 1; }
+
+.reader-page-message {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  padding: 20px;
+  color: var(--muted);
+  text-align: center;
+  font-size: 13px;
+}
+
 .preload-banner {
   position: fixed;
   bottom: 80px;
