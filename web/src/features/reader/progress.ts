@@ -74,7 +74,9 @@ export function loadLocalProgress(seriesSlug: string, chapterId: string): Reader
       updatedAt: finiteNumber(value.updatedAt)
         ? value.updatedAt
         : finiteNumber(value.timestamp) ? value.timestamp : 0,
-      readingMode: value.readingMode as ReadingMode | undefined,
+      readingMode: value.readingMode === "scroll"
+        ? "continuous"
+        : value.readingMode as ReadingMode | undefined,
       zoom: finiteNumber(value.zoom) ? value.zoom : undefined,
     };
     return isValidProgress(progress, seriesSlug, chapterId) ? progress : null;

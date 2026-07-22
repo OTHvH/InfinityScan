@@ -1,5 +1,7 @@
 export type ReaderDirection = "next" | "previous";
-export type ReadingMode = "vertical" | "horizontal" | "scroll";
+export type ReadingMode = "continuous" | "vertical" | "horizontal";
+export type SpreadMode = "single" | "spread";
+export type ReadingDirection = "ltr" | "rtl";
 
 export interface ReaderSeries {
   id: string;
