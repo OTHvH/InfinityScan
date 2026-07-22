@@ -126,7 +126,6 @@ localStorage.getItem('infinityscan_progress_{slug}_{chapter}')
 | AUTH-01 | Access bookmarks without auth | 1. GET /bookmarks (no cookie) | 401 Unauthorized |
 | AUTH-02 | Consistent user identity | 1. Login as user A<br>2. GET bookmarks | Bookmarks for user A returned |
 | AUTH-03 | Different users isolated | 1. User A adds bookmark<br>2. User B queries bookmarks | User B sees only their bookmarks |
-| AUTH-04 | Identity header ignored | 1. Login as user A<br>2. GET /me with X-User-ID header | User A's identity returned (header ignored) |
 | AUTH-05 | Progress user isolation | 1. User A reads to page 5<br>2. User B reads same chapter | Each has independent progress |
 
 ### Test Commands

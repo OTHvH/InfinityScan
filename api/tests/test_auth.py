@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import time
 import uuid
+from decimal import Decimal
 
 import pytest
 from sqlalchemy import select
@@ -822,7 +823,7 @@ class TestIsolation:
         db.refresh(s)
         return s
 
-    def _create_chapter(self, db, series: Series, number: float = 1.0) -> Chapter:
+    def _create_chapter(self, db, series: Series, number: Decimal = Decimal("1.0")) -> Chapter:
         ch = Chapter(series_id=series.id, number=number, language="en")
         db.add(ch)
         db.commit()

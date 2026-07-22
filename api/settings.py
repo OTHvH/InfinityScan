@@ -31,6 +31,10 @@ def _csv(name: str, default: str = "") -> list[str]:
     return [item.strip() for item in raw.split(",") if item.strip()]
 
 
+def _float(name: str, default: float) -> float:
+    return float(os.environ.get(name, str(default)))
+
+
 @dataclass(frozen=True)
 class Settings:
     """Immutable, validated application settings."""
@@ -143,9 +147,66 @@ class Settings:
         default_factory=lambda: os.environ.get("COPYMANGA_TOKEN", "")
     )
 
+    # ── Provider adapter settings ─────────────────────────────────────
+    copymanga_enabled: bool = field(
+        default_factory=lambda: _bool("COPYMANGA_ENABLED", True)
+    )
+    copymanga_timeout: float = field(
+        default_factory=lambda: _float("COPYMANGA_TIMEOUT", 15.0)
+    )
+    copymanga_max_response_bytes: int = field(
+        default_factory=lambda: int(os.environ.get("COPYMANGA_MAX_RESPONSE_BYTES", str(2 * 1024 * 1024)))
+    )
+    copymanga_max_redirects: int = field(
+        default_factory=lambda: int(os.environ.get("COPYMANGA_MAX_REDIRECTS", "5"))
+    )
+    copymanga_cache_ttl: int = field(
+        default_factory=lambda: int(os.environ.get("COPYMANGA_CACHE_TTL", "300"))
+    )
+    local_content_enabled: bool = field(
+        default_factory=lambda: _bool("LOCAL_CONTENT_ENABLED", True)
+    )
+    local_content_root: str = field(
+        default_factory=lambda: os.environ.get("LOCAL_CONTENT_ROOT", "")
+    )
+    provider_mirroring_enabled: bool = field(
+        default_factory=lambda: _bool("PROVIDER_MIRRORING_ENABLED", False)
+    )
+
     # ── S3 / CDN ────────────────────────────────────────────────────────
     s3_public_url: str = field(
         default_factory=lambda: os.environ.get("S3_PUBLIC_URL", "").rstrip("/")
+    )
+
+    # ── Object storage ──────────────────────────────────────────────────
+    object_storage_enabled: bool = field(
+        default_factory=lambda: _bool("OBJECT_STORAGE_ENABLED", False)
+    )
+    s3_endpoint_url: str | None = field(
+        default_factory=lambda: os.environ.get("S3_ENDPOINT_URL") or None
+    )
+    s3_region: str = field(default_factory=lambda: os.environ.get("S3_REGION", "auto"))
+    s3_bucket: str = field(default_factory=lambda: os.environ.get("S3_BUCKET", ""))
+    s3_access_key_id: str = field(
+        default_factory=lambda: os.environ.get("S3_ACCESS_KEY_ID", "")
+    )
+    s3_secret_access_key: str = field(
+        default_factory=lambda: os.environ.get("S3_SECRET_ACCESS_KEY", "")
+    )
+    s3_presign_ttl_seconds: int = field(
+        default_factory=lambda: int(os.environ.get("S3_PRESIGN_TTL_SECONDS", "300"))
+    )
+    s3_force_path_style: bool = field(
+        default_factory=lambda: _bool("S3_FORCE_PATH_STYLE", False)
+    )
+    s3_connect_timeout: float = field(
+        default_factory=lambda: _float("S3_CONNECT_TIMEOUT", 5.0)
+    )
+    s3_read_timeout: float = field(
+        default_factory=lambda: _float("S3_READ_TIMEOUT", 30.0)
+    )
+    storage_public_base_url: str | None = field(
+        default_factory=lambda: os.environ.get("STORAGE_PUBLIC_BASE_URL") or None
     )
 
     # ── Logging ─────────────────────────────────────────────────────────
@@ -218,6 +279,29 @@ def _validate_settings(s: Settings) -> None:
             "COOKIE_SECURE must be 'true' when COOKIE_SAME_SITE is 'none'. "
             "Browsers reject SameSite=None cookies without Secure."
         )
+
+    if s.s3_presign_ttl_seconds < 1 or s.s3_presign_ttl_seconds > 3600:
+        raise ValueError("S3_PRESIGN_TTL_SECONDS must be between 1 and 3600 seconds")
+    if s.s3_connect_timeout <= 0 or s.s3_read_timeout <= 0:
+        raise ValueError("S3_CONNECT_TIMEOUT and S3_READ_TIMEOUT must be positive")
+
+    if s.object_storage_enabled:
+        required = {
+            "S3_REGION": s.s3_region,
+            "S3_BUCKET": s.s3_bucket,
+            "S3_ACCESS_KEY_ID": s.s3_access_key_id,
+            "S3_SECRET_ACCESS_KEY": s.s3_secret_access_key,
+        }
+        if s.app_env == "production":
+            required["S3_ENDPOINT_URL"] = s.s3_endpoint_url or ""
+            if s.s3_region != "auto":
+                raise ValueError("Production R2 storage requires S3_REGION=auto")
+        missing = [name for name, value in required.items() if not value]
+        if missing:
+            raise ValueError(
+                "Object storage is enabled but required settings are missing: "
+                + ", ".join(missing)
+            )
 
 
 def reset_settings() -> None:

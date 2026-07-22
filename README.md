@@ -74,6 +74,13 @@ See [`infra/.env.example`](infra/.env.example) for all available variables.
 | `NEXT_PUBLIC_API_URL` | `http://localhost:8000`                                          | Base URL the frontend uses for API       |
 | `API_HOST`            | `0.0.0.0`                                                        | Host the API listens on                  |
 | `API_PORT`            | `8000`                                                           | Port the API listens on                  |
+| `OBJECT_STORAGE_ENABLED` | `false`                                                        | Enable private S3-compatible storage    |
+| `S3_BUCKET`           | `infinityscan-pages`                                             | Object-storage bucket                   |
+
+To run local object-storage integration, configure the `S3_*` variables in
+`infra/.env`, then run `docker compose --profile storage up -d minio` followed
+by `docker compose --profile storage run --rm minio-setup`. The API never creates
+production buckets automatically.
 
 ---
 

@@ -5,13 +5,17 @@ from __future__ import annotations
 import enum
 import uuid
 from datetime import datetime
+from decimal import Decimal
 
 from sqlalchemy import (
     Boolean,
     DateTime,
     Enum,
     ForeignKey,
+    JSON,
     Integer,
+    BigInteger,
+    Numeric,
     SmallInteger,
     String,
     Table,
@@ -57,6 +61,42 @@ class SeriesStatus(str, enum.Enum):
 class UserRole(str, enum.Enum):
     admin = "admin"
     user = "user"
+
+
+class ChapterImportStatus(str, enum.Enum):
+    importing = "importing"
+    ready = "ready"
+    failed = "failed"
+    quarantined = "quarantined"
+
+
+class PageIntegrityStatus(str, enum.Enum):
+    pending = "pending"
+    verified = "verified"
+    missing = "missing"
+    mismatch = "mismatch"
+    quarantined = "quarantined"
+
+
+class ImportJobStatus(str, enum.Enum):
+    pending = "pending"
+    scanning = "scanning"
+    uploading = "uploading"
+    verifying = "verifying"
+    succeeded = "succeeded"
+    partial = "partial"
+    failed = "failed"
+    cancelled = "cancelled"
+
+
+class ImportJobItemStatus(str, enum.Enum):
+    pending = "pending"
+    uploading = "uploading"
+    verifying = "verifying"
+    succeeded = "succeeded"
+    skipped = "skipped"
+    failed = "failed"
+    quarantined = "quarantined"
 
 
 # ---------------------------------------------------------------------------
@@ -150,6 +190,7 @@ class User(Base):
     refresh_sessions: Mapped[list[RefreshSession]] = relationship(
         "RefreshSession", back_populates="user", cascade="all, delete-orphan"
     )
+    import_jobs: Mapped[list[ImportJob]] = relationship("ImportJob", back_populates="requested_by_user")
 
 
 # ---------------------------------------------------------------------------
@@ -196,6 +237,9 @@ class Series(Base):
     bookmarks: Mapped[list[Bookmark]] = relationship(
         "Bookmark", back_populates="series", cascade="all, delete-orphan"
     )
+    source_links: Mapped[list[SourceSeries]] = relationship(
+        "SourceSeries", back_populates="series", cascade="all, delete-orphan"
+    )
 
 
 class Chapter(Base):
@@ -208,7 +252,7 @@ class Chapter(Base):
     series_id: Mapped[uuid.UUID] = mapped_column(
         Uuid(as_uuid=True), ForeignKey("series.id", ondelete="CASCADE"), nullable=False, index=True
     )
-    number: Mapped[float] = mapped_column(nullable=False)
+    number: Mapped[Decimal] = mapped_column(Numeric(12, 4), nullable=False)
     volume: Mapped[int | None] = mapped_column(SmallInteger)
     title: Mapped[str | None] = mapped_column(String(512))
     language: Mapped[str] = mapped_column(String(10), nullable=False, default="en")
@@ -217,6 +261,14 @@ class Chapter(Base):
         Enum(ReadingMode, name="reading_mode_enum", create_constraint=False)
     )
     page_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    import_status: Mapped[ChapterImportStatus] = mapped_column(
+        Enum(ChapterImportStatus, name="chapter_import_status_enum"),
+        nullable=False,
+        default=ChapterImportStatus.importing,
+        server_default=ChapterImportStatus.importing.value,
+    )
+    verified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    source_updated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     published_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
@@ -243,9 +295,135 @@ class Page(Base):
     object_key: Mapped[str] = mapped_column(String(1024), nullable=False)
     width: Mapped[int | None] = mapped_column(Integer)
     height: Mapped[int | None] = mapped_column(Integer)
-    file_size: Mapped[int | None] = mapped_column(Integer)
+    file_size: Mapped[int | None] = mapped_column(BigInteger)
+    sha256: Mapped[str | None] = mapped_column(String(64))
+    mime_type: Mapped[str | None] = mapped_column(String(127))
+    file_extension: Mapped[str | None] = mapped_column(String(16))
+    integrity_status: Mapped[PageIntegrityStatus] = mapped_column(
+        Enum(PageIntegrityStatus, name="page_integrity_status_enum"),
+        nullable=False,
+        default=PageIntegrityStatus.pending,
+        server_default=PageIntegrityStatus.pending.value,
+    )
+    verified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    storage_etag: Mapped[str | None] = mapped_column(String(255))
+    imported_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
     chapter: Mapped[Chapter] = relationship("Chapter", back_populates="pages")
+
+
+class Source(Base):
+    """A configured content source; configuration must contain no secrets."""
+
+    __tablename__ = "sources"
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    key: Mapped[str] = mapped_column(String(100), nullable=False, unique=True)
+    display_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    adapter_type: Mapped[str] = mapped_column(String(100), nullable=False)
+    enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True, server_default="true")
+    base_url: Mapped[str | None] = mapped_column(String(1024))
+    configuration: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict, server_default="{}")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+    series_links: Mapped[list[SourceSeries]] = relationship(
+        "SourceSeries", back_populates="source", cascade="all, delete-orphan"
+    )
+    import_jobs: Mapped[list[ImportJob]] = relationship("ImportJob", back_populates="source")
+
+
+class SourceSeries(Base):
+    """Maps a local series to its identity at an external source."""
+
+    __tablename__ = "source_series"
+    __table_args__ = (
+        UniqueConstraint("source_id", "external_series_id", name="uq_source_series_external_id"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    source_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("sources.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    series_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("series.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    external_series_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    external_url: Mapped[str | None] = mapped_column(String(2048))
+    last_synced_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    metadata_hash: Mapped[str | None] = mapped_column(String(64))
+
+    source: Mapped[Source] = relationship("Source", back_populates="series_links")
+    series: Mapped[Series] = relationship("Series", back_populates="source_links")
+
+
+class ImportJob(Base):
+    """Tracks one import or synchronization run."""
+
+    __tablename__ = "import_jobs"
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    source_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("sources.id", ondelete="SET NULL"), index=True
+    )
+    requested_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), index=True
+    )
+    status: Mapped[ImportJobStatus] = mapped_column(
+        Enum(ImportJobStatus, name="import_job_status_enum"),
+        nullable=False,
+        default=ImportJobStatus.pending,
+        server_default=ImportJobStatus.pending.value,
+        index=True,
+    )
+    idempotency_key: Mapped[str] = mapped_column(String(255), nullable=False, unique=True)
+    manifest_hash: Mapped[str | None] = mapped_column(String(64))
+    series_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    chapter_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    page_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    uploaded_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    skipped_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    failed_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    error_summary: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False, index=True)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+
+    source: Mapped[Source | None] = relationship("Source", back_populates="import_jobs")
+    requested_by_user: Mapped[User | None] = relationship("User", back_populates="import_jobs")
+    items: Mapped[list[ImportJobItem]] = relationship(
+        "ImportJobItem", back_populates="job", cascade="all, delete-orphan"
+    )
+
+
+class ImportJobItem(Base):
+    """Per-file state for an import job."""
+
+    __tablename__ = "import_job_items"
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    job_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("import_jobs.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    source_reference: Mapped[str] = mapped_column(String(2048), nullable=False)
+    object_key: Mapped[str] = mapped_column(String(1024), nullable=False)
+    sha256: Mapped[str | None] = mapped_column(String(64))
+    status: Mapped[ImportJobItemStatus] = mapped_column(
+        Enum(ImportJobItemStatus, name="import_job_item_status_enum"),
+        nullable=False,
+        default=ImportJobItemStatus.pending,
+        server_default=ImportJobItemStatus.pending.value,
+        index=True,
+    )
+    error: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+    job: Mapped[ImportJob] = relationship("ImportJob", back_populates="items")
 
 
 # ---------------------------------------------------------------------------

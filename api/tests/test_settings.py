@@ -335,3 +335,77 @@ class TestEnvironmentVariables:
         """COOKIE_DOMAIN should be None by default."""
         settings = get_settings()
         assert settings.cookie_domain is None
+
+
+class TestObjectStorageSettings:
+    """Test disabled-by-default and production storage validation."""
+
+    def test_object_storage_is_disabled_by_default(self):
+        env = os.environ.copy()
+        env.pop("OBJECT_STORAGE_ENABLED", None)
+        with patch.dict(os.environ, env, clear=True):
+            reset_settings()
+            settings = get_settings()
+            assert settings.object_storage_enabled is False
+            assert settings.s3_region == "auto"
+            assert settings.s3_presign_ttl_seconds == 300
+
+    def test_enabled_development_storage_reads_configuration(self):
+        with patch.dict(
+            os.environ,
+            {
+                "OBJECT_STORAGE_ENABLED": "true",
+                "S3_ENDPOINT_URL": "http://minio:9000",
+                "S3_REGION": "us-east-1",
+                "S3_BUCKET": "test-bucket",
+                "S3_ACCESS_KEY_ID": "access",
+                "S3_SECRET_ACCESS_KEY": "secret",
+                "S3_FORCE_PATH_STYLE": "true",
+            },
+        ):
+            reset_settings()
+            settings = get_settings()
+            assert settings.object_storage_enabled is True
+            assert settings.s3_endpoint_url == "http://minio:9000"
+            assert settings.s3_force_path_style is True
+
+    def test_production_enabled_storage_requires_complete_settings(self):
+        with patch.dict(
+            os.environ,
+            {
+                "APP_ENV": "production",
+                "JWT_SECRET_KEY": "a" * 64,
+                "CSRF_SECRET_KEY": "b" * 64,
+                "COOKIE_SECURE": "true",
+                "OBJECT_STORAGE_ENABLED": "true",
+                "S3_REGION": "auto",
+                "S3_BUCKET": "prod-bucket",
+                "S3_ENDPOINT_URL": "https://account.r2.cloudflarestorage.com",
+                "S3_ACCESS_KEY_ID": "access",
+            },
+            clear=True,
+        ):
+            reset_settings()
+            with pytest.raises(ValueError, match="S3_SECRET_ACCESS_KEY"):
+                get_settings()
+
+    def test_production_enabled_storage_requires_r2_auto_region(self):
+        with patch.dict(
+            os.environ,
+            {
+                "APP_ENV": "production",
+                "JWT_SECRET_KEY": "a" * 64,
+                "CSRF_SECRET_KEY": "b" * 64,
+                "COOKIE_SECURE": "true",
+                "OBJECT_STORAGE_ENABLED": "true",
+                "S3_REGION": "us-east-1",
+                "S3_BUCKET": "prod-bucket",
+                "S3_ENDPOINT_URL": "https://account.r2.cloudflarestorage.com",
+                "S3_ACCESS_KEY_ID": "access",
+                "S3_SECRET_ACCESS_KEY": "secret",
+            },
+            clear=True,
+        ):
+            reset_settings()
+            with pytest.raises(ValueError, match="S3_REGION=auto"):
+                get_settings()

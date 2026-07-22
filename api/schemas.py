@@ -11,6 +11,7 @@ are now in auth/schemas.py.
 from __future__ import annotations
 
 from datetime import datetime
+from decimal import Decimal
 from typing import Optional
 from uuid import UUID
 
@@ -25,6 +26,42 @@ class _Strict(BaseModel):
 
 
 # ── Content schemas ─────────────────────────────────────────────────────────
+
+
+class ProviderSeriesOut(_Strict):
+    external_id: str
+    title: str
+    description: str = ""
+    cover_url: str | None = None
+    status: str | None = None
+    content_type: str | None = None
+    year: int | None = None
+    tags: list[str] = []
+    authors: list[str] = []
+
+
+class ProviderSeriesListOut(_Strict):
+    total: int
+    limit: int
+    offset: int
+    list: list[ProviderSeriesOut]
+
+
+class ProviderChapterItemOut(_Strict):
+    external_id: str
+    number: Decimal
+    title: str | None = None
+    volume: str | None = None
+    language: str = ""
+    page_count: int = 0
+    published_at: str | None = None
+
+
+class ProviderChapterListOut(_Strict):
+    total: int
+    limit: int
+    offset: int
+    list: list[ProviderChapterItemOut]
 
 
 class ComicOut(_Strict):
@@ -53,7 +90,7 @@ class LocalSeriesOut(_Strict):
 
 class LocalChapterOut(_Strict):
     id: str
-    number: float
+    number: Decimal
     title: str | None
     page_count: int
     published_at: str | None

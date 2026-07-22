@@ -6,6 +6,7 @@ Creates admin user and sample data.
 
 import os
 import sys
+from decimal import Decimal
 
 # Add parent directory to path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -121,7 +122,7 @@ def create_sample_series(session):
         chapter_dirs.sort(key=lambda x: int(x.name))
         
         for chapter_dir in chapter_dirs:
-            chapter_num = int(chapter_dir.name)
+            chapter_num = Decimal(chapter_dir.name)
             
             # Get page files
             pages = sorted(chapter_dir.glob("*.jpg")) + sorted(chapter_dir.glob("*.png"))

@@ -1,7 +1,8 @@
 # InfinityScan — Infrastructure & Deployment
 
 Local Docker Compose stack for development. Runs PostgreSQL, the FastAPI API,
-and the Next.js frontend.
+and the Next.js frontend. An optional MinIO profile provides local S3-compatible
+object storage.
 
 ## Prerequisites
 
@@ -25,6 +26,10 @@ docker compose up -d db
 docker compose run --rm migrate        # one-off Alembic migration
 docker compose up -d api web
 
+# Optional: start MinIO and explicitly create the configured private bucket
+docker compose --profile storage up -d minio
+docker compose --profile storage run --rm minio-setup
+
 # 4. Check health
 docker compose ps                      # all services should be "Up" or "healthy"
 curl -s http://localhost:8000/health    # should return {"status":"ok"}
@@ -45,6 +50,8 @@ docker compose down -v
 | `migrate`  | —     | One-off Alembic migration. Runs then exits.     |
 | `api`      | 8000  | FastAPI + Uvicorn. Starts only after `db` is healthy and `migrate` succeeds. |
 | `web`      | 3000  | Next.js standalone server. Starts only after `api` is healthy. |
+| `minio`    | 9000/9001 | Optional private S3-compatible API and console (`storage` profile). |
+| `minio-setup` | — | Explicit local bucket setup job (`storage` profile). |
 
 ## Migration handling
 
@@ -108,6 +115,9 @@ See `.env.example` for the full list. The most important variables:
 | `DATABASE_URL`        | api, migrate | Must match POSTGRES_* settings.               |
 | `SECRET_KEY`          | api        | Optional for local dev (ephemeral key generated if missing). |
 | `NEXT_PUBLIC_API_URL` | web (build-time) | Must be reachable by end-user browsers. |
+| `OBJECT_STORAGE_ENABLED` | api | Enables private server-side object storage. Disabled by default. |
+| `S3_*` | api, minio-setup | S3-compatible endpoint, credentials, bucket, timeouts, and presign settings. |
+| `STORAGE_PUBLIC_BASE_URL` | api | Optional CDN base URL; presigned delivery remains the default. |
 
 ## Troubleshooting
 
