@@ -174,6 +174,10 @@ export default function EnhancedReader({ params }: ReaderProps) {
   const loadNext = useCallback(() => feed.loadNext(), [feed]);
   const loadPrevious = useCallback(() => feed.loadPrevious(), [feed]);
   const retryFeed = useCallback(() => feed.retry(), [feed]);
+  const registerPageCleanup = useCallback(
+    (pageId: string, cleanup: () => void) => feed.registerPageCleanup(pageId, cleanup),
+    [feed],
+  );
 
   const activeChapter = feedState.chaptersById[currentChapterId]
     ?? (feedState.orderedChapterIds[0] ? feedState.chaptersById[feedState.orderedChapterIds[0]] : undefined);
@@ -207,6 +211,12 @@ export default function EnhancedReader({ params }: ReaderProps) {
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
   }, [activeChapter, activePages.length, currentPage, goToPage, navigateToChapter, readingMode, spreadMode]);
+
+  useEffect(() => {
+    if (!activeChapter) return;
+    feed.setChapterProtected(activeChapter.id, true);
+    return () => feed.setChapterProtected(activeChapter.id, false);
+  }, [activeChapter?.id, feed]);
 
   useEffect(() => {
     if (!activeChapter) return;
@@ -299,6 +309,7 @@ export default function EnhancedReader({ params }: ReaderProps) {
             onLoadPrevious={loadPrevious}
             onRetry={retryFeed}
             onRangeChanged={onRangeChanged}
+            registerPageCleanup={registerPageCleanup}
           />
         ) : readingMode === "vertical" ? (
           <VirtualizedPages

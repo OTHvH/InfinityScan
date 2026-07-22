@@ -1,5 +1,10 @@
 import { describe, expect, it, vi } from "vitest";
-import { ReaderFeedController, type ReaderChunkFetcher } from "../feed";
+import {
+  MAX_RETAINED_CHAPTERS,
+  MAX_RETAINED_PAGES,
+  ReaderFeedController,
+  type ReaderChunkFetcher,
+} from "../feed";
 import type { ReaderChapter, ReaderChunkResponse } from "../types";
 
 function chapter(id: string, number: string, pageIds = [`${id}-page`]): ReaderChapter {
@@ -165,5 +170,52 @@ describe("ReaderFeedController", () => {
 
     expect(feed.getState().firstItemIndex).toBe(before - 2);
     expect(feed.getState().orderedChapterIds).toEqual(["a", "b"]);
+  });
+
+  it("bounds chapters and pages across one hundred chapters and reloads evicted content", async () => {
+    const evictedPages: string[] = [];
+    const pagesFor = (id: string) => Array.from({ length: 30 }, (_, index) => `${id}-page-${index}`);
+    const fetcher = vi.fn<ReaderChunkFetcher>((request) => {
+      if (request.startChapterId) {
+        return Promise.resolve(response([chapter("1", "1", pagesFor("1"))], { nextCursor: "next:1", hasMoreNext: true }));
+      }
+      const [direction, rawId] = (request.cursor ?? "").split(":");
+      const id = Number(rawId) + (direction === "next" ? 1 : -1);
+      const chapterId = String(id);
+      return Promise.resolve(response([chapter(chapterId, chapterId, pagesFor(chapterId))], {
+        nextCursor: id < 100 ? `next:${id}` : null,
+        previousCursor: id > 1 ? `previous:${id}` : null,
+        hasMoreNext: id < 100,
+        hasMorePrevious: id > 1,
+      }));
+    });
+    const feed = new ReaderFeedController(fetcher, { onEvict: (pages) => evictedPages.push(...pages.map((page) => page.id)) });
+
+    await feed.loadInitial("series", "1");
+    feed.setVisibleChapterId("1");
+    const cleanup = vi.fn();
+    const unregister = feed.registerPageCleanup("1-page-0", cleanup);
+    for (let id = 2; id <= 100; id += 1) {
+      await feed.loadNext();
+      feed.setVisibleChapterId(String(id));
+      const diagnostics = feed.getDiagnostics(feed.getState().items.length, feed.getState().items.filter((item) => item.kind === "page").length);
+      expect(diagnostics?.retainedChapterCount).toBeLessThanOrEqual(MAX_RETAINED_CHAPTERS);
+      expect(diagnostics?.retainedPageCount).toBeLessThanOrEqual(MAX_RETAINED_PAGES);
+    }
+
+    expect(feed.getState().chaptersById["100"]).toBeDefined();
+    expect(feed.getState().visibleChapterId).toBe("100");
+    expect(new Set(feed.getState().orderedChapterIds).size).toBe(feed.getState().orderedChapterIds.length);
+    expect(evictedPages).toContain("1-page-0");
+    expect(cleanup).toHaveBeenCalledTimes(1);
+    unregister();
+
+    for (let id = 99; id >= 1; id -= 1) {
+      feed.setVisibleChapterId(String(id + 1));
+      await feed.loadPrevious();
+      feed.setVisibleChapterId(String(id));
+    }
+    expect(feed.getState().chaptersById["1"]).toBeDefined();
+    expect(feed.getState().visibleChapterId).toBe("1");
   });
 });

@@ -22,6 +22,7 @@ interface ContinuousReaderProps {
   onLoadPrevious: () => Promise<unknown> | null;
   onRetry: () => Promise<unknown> | null;
   onRangeChanged: (range: ListRange) => void;
+  registerPageCleanup?: (pageId: string, cleanup: () => void) => () => void;
 }
 
 function FooterSentinel({ onIntersect }: { onIntersect: () => void }) {
@@ -93,7 +94,7 @@ function ContinuousReaderView(props: ContinuousReaderProps) {
       }}
       itemContent={(_, item) => item.kind === "chapter-separator"
         ? <ChapterSeparator item={item} />
-        : <ReaderPage item={item} zoom={props.zoom} fitWidth={props.fitWidth} />}
+        : <ReaderPage item={item} zoom={props.zoom} fitWidth={props.fitWidth} registerCleanup={props.registerPageCleanup} />}
       endReached={triggerNext}
       startReached={triggerPrevious}
       rangeChanged={props.onRangeChanged}

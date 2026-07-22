@@ -1,6 +1,6 @@
 "use client";
 
-import { memo, useState } from "react";
+import { memo, useEffect, useState } from "react";
 import type { ReaderItem } from "../types";
 
 type PageItem = Extract<ReaderItem, { kind: "page" }>;
@@ -10,10 +10,15 @@ interface ReaderPageProps {
   zoom: number;
   fitWidth: boolean;
   seeking?: boolean;
+  registerCleanup?: (pageId: string, cleanup: () => void) => () => void;
 }
 
-function ReaderPageView({ item, zoom, fitWidth, seeking = false }: ReaderPageProps) {
+function ReaderPageView({ item, zoom, fitWidth, seeking = false, registerCleanup }: ReaderPageProps) {
   const [failed, setFailed] = useState(false);
+  useEffect(() => {
+    const unregister = registerCleanup?.(item.pageId, () => undefined);
+    return () => unregister?.();
+  }, [item.pageId, registerCleanup]);
   const aspectRatio = item.width > 0 && item.height > 0
     ? `${item.width} / ${item.height}`
     : `${item.aspectRatio || 2 / 3}`;
