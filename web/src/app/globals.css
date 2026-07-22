@@ -522,6 +522,30 @@ input[type="range"] { accent-color: var(--accent); }
   margin: 8px;
 }
 
+.chapter-separator {
+  width: 100%;
+  padding: 18px 16px 10px;
+  color: var(--muted);
+  text-align: center;
+}
+.chapter-separator h2 {
+  margin: 0;
+  font-size: 14px;
+  font-weight: 700;
+}
+.reader-loading-footer,
+.reader-error-footer {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  min-height: 56px;
+  padding: 12px;
+  color: var(--muted);
+  text-align: center;
+}
+.reader-error-footer { color: var(--accent3); }
+
 /* Spread layout */
 .spread-container {
   display: flex;
@@ -635,4 +659,3 @@ input[type="range"] { accent-color: var(--accent); }
   box-shadow: var(--glow);
   animation: slideUp 0.2s ease;
 }
-

@@ -5,9 +5,10 @@ import { Virtuoso, type ListRange } from "react-virtuoso";
 import { useRouter } from "next/navigation";
 import { useAuthStore } from "@/stores/auth";
 import { fetchReaderChunk } from "@/features/reader/api";
+import { ContinuousReader } from "@/features/reader/components/ContinuousReader";
 import { ReaderFeedController } from "@/features/reader/feed";
 import { loadLocalProgress, loadServerProgress, saveLocalProgress, saveServerProgress } from "@/features/reader/progress";
-import type { ReaderDirection, ReaderItem, ReaderPage, ReadingMode } from "@/features/reader/types";
+import type { ReaderItem, ReaderPage, ReadingMode } from "@/features/reader/types";
 
 type SpreadMode = "single" | "spread";
 
@@ -170,16 +171,13 @@ export default function EnhancedReader({ params }: ReaderProps) {
     return () => feed.dispose();
   }, [chapterId, feed, seriesSlug]);
 
-  const loadMore = (direction: ReaderDirection) => {
-    const request = direction === "next" ? feed.loadNext() : feed.loadPrevious();
-    void request?.catch(() => undefined);
-  };
+  const loadNext = useCallback(() => feed.loadNext(), [feed]);
+  const loadPrevious = useCallback(() => feed.loadPrevious(), [feed]);
+  const retryFeed = useCallback(() => feed.retry(), [feed]);
 
   const activeChapter = feedState.chaptersById[currentChapterId]
     ?? (feedState.orderedChapterIds[0] ? feedState.chaptersById[feedState.orderedChapterIds[0]] : undefined);
   const activePages = activeChapter?.pages ?? [];
-  const continuousPages = feedState.items.filter((item): item is RenderPage => item.kind === "page");
-  const loadingMore = feedState.loadingNext || feedState.loadingPrevious;
 
   const goToPage = useCallback((page: number) => {
     setCurrentPage(Math.min(Math.max(1, page), Math.max(1, activePages.length)));
@@ -240,15 +238,15 @@ export default function EnhancedReader({ params }: ReaderProps) {
   }, [activeChapter, currentPage, readingMode, seriesSlug, zoom]);
 
   const onRangeChanged = useCallback((range: ListRange) => {
-    const page = continuousPages[range.startIndex];
-    if (!page) return;
-    setCurrentChapterId(page.chapterId);
-    setCurrentPage(page.pageNumber);
-    feed.setVisibleChapterId(page.chapterId);
-  }, [continuousPages, feed]);
+    const item = feedState.items[range.startIndex];
+    if (!item) return;
+    setCurrentChapterId(item.chapterId);
+    feed.setVisibleChapterId(item.chapterId);
+    if (item.kind === "page") setCurrentPage(item.pageNumber);
+  }, [feed, feedState.items]);
 
   if (feedState.loadingInitial) return <div className="reader-loading"><div className="spinner" /><p>Loading chapter...</p></div>;
-  if (feedState.error || !activeChapter || activePages.length === 0) {
+  if (!activeChapter || activePages.length === 0) {
     return (
       <div className="reader-error">
         <p>{feedState.error || (activeChapter ? "No verified pages available" : "Chapter not found")}</p>
@@ -287,13 +285,19 @@ export default function EnhancedReader({ params }: ReaderProps) {
         }}
       >
         {readingMode === "scroll" ? (
-          <VirtualizedPages
-            pages={continuousPages}
+          <ContinuousReader
+            items={feedState.items}
             firstItemIndex={feedState.firstItemIndex}
+            hasMoreNext={feedState.hasMoreNext}
+            hasMorePrevious={feedState.hasMorePrevious}
+            loadingNext={feedState.loadingNext}
+            loadingPrevious={feedState.loadingPrevious}
+            error={feedState.error}
             zoom={zoom}
             fitWidth
-            onEndReached={() => loadMore("next")}
-            onStartReached={() => loadMore("previous")}
+            onLoadNext={loadNext}
+            onLoadPrevious={loadPrevious}
+            onRetry={retryFeed}
             onRangeChanged={onRangeChanged}
           />
         ) : readingMode === "vertical" ? (
@@ -328,7 +332,6 @@ export default function EnhancedReader({ params }: ReaderProps) {
           </div>
         )}
       </div>
-      {loadingMore && <div className="preload-banner">Loading chapters...</div>}
       <div className="reader-controls">
         <span>{activeChapter.title ?? `Chapter ${activeChapter.number}`}</span>
         <input

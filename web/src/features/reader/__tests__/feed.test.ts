@@ -152,4 +152,18 @@ describe("ReaderFeedController", () => {
     expect(feed.loadPrevious()).toBeNull();
     expect(fetcher).toHaveBeenCalledTimes(1);
   });
+
+  it("moves firstItemIndex by the prepended virtual items", async () => {
+    const fetcher = vi.fn<ReaderChunkFetcher>()
+      .mockResolvedValueOnce(response([chapter("b", "2")], { previousCursor: "previous", hasMorePrevious: true }))
+      .mockResolvedValueOnce(response([chapter("a", "1")]));
+    const feed = new ReaderFeedController(fetcher);
+
+    await feed.loadInitial("series", "b");
+    const before = feed.getState().firstItemIndex;
+    await feed.loadPrevious();
+
+    expect(feed.getState().firstItemIndex).toBe(before - 2);
+    expect(feed.getState().orderedChapterIds).toEqual(["a", "b"]);
+  });
 });

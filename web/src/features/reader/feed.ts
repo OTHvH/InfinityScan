@@ -200,7 +200,7 @@ export class ReaderFeedController {
       } else {
         const removed = orderedIds.shift();
         if (removed) {
-          this.state = { ...this.state, firstItemIndex: this.state.firstItemIndex + (currentById[removed]?.pages.length ?? 0) };
+          this.state = { ...this.state, firstItemIndex: this.state.firstItemIndex + countItems(currentById[removed]) };
           this.removeCursor(removed);
         }
       }
@@ -273,5 +273,9 @@ function mergeChapter(current: ReaderChapter | undefined, incoming: ReaderChapte
 }
 
 function countPages(chapterIds: string[], chaptersById: Record<string, ReaderChapter>): number {
-  return chapterIds.reduce((count, id) => count + (chaptersById[id]?.pages.length ?? 0), 0);
+  return chapterIds.reduce((count, id) => count + countItems(chaptersById[id]), 0);
+}
+
+function countItems(chapter: ReaderChapter | undefined): number {
+  return chapter ? chapter.pages.length + 1 : 0;
 }
