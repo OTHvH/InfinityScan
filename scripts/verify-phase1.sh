@@ -97,7 +97,7 @@ echo "======================================"
 echo "  InfinityScan Phase 1 Audit"
 echo "======================================"
 
-for tool in python3 node npm curl git; do
+for tool in python3 node npm curl git jq; do
   if command -v "$tool" >/dev/null 2>&1; then
     pass "TOOL: $tool available"
   else
@@ -246,49 +246,17 @@ else
   fail "REQ-01/02/04/05: API Python is unavailable"
 fi
 
-audit_npm() {
-  local report="$TMPDIR/npm-audit.json"
-  if (cd web && npm audit --include=dev --json >"$report" 2>&1); then
-    pass "REQ-10c: npm audit found no vulnerabilities"
-    return
-  fi
-  # The only current exception is the tracked Next.js transitive PostCSS
-  # advisory identified by npm advisory ID 1117015.
-  if node - "$report" <<'NODE'
-const fs = require("fs");
-const report = JSON.parse(fs.readFileSync(process.argv[2], "utf8"));
-const allowlisted = [];
-for (const [name, vulnerability] of Object.entries(report.vulnerabilities ?? {})) {
-  const via = vulnerability.via ?? [];
-  const isPostcssAdvisory = name === "postcss" && via.some(
-    (item) => item && typeof item === "object" && item.source === 1117015
-  );
-  const isNextPostcssPropagation = name === "next" && via.length === 1 && via[0] === "postcss";
-  if (isPostcssAdvisory || isNextPostcssPropagation) {
-    allowlisted.push(name);
-    continue;
-  }
-  console.error(`${name}: unallowlisted npm audit finding`);
-  process.exitCode = 1;
-}
-if (process.exitCode !== 1 && allowlisted.length > 0) {
-  console.log(`allowlisted known PostCSS advisory affecting Next.js: ${allowlisted.join(", ")}`);
-}
-NODE
-  then
-    pass "REQ-10c: npm audit findings are limited to the documented PostCSS/Next.js allowlist"
-  else
-    fail "REQ-10c: npm audit found an unallowlisted vulnerability"
-  fi
-}
-
 if [ -x "$API_PYTHON" ]; then
   run_check "REQ-10a: pip-audit runtime requirements" "$API_PYTHON" -m pip_audit -r api/requirements.txt
   run_check "REQ-10b: pip-audit development requirements" "$API_PYTHON" -m pip_audit -r api/requirements-dev.txt
 else
   fail "REQ-10a/10b: pip-audit cannot run without API Python"
 fi
-audit_npm
+run_check "REQ-10c: shared npm audit policy" \
+  "$REPO_ROOT/scripts/lib/npm-audit.sh" \
+  "$REPO_ROOT/web" \
+  "$REPO_ROOT/scripts/lib/npm-audit-exceptions.json" \
+  "$TMPDIR/npm-audit.json"
 
 if grep -q 'CMD \["uvicorn' api/Dockerfile && ! grep -q 'alembic' api/Dockerfile && grep -q '^  migrate:' infra/docker-compose.yml; then
   pass "REQ-13: migrations are separate from the API runtime"
@@ -343,13 +311,20 @@ else
   fi
 
   BUILDER=infinityscan-multiarch
-  if docker buildx inspect "$BUILDER" >/dev/null 2>&1; then
-    if REMOVE_OUT=$(docker buildx rm "$BUILDER" 2>&1); then
-      pass "REQ-12a: removed existing $BUILDER builder before recreation"
+  BUILDER_READY=false
+  if EXISTING_BUILDER_OUT=$(docker buildx inspect "$BUILDER" 2>&1); then
+    EXISTING_DRIVER="$(printf '%s\n' "$EXISTING_BUILDER_OUT" | awk -F: '/^Driver:/ { gsub(/^[[:space:]]+/, "", $2); print $2; exit }')"
+    if [ "$EXISTING_DRIVER" = "docker-container" ]; then
+      BUILDER_READY=true
+      pass "REQ-12a: existing $BUILDER uses the docker-container driver"
+    elif REMOVE_OUT=$(docker buildx rm "$BUILDER" 2>&1); then
+      pass "REQ-12a: removed incompatible $BUILDER driver '$EXISTING_DRIVER'"
     else
       status=$?
-      fail "REQ-12a: could not remove existing $BUILDER (exit $status): $(short_error "$REMOVE_OUT")"
+      fail "REQ-12a: could not remove incompatible $BUILDER (exit $status): $(short_error "$REMOVE_OUT")"
     fi
+  else
+    pass "REQ-12a: no conflicting $BUILDER builder exists"
   fi
 
   if BINFMT_OUT=$(docker run --privileged --rm tonistiigi/binfmt --install arm64 2>&1); then
@@ -359,14 +334,17 @@ else
     fail "REQ-12b: arm64 binfmt registration failed (exit $status): $(short_error "$BINFMT_OUT")"
   fi
 
-  if CREATE_OUT=$(docker buildx create --name "$BUILDER" --driver docker-container --use 2>&1); then
+  if [ "$BUILDER_READY" = true ]; then
+    pass "REQ-12c: reusing dedicated $BUILDER builder"
+  elif CREATE_OUT=$(docker buildx create --name "$BUILDER" --driver docker-container 2>&1); then
+    BUILDER_READY=true
     pass "REQ-12c: created dedicated $BUILDER docker-container builder"
   else
     status=$?
     fail "REQ-12c: builder creation failed (exit $status): $(short_error "$CREATE_OUT")"
   fi
 
-  if INSPECT_OUT=$(docker buildx inspect --builder "$BUILDER" --bootstrap 2>&1); then
+  if INSPECT_OUT=$(docker buildx inspect "$BUILDER" --bootstrap 2>&1); then
     if printf '%s\n' "$INSPECT_OUT" | grep -q 'linux/arm64'; then
       pass "REQ-12d: exact builder supports linux/arm64"
     else
@@ -377,19 +355,52 @@ else
     fail "REQ-12d: exact builder inspection failed (exit $status): $(short_error "$INSPECT_OUT")"
   fi
 
-  if ARM_API_OUT=$(docker buildx build --builder "$BUILDER" --platform linux/arm64 --load -f api/Dockerfile -t infinityscan-api:arm64 api 2>&1); then
-    pass "REQ-12e: API linux/arm64 --load build succeeds"
-  else
-    status=$?
-    fail "REQ-12e: API linux/arm64 build failed (exit $status): $(short_error "$ARM_API_OUT")"
-  fi
+  BUILDX_CACHE_ROOT="$REPO_ROOT/.cache"
+  mkdir -p "$BUILDX_CACHE_ROOT"
 
-  if ARM_WEB_OUT=$(docker buildx build --builder "$BUILDER" --platform linux/arm64 --load --build-arg NEXT_PUBLIC_API_URL=http://localhost:8000 -f web/Dockerfile -t infinityscan-web:arm64 web 2>&1); then
-    pass "REQ-12f: web linux/arm64 --load build succeeds"
-  else
-    status=$?
-    fail "REQ-12f: web linux/arm64 build failed (exit $status): $(short_error "$ARM_WEB_OUT")"
-  fi
+  run_arm64_build() {
+    local label="$1" component="$2" cache_dir="$3"
+    shift 3
+    local cache_output="${cache_dir}.new" log_file="$TMPDIR/buildx-${component}.log" status
+    local cache_from=()
+    rm -rf "$cache_output"
+    if [ -f "$cache_dir/index.json" ]; then
+      cache_from=(--cache-from "type=local,src=$cache_dir")
+    fi
+    if docker buildx build \
+      --builder "$BUILDER" \
+      --platform linux/arm64 \
+      --load \
+      --progress=plain \
+      "${cache_from[@]}" \
+      --cache-to "type=local,dest=$cache_output,mode=max" \
+      "$@" >"$log_file" 2>&1; then
+      rm -rf "$cache_dir"
+      mv "$cache_output" "$cache_dir"
+      pass "$label"
+    else
+      status=$?
+      fail "$label (exit $status): $(tail -n 12 "$log_file" | tr '\n' ' ')"
+      rm -rf "$cache_output"
+    fi
+  }
+
+  run_arm64_build \
+    "REQ-12e: API linux/arm64 --load build succeeds" \
+    api \
+    "$BUILDX_CACHE_ROOT/buildx-api" \
+    -f api/Dockerfile \
+    -t infinityscan-api:arm64 \
+    api
+
+  run_arm64_build \
+    "REQ-12f: web linux/arm64 --load build succeeds" \
+    web \
+    "$BUILDX_CACHE_ROOT/buildx-web" \
+    --build-arg NEXT_PUBLIC_API_URL=http://localhost:8000 \
+    -f web/Dockerfile \
+    -t infinityscan-web:arm64 \
+    web
 
   if DOWN_OUT=$(compose down -v --remove-orphans 2>&1); then
     :

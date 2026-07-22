@@ -311,53 +311,11 @@ else
   fail "TOOL-P1f/P1g: pip-audit cannot run without API Python"
 fi
 
-NPM_AUDIT_REPORT="$TMPDIR/npm-audit.json"
-if (cd web && npm audit --json >"$NPM_AUDIT_REPORT" 2>&1); then
-  pass "TOOL-P1h: npm audit found no vulnerabilities"
-else
-  if node - "$NPM_AUDIT_REPORT" <<'NODEEOF'
-const fs = require("fs");
-const report = JSON.parse(fs.readFileSync(process.argv[2], "utf8"));
-const allowlisted = [];
-for (const [name, vulnerability] of Object.entries(report.vulnerabilities ?? {})) {
-  const via = vulnerability.via ?? [];
-  // Allowlist: postcss CVE (source 1117015)
-  const isPostcssAdvisory = name === "postcss" && via.some(
-    (item) => item && typeof item === "object" && item.source === 1117015
-  );
-  // Allowlist: next propagation of postcss/sharp transitive advisories
-  const isNextPropagation = name === "next" && via.every(
-    (item) => {
-      if (typeof item === "string") {
-        return item === "postcss" || item === "sharp";
-      }
-      if (item && typeof item === "object") {
-        return item.source === 1117015 || (item.source && String(item.source).startsWith("npm:sharp"));
-      }
-      return false;
-    }
-  ) && via.length > 0;
-  // Allowlist: sharp/libvips advisory (GHSA-f88m-g3jw-g9cj)
-  const isSharpAdvisory = name === "sharp" && via.some(
-    (item) => item && typeof item === "object" && item.source === 1124066
-  );
-  if (isPostcssAdvisory || isNextPropagation || isSharpAdvisory) {
-    allowlisted.push(name);
-    continue;
-  }
-  console.error(`${name}: unallowlisted npm audit finding`);
-  process.exitCode = 1;
-}
-if (process.exitCode !== 1 && allowlisted.length > 0) {
-  console.log(`allowlisted advisory(s) affecting: ${allowlisted.join(", ")}`);
-}
-NODEEOF
-  then
-    pass "TOOL-P1h: npm audit findings are limited to documented allowlist"
-  else
-    fail "TOOL-P1h: npm audit found an unallowlisted vulnerability"
-  fi
-fi
+run_check "TOOL-P1h: shared npm audit policy" \
+  "$REPO_ROOT/scripts/lib/npm-audit.sh" \
+  "$REPO_ROOT/web" \
+  "$REPO_ROOT/scripts/lib/npm-audit-exceptions.json" \
+  "$TMPDIR/npm-audit.json"
 
 if grep -q 'CMD \["uvicorn' api/Dockerfile && ! grep -q 'alembic' api/Dockerfile && grep -q '^  migrate:' infra/docker-compose.yml; then
   pass "REQ-13: migrations are separate from the API runtime"
@@ -1326,9 +1284,6 @@ fi
 
 if [ "$FAIL_COUNT" -eq 0 ] && [ "$SKIP_COUNT" -eq 0 ]; then
   printf '%bPhase 3 gate: PASS%b\n' "$GREEN" "$NC"
-  exit 0
-elif [ "$FAIL_COUNT" -eq 0 ]; then
-  printf '%bPhase 3 gate: PASS (with %d skipped)%b\n' "$YELLOW" "$NC" "$SKIP_COUNT"
   exit 0
 fi
 printf '%bPhase 3 gate: FAIL%b\n' "$RED" "$NC"

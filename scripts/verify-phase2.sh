@@ -145,40 +145,11 @@ else
   fail "CHECK-A6/A7: pip-audit cannot run without API Python"
 fi
 
-audit_npm() {
-  local report="$TMPDIR/npm-audit.json"
-  if (cd web && npm audit --json >"$report" 2>&1); then
-    pass "CHECK-A8: npm audit found no vulnerabilities"
-    return
-  fi
-  if node - "$report" <<'NODE'
-const fs = require("fs");
-const report = JSON.parse(fs.readFileSync(process.argv[2], "utf8"));
-const allowlisted = [];
-for (const [name, vulnerability] of Object.entries(report.vulnerabilities ?? {})) {
-  const via = vulnerability.via ?? [];
-  const postcss = name === "postcss" && via.some(
-    (item) => item && typeof item === "object" && item.source === 1117015
-  );
-  const nextPropagation = name === "next" && via.length === 1 && via[0] === "postcss";
-  if (postcss || nextPropagation) {
-    allowlisted.push(name);
-    continue;
-  }
-  console.error(`${name}: unallowlisted npm audit finding`);
-  process.exitCode = 1;
-}
-if (process.exitCode !== 1 && allowlisted.length > 0) {
-  console.log(`allowlisted PostCSS advisory affecting Next.js: ${allowlisted.join(", ")}`);
-}
-NODE
-  then
-    pass "CHECK-A8: npm audit findings are limited to the documented PostCSS/Next.js allowlist"
-  else
-    fail "CHECK-A8: npm audit found an unallowlisted vulnerability"
-  fi
-}
-audit_npm
+run_local_check "CHECK-A8: shared npm audit policy" \
+  "$REPO_ROOT/scripts/lib/npm-audit.sh" \
+  "$REPO_ROOT/web" \
+  "$REPO_ROOT/scripts/lib/npm-audit-exceptions.json" \
+  "$TMPDIR/npm-audit.json"
 
 if git grep -n -E 'X-User-ID|x_user_id|get_user_id' -- ':!api/tests/**' ':!scripts/**' >/dev/null 2>&1; then
   fail "CHECK-A9: forbidden identity reference exists in runtime or documentation"

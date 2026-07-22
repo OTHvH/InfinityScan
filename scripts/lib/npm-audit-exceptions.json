@@ -1,0 +1,5 @@
+{
+  "schema_version": 1,
+  "description": "Exact, temporary moderate-severity npm audit exceptions. High and critical findings cannot be excepted.",
+  "exceptions": []
+}
