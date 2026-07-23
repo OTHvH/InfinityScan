@@ -45,35 +45,52 @@ This test plan covers functional testing for the InfinityScan manga reader appli
 
 | ID | Description | Steps | Expected Result |
 |----|------------|-------|-----------------|
-| CH-01 | Natural sort ordering | Import chapters: ch1, ch2, ch10, ch11, ch2.5 | Order: 1, 2, 2.5, 10, 11 |
+| CH-01 | Decimal ordering | Seed chapters 1, 1.5, 1.75, 10 | Numeric order is preserved; numbers are serialized as strings |
 | CH-02 | Mixed naming conventions | Import: ch1, Chapter_02, chap-3, vol4 | All detected and sorted |
 | CH-03 | Chapter title extraction | Chapter folder named "Chapter 5: The Battle" | Title extracted as "The Battle" |
-| CH-04 | Reverse chapter order | Import chapters in descending order | Ascending order in API |
+| CH-04 | Reverse insertion order | Insert chapters in descending order | Cursor API returns deterministic `(number, UUID)` order |
 | CH-05 | Volume and chapter | Import with volumes: vol1/ch1, vol1/ch2, vol2/ch1 | Sorted by chapter number |
+| CH-06 | Skipped numbers | Seed chapters with integer gaps | Cursor traversal preserves gaps without synthesizing chapters |
+| CH-07 | Duplicate numbers | Seed two languages at the same chapter number | UUID is the deterministic tie-breaker |
 
 ### Verification Query
 ```bash
-curl http://localhost:8000/series/{slug}/chapters | jq '.list[].name, .number'
+curl "http://localhost:8000/reader/{slug}/chunks?start_chapter_id={uuid}&limit=5" | jq '.chapters[] | [.id, .number]'
 ```
 
 ---
 
-## 3. Continuous Scroll Stability
+## 3. Reader Stability
 
 ### Test Cases
 
 | ID | Description | Steps | Expected Result |
 |----|------------|-------|-----------------|
-| SCR-01 | Vertical scroll rendering | 1. Open chapter in vertical mode<br>2. Scroll rapidly | Pages render without layout shift |
-| SCR-02 | Horizontal scroll rendering | 1. Open chapter in horizontal mode<br>2. Scroll horizontally | Smooth horizontal navigation |
-| SCR-03 | Large chapter (100+ pages) | 1. Load chapter with 150 pages<br>2. Scroll through all | No memory leaks, consistent FPS |
+| SCR-01 | Continuous rendering | Open a 200-chapter fixture and scroll rapidly | Virtualized pages render while retained data stays bounded |
+| SCR-02 | Paged rendering | Switch between vertical, horizontal, single, spread, LTR, and RTL | Visible chapter is retained and page navigation follows mode settings |
+| SCR-03 | 100+ chapter traversal | Traverse beyond chapter 100 and continue to chapter 200 | No duplicate items, exhausted cursors stop requesting, and memory remains bounded |
 | SCR-04 | Scroll position restoration | 1. Scroll to middle of chapter<br>2. Navigate away<br>3. Return to chapter | Position restored |
-| SCR-05 | Image preloading | 1. Set preload threshold to 3<br>2. Reach page 47 of 50 | Next chapter preloads |
+| SCR-05 | Bidirectional loading | Scroll forward until old chapters are evicted, then scroll backward | Previous cursors reload earlier chapters without duplicate requests |
+| SCR-06 | URL replacement | Change the viewport-centered chapter while scrolling | URL is replaced with `/reader/{slug}/{chapter_uuid}` without adding history entries |
+| SCR-07 | Image retry | Fail one media request temporarily | Retry succeeds within three attempts; HTTP 404 is terminal |
 
-### Performance Metrics
-- Initial render: < 500ms for 20 pages
-- Scroll FPS: > 30fps
-- Memory: < 200MB for 100-page chapter
+### Phase 4 Performance Limits
+
+The automated long-scroll gate uses 200 chapters with 10 pages each and enforces:
+
+- Retained chapters: at most 9.
+- Retained page records: at most 250.
+- Retention window: 3 chapters behind and 5 ahead of the protected chapter.
+- Mounted page elements: at most 64.
+- Mounted chapter separators: at most 8.
+- Requests in flight: at most one next and one previous request.
+- Chunk requests for the scenario: fewer than 180.
+- API chunk size: 1–5 chapters and at most 5 SQL statements.
+- Media retries after temporary failure: at most 3.
+- Post-eviction Chromium JS heap growth over baseline: at most 64 MiB.
+
+These are automated release limits. They do not claim total browser process
+memory, decoded-image memory, frame rate, or initial-render latency.
 
 ---
 
@@ -83,7 +100,7 @@ curl http://localhost:8000/series/{slug}/chapters | jq '.list[].name, .number'
 
 | ID | Description | Steps | Expected Result |
 |----|------------|-------|-----------------|
-| RES-01 | Save progress locally | 1. Read to page 15<br>2. Wait 3 seconds<br>3. Check localStorage | Progress saved with timestamp |
+| RES-01 | Save progress locally | 1. Read to page 15<br>2. Wait 1.5 seconds<br>3. Check localStorage | Progress saved with timestamp, series slug, chapter UUID, page, and scroll ratio |
 | RES-02 | Resume from localStorage | 1. Close browser at page 10<br>2. Reopen chapter | Jump to page 10 |
 | RES-03 | Progress persists across refresh | 1. Read to page 5<br>2. Refresh page | Still at page 5 |
 | RES-04 | Save on chapter change | 1. Read to page 10/20<br>2. Navigate to next chapter | Page 10 saved before navigation |
@@ -92,8 +109,8 @@ curl http://localhost:8000/series/{slug}/chapters | jq '.list[].name, .number'
 ### Verification
 ```javascript
 // Check localStorage
-localStorage.getItem('infinityscan_progress_{slug}_{chapter}')
-// Returns: {"page": 15, "updatedAt": 1234567890}
+localStorage.getItem('infinityscan_progress_{slug}_{chapter_uuid}')
+// Includes seriesSlug, chapterId, page, scrollRatio, and updatedAt.
 ```
 
 ---
@@ -104,16 +121,17 @@ localStorage.getItem('infinityscan_progress_{slug}_{chapter}')
 
 | ID | Description | Steps | Expected Result |
 |----|------------|-------|-----------------|
-| IMG-01 | 404 image URL | 1. Mock API to return invalid page URL<br>2. Load chapter | Placeholder shown, no crash |
-| IMG-02 | Timeout on image load | 1. Slow network simulation<br>2. Load pages | Loading spinner, then error placeholder |
-| IMG-03 | Corrupt image file | 1. Return invalid JPEG data<br>2. Load page | Broken image icon displayed |
+| IMG-01 | 404 image URL | 1. Mock API to return invalid page URL<br>2. Load chapter | Terminal error placeholder shown; 404 is not accepted as success or retried |
+| IMG-02 | Temporary network failure | Abort one media request<br>2. Load pages | Loading state followed by bounded retry and successful image |
+| IMG-03 | Corrupt image file | Return invalid JPEG data<br>2. Load page | Decode failure is shown without an infinite retry loop |
 | IMG-04 | Empty page URL | 1. API returns page with empty url<br>2. Load chapter | Page skipped or placeholder |
 | IMG-05 | Redirect URL handling | 1. Image URL redirects (302)<br>2. Load page | Follows redirect successfully |
 
 ### Expected UI Behavior
-- Loading: Spinner overlay on image
-- Error: Gray placeholder with reload icon
-- Empty: Skip rendering or show placeholder
+- Loading: skeleton state.
+- Retryable failure: bounded retry with an attempt query marker.
+- Terminal failure: error state with no false success.
+- Eviction: abort pending work and clear retry timers.
 
 ---
 
@@ -186,9 +204,9 @@ curl https://api.example.com/series
 curl "https://api.example.com/series?q=onepiece"
 # Expected: Search results
 
-# 5. Chapter pages
-curl "https://api.example.com/series/onepiece/chapter/uuid"
-# Expected: Page URLs returned
+# 5. Initial local reader chunk
+curl "https://api.example.com/reader/onepiece/chunks?start_chapter_id=uuid"
+# Expected: Ready chapters with verified same-origin media paths
 ```
 
 ### Rollback Plan
@@ -225,5 +243,10 @@ curl http://localhost:8000/series | jq
 
 ### E2E Tests (Playwright)
 ```bash
-cd web && npx playwright test
+cd web && npm run build && npm run test:e2e
+```
+
+### Phase 4 Release Gate
+```bash
+scripts/verify-phase4.sh
 ```

@@ -74,7 +74,6 @@ from schemas import (
     ProviderChapterListOut,
     ProviderSeriesListOut,
     ProviderSeriesOut,
-    ReaderPayload,
 )
 
 # ---------------------------------------------------------------------------
@@ -363,7 +362,12 @@ def get_local_series(
 @app.get(
     "/library/{slug}/chapter/{number}",
     response_model=ChapterPagesOut,
-    summary="Get local chapter pages",
+    summary="Get local chapter pages by number (deprecated)",
+    description=(
+        "Deprecated compatibility route. New clients must use "
+        "GET /reader/{series_slug}/chunks with UUID chapter identities and opaque cursors."
+    ),
+    deprecated=True,
 )
 def get_local_chapter_pages(
     slug: str,
@@ -629,42 +633,6 @@ async def get_chapter_pages(
         prev_chapter_uuid=None,
         next_chapter_uuid=None,
     )
-
-
-@app.get(
-    "/reader/{path_word}/chapter/{chapter_uuid}",
-    response_model=ReaderPayload,
-    summary="Continuous reader payload — starting chapter and look-ahead chunks",
-)
-async def get_reader_payload(
-    path_word: str = Path(...),
-    chapter_uuid: str = Path(...),
-    look_ahead: int = Query(
-        2, ge=0, le=5, alias="look_ahead",
-        description="How many subsequent chapters to pre-fetch (0–5)",
-    ),
-) -> ReaderPayload:
-    if not _copymanga.enabled:
-        raise HTTPException(status_code=404, detail="Provider is not enabled")
-    try:
-        page_refs = await _copymanga.get_chapter_pages(path_word, chapter_uuid)
-    except ProviderTimeout:
-        raise HTTPException(status_code=504, detail="Provider timed out")
-    except ProviderError as exc:
-        raise HTTPException(status_code=502, detail=f"Provider error: {exc}")
-
-    start = ChapterPagesOut(
-        chapter_uuid=chapter_uuid,
-        chapter_name=chapter_uuid,
-        comic_path_word=path_word,
-        pages=[
-            PageMeta(page_number=ref.page_number, url=ref.url)
-            for ref in page_refs
-        ],
-        prev_chapter_uuid=None,
-        next_chapter_uuid=None,
-    )
-    return ReaderPayload(start_chapter_uuid=chapter_uuid, chapters=[start])
 
 
 # ---------------------------------------------------------------------------

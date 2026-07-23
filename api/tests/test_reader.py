@@ -210,3 +210,12 @@ def test_query_count_is_bounded_for_a_chunk(client, db):
 
     assert response.status_code == 200
     assert count <= 5
+
+
+def test_number_based_local_reader_route_is_deprecated(client):
+    operation = client.get("/openapi.json").json()["paths"][
+        "/library/{slug}/chapter/{number}"
+    ]["get"]
+
+    assert operation["deprecated"] is True
+    assert "/reader/{series_slug}/chunks" in operation["description"]

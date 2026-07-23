@@ -136,11 +136,6 @@ class ChapterPagesOut(_Strict):
     next_chapter_uuid: str | None
 
 
-class ReaderPayload(_Strict):
-    start_chapter_uuid: str
-    chapters: list[ChapterPagesOut]
-
-
 class BookmarkIn(_Strict):
     series_path_word: str
     series_name: str
