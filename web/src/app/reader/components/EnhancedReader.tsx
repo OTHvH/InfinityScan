@@ -78,6 +78,14 @@ export default function EnhancedReader({ params }: ReaderProps) {
     progressController.setAuthenticated(!!user);
   }, [progressController, user]);
 
+  const loadNext = useCallback(() => feed.loadNext(), [feed]);
+  const loadPrevious = useCallback(() => feed.loadPrevious(), [feed]);
+  const retryFeed = useCallback(() => feed.retry(), [feed]);
+  const registerPageCleanup = useCallback(
+    (pageId: string, cleanup: () => void) => feed.registerPageCleanup(pageId, cleanup),
+    [feed],
+  );
+
   const activeChapter = feedState.chaptersById[currentChapterId]
     ?? (feedState.orderedChapterIds[0] ? feedState.chaptersById[feedState.orderedChapterIds[0]] : undefined);
   const activePages = useMemo(() => activeChapter?.pages ?? [], [activeChapter]);
@@ -270,6 +278,10 @@ export default function EnhancedReader({ params }: ReaderProps) {
   );
   const hasPreviousChapter = !!activeChapter.previousChapterId || feedState.hasMorePrevious;
   const hasNextChapter = !!activeChapter.nextChapterId || feedState.hasMoreNext;
+  const diagnostics = feed.getDiagnostics(
+    feedState.items.length,
+    feedState.items.filter((item) => item.kind === "page").length,
+  );
   return (
     <div className={`reader ${readingMode}`} data-reading-mode={readingMode}>
       <div className="progress-wrap"><div className="progress-bar" style={{ width: `${progress}%` }} /></div>
@@ -318,12 +330,12 @@ export default function EnhancedReader({ params }: ReaderProps) {
             error={feedState.error}
             zoom={zoom}
             fitWidth={fitWidth}
-            onLoadNext={() => feed.loadNext()}
-            onLoadPrevious={() => feed.loadPrevious()}
-            onRetry={() => feed.retry()}
+            onLoadNext={loadNext}
+            onLoadPrevious={loadPrevious}
+            onRetry={retryFeed}
             onRangeChanged={onContinuousRangeChanged}
-            initialTopMostItemIndex={continuousInitialIndex < 0 ? undefined : feedState.firstItemIndex + continuousInitialIndex}
-            registerPageCleanup={(pageId, cleanup) => feed.registerPageCleanup(pageId, cleanup)}
+            initialTopMostItemIndex={continuousInitialIndex < 0 ? undefined : continuousInitialIndex}
+            registerPageCleanup={registerPageCleanup}
           />
         ) : (
           <PagedReader
@@ -346,6 +358,21 @@ export default function EnhancedReader({ params }: ReaderProps) {
           <label><input type="checkbox" checked={firstPageAlone} onChange={(event) => setFirstPageAlone(event.target.checked)} /> First page alone</label>
         )}
       </div>
+      {diagnostics && (
+        <output
+          data-testid="reader-diagnostics"
+          hidden
+          data-visible-chapter-id={currentChapterId}
+          data-visible-page-id={currentPageId ?? ""}
+          data-visible-page-number={currentPage}
+          data-retained-chapters={diagnostics.retainedChapterCount}
+          data-retained-pages={diagnostics.retainedPageCount}
+          data-rendered-items={diagnostics.renderedItemCount}
+          data-rendered-pages={diagnostics.renderedPageCount}
+          data-active-next-requests={diagnostics.activeNextRequests}
+          data-active-previous-requests={diagnostics.activePreviousRequests}
+        />
+      )}
     </div>
   );
 }

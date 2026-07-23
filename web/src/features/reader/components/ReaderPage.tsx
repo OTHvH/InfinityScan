@@ -183,6 +183,8 @@ function ReaderPageView({ item, zoom, fitWidth, seeking = false, registerCleanup
     <div
       className="page reader-page-frame"
       data-image-state={view.status}
+      data-page-id={item.pageId}
+      data-chapter-id={item.chapterId}
       style={{ aspectRatio, width: fitWidth ? "100%" : `${zoom}%` }}
     >
       {view.status !== "loaded" && <div className="reader-page-skeleton" aria-hidden="true" />}

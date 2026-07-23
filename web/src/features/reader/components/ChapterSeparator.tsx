@@ -7,7 +7,7 @@ type SeparatorItem = Extract<ReaderItem, { kind: "chapter-separator" }>;
 
 function ChapterSeparatorView({ item }: { item: SeparatorItem }) {
   return (
-    <div className="chapter-separator" aria-labelledby={item.key}>
+    <div className="chapter-separator" data-chapter-id={item.chapterId} aria-labelledby={item.key}>
       <h2 id={item.key}>
         Chapter {item.chapterNumber}
         {item.title ? `: ${item.title}` : ""}

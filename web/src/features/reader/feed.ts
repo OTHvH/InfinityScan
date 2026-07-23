@@ -127,7 +127,13 @@ export class ReaderFeedController {
         throw error;
       })
       .finally(() => {
-        if (this.inFlight.get("next") === trackedPromise) this.inFlight.delete("next");
+        if (this.inFlight.get("next") === trackedPromise) {
+          this.inFlight.delete("next");
+          if (requestGeneration === this.generation) {
+            this.state = { ...this.state };
+            this.publish();
+          }
+        }
       });
     this.inFlight.set("next", trackedPromise);
     return trackedPromise;
@@ -174,7 +180,6 @@ export class ReaderFeedController {
   }
 
   getDiagnostics(renderedItemCount = 0, renderedPageCount = 0): ReaderDiagnostics | null {
-    if (process.env.NODE_ENV === "production") return null;
     return {
       retainedChapterCount: this.state.orderedChapterIds.length,
       retainedPageCount: countUniquePages(this.state.orderedChapterIds, this.state.chaptersById),
@@ -238,7 +243,13 @@ export class ReaderFeedController {
         throw error;
       })
       .finally(() => {
-        if (this.inFlight.get(direction) === trackedPromise) this.inFlight.delete(direction);
+        if (this.inFlight.get(direction) === trackedPromise) {
+          this.inFlight.delete(direction);
+          if (requestGeneration === this.generation) {
+            this.state = { ...this.state };
+            this.publish();
+          }
+        }
       });
     this.inFlight.set(direction, trackedPromise);
     return trackedPromise;
