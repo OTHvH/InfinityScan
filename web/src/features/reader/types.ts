@@ -35,6 +35,11 @@ export interface ReaderChunkResponse {
   previousCursor: string | null;
   hasMoreNext: boolean;
   hasMorePrevious: boolean;
+  boundariesByChapterId: Record<string, ReaderChapterBoundary>;
+}
+
+export interface ReaderChapterBoundary extends ReaderCursorState {
+  chapterId: string;
 }
 
 export interface ReaderCursorState {
@@ -93,4 +98,15 @@ export interface ReaderChunkRequest {
   direction: ReaderDirection;
   limit: number;
   signal: AbortSignal;
+  reason: ReaderRequestReason;
 }
+
+export type ReaderRequestReason =
+  | "initial"
+  | "endReached"
+  | "footerObserver"
+  | "prepend"
+  | "evictionReload"
+  | "resume"
+  | "modeTransition"
+  | "retry";

@@ -27,6 +27,13 @@ interface RawReaderChunkResponse {
   previous_cursor: string | null;
   has_more_next: boolean;
   has_more_previous: boolean;
+  chapter_boundaries: Array<{
+    chapter_id: string;
+    next_cursor: string | null;
+    previous_cursor: string | null;
+    has_more_next: boolean;
+    has_more_previous: boolean;
+  }>;
 }
 
 function mapPage(page: RawReaderPage): ReaderPage {
@@ -70,5 +77,15 @@ export async function fetchReaderChunk(request: ReaderChunkRequest): Promise<Rea
     previousCursor: response.previous_cursor,
     hasMoreNext: response.has_more_next,
     hasMorePrevious: response.has_more_previous,
+    boundariesByChapterId: Object.fromEntries(response.chapter_boundaries.map((boundary) => [
+      boundary.chapter_id,
+      {
+        chapterId: boundary.chapter_id,
+        nextCursor: boundary.next_cursor,
+        previousCursor: boundary.previous_cursor,
+        hasMoreNext: boundary.has_more_next,
+        hasMorePrevious: boundary.has_more_previous,
+      },
+    ])),
   };
 }

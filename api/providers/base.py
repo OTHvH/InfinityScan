@@ -13,6 +13,10 @@ class ProviderTimeout(ProviderError):
     """Raised when a provider request times out."""
 
 
+class ProviderSecurityError(ProviderError):
+    """Raised before a provider request violates outbound URL policy."""
+
+
 @dataclass(frozen=True)
 class NormalizedSeries:
     external_id: str

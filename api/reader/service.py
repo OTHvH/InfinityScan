@@ -12,7 +12,13 @@ from sqlalchemy.orm import Session, aliased
 from models import Chapter, ChapterImportStatus, Page, PageIntegrityStatus, Series
 
 from .cursor import ReaderDirection, decode_cursor, encode_cursor
-from .schemas import ReaderChapterOut, ReaderChunksOut, ReaderPageOut, ReaderSeriesOut
+from .schemas import (
+    ReaderChapterBoundaryOut,
+    ReaderChapterOut,
+    ReaderChunksOut,
+    ReaderPageOut,
+    ReaderSeriesOut,
+)
 
 
 def _position_filter(
@@ -112,6 +118,7 @@ def get_reader_chunks(
         return ReaderChunksOut(
             series=ReaderSeriesOut(id=series.id, slug=series.slug, title=series.title),
             chapters=[],
+            chapter_boundaries=[],
             next_cursor=None,
             previous_cursor=None,
             has_more_next=False,
@@ -167,6 +174,7 @@ def get_reader_chunks(
         pages_by_chapter[page.chapter_id].append(_page_output(page))
 
     output_chapters = []
+    chapter_boundaries = []
     for chapter in chapters:
         row, previous, following = chapter_details[chapter.id]
         chapter_pages = pages_by_chapter[chapter.id]
@@ -181,6 +189,23 @@ def get_reader_chunks(
                 pages=chapter_pages,
             )
         )
+        chapter_boundaries.append(
+            ReaderChapterBoundaryOut(
+                chapter_id=row.id,
+                next_cursor=(
+                    encode_cursor(series.id, row.number, row.id, ReaderDirection.next)
+                    if following is not None
+                    else None
+                ),
+                previous_cursor=(
+                    encode_cursor(series.id, row.number, row.id, ReaderDirection.previous)
+                    if previous is not None
+                    else None
+                ),
+                has_more_next=following is not None,
+                has_more_previous=previous is not None,
+            )
+        )
 
     first = output_chapters[0]
     last = output_chapters[-1]
@@ -189,16 +214,9 @@ def get_reader_chunks(
     return ReaderChunksOut(
         series=ReaderSeriesOut(id=series.id, slug=series.slug, title=series.title),
         chapters=output_chapters,
-        next_cursor=(
-            encode_cursor(series.id, last.number, last.id, ReaderDirection.next)
-            if has_more_next
-            else None
-        ),
-        previous_cursor=(
-            encode_cursor(series.id, first.number, first.id, ReaderDirection.previous)
-            if has_more_previous
-            else None
-        ),
+        chapter_boundaries=chapter_boundaries,
+        next_cursor=chapter_boundaries[-1].next_cursor,
+        previous_cursor=chapter_boundaries[0].previous_cursor,
         has_more_next=has_more_next,
         has_more_previous=has_more_previous,
     )

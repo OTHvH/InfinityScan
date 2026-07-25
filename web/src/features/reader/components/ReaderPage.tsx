@@ -130,7 +130,7 @@ function ReaderPageView({ item, zoom, fitWidth, seeking = false, registerCleanup
         });
       } catch (error) {
         if (!active || generationRef.current !== generation || controller !== requestController) return;
-        if (error instanceof Error && error.name === "AbortError") return;
+        if (requestController.signal.aborted) return;
         scheduleRetry();
       }
     };

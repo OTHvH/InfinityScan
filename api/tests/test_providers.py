@@ -15,6 +15,7 @@ from providers.base import (
     NormalizedSeries,
     ProviderAdapter,
     ProviderError,
+    ProviderSecurityError,
     ProviderTimeout,
 )
 from providers.cache import MetadataCache
@@ -66,6 +67,11 @@ class TestSSRF:
     def test_reserved_ip_blocked(self):
         with pytest.raises(ValueError, match="blocked network"):
             validate_url("https://192.0.2.1/api")
+
+    @pytest.mark.parametrize("address", ["100.64.0.1", "203.0.113.10", "224.0.0.1"])
+    def test_carrier_reserved_and_multicast_targets_blocked(self, address):
+        with pytest.raises(ValueError, match="blocked network"):
+            validate_url(f"https://{address}/api")
 
     def test_no_scheme_rejected(self):
         with pytest.raises(ValueError, match="URL scheme must be http or https"):
@@ -360,6 +366,20 @@ class TestCopyMangaAdapter:
             client.get = AsyncMock(side_effect=httpx.ConnectError("connection refused"))
             mock_get_client.return_value = client
             with pytest.raises(ProviderError, match="request failed"):
+                await self.adapter.search_series("test")
+
+    @pytest.mark.asyncio
+    async def test_redirect_to_private_target_raises_security_error(self):
+        redirect = httpx.Response(
+            status_code=302,
+            headers={"location": "https://169.254.169.254/latest/meta-data"},
+            request=httpx.Request("GET", "https://api.copymanga.tv/api/v3/search/comic"),
+        )
+        with patch.object(self.adapter, "_get_client") as mock_get_client:
+            client = AsyncMock()
+            client.get = AsyncMock(return_value=redirect)
+            mock_get_client.return_value = client
+            with pytest.raises(ProviderSecurityError, match="Redirect URL validation failed"):
                 await self.adapter.search_series("test")
 
     @pytest.mark.asyncio
@@ -682,3 +702,24 @@ class TestNormalizedDTOs:
         exc = ProviderTimeout("timeout")
         assert isinstance(exc, ProviderError)
         assert isinstance(exc, Exception)
+
+
+def test_provider_disabled_search_has_deterministic_404(client, monkeypatch):
+    import main
+
+    monkeypatch.setattr(main._copymanga, "_enabled", False)
+    response = client.get("/series", params={"q": "probe"})
+
+    assert response.status_code == 404
+    assert response.json() == {"detail": "Search provider is not enabled"}
+
+
+def test_provider_loopback_configuration_has_deterministic_422(client, monkeypatch):
+    import main
+
+    adapter = CopyMangaAdapter("https://127.0.0.1:5432", enabled=True)
+    monkeypatch.setattr(main, "_copymanga", adapter)
+    response = client.get("/series", params={"q": "probe"})
+
+    assert response.status_code == 422
+    assert "Loopback hostname blocked" in response.json()["detail"]

@@ -419,7 +419,7 @@ if [ "$STACK_OK" = true ] && [ "$LIVE_API_OK" = true ] && [ -x web/node_modules/
       PLAYWRIGHT_EXTERNAL_SERVER=1 \
       API_URL="$API_BASE" \
       WEB_URL="$WEB_BASE" \
-      npm --prefix web run test:e2e -- e2e/reader-long-scroll.spec.ts --project=chromium >"$E2E_LOG" 2>&1; then
+      npm --prefix web run test:e2e:phase4 >"$E2E_LOG" 2>&1; then
     pass "P4-23b through P4-34: Playwright 100+ chapter scroll, DOM/data/request bounds, URL/progress/resume/backward/retry/modes, and heap measurement passed"
     E2E_OK=true
   else

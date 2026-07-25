@@ -30,7 +30,7 @@ function response(
   chapters: ReaderChapter[],
   options: Partial<ReaderChunkResponse> = {},
 ): ReaderChunkResponse {
-  return {
+  const merged = {
     series: { id: "series-id", slug: "series", title: "Series" },
     chapters,
     nextCursor: null,
@@ -38,6 +38,19 @@ function response(
     hasMoreNext: false,
     hasMorePrevious: false,
     ...options,
+  };
+  return {
+    ...merged,
+    boundariesByChapterId: options.boundariesByChapterId ?? Object.fromEntries(chapters.map((item, index) => [
+      item.id,
+      {
+        chapterId: item.id,
+        previousCursor: index === 0 ? merged.previousCursor : `previous-${item.id}`,
+        nextCursor: index === chapters.length - 1 ? merged.nextCursor : `next-${item.id}`,
+        hasMorePrevious: index === 0 ? merged.hasMorePrevious : true,
+        hasMoreNext: index === chapters.length - 1 ? merged.hasMoreNext : true,
+      },
+    ])),
   };
 }
 
@@ -217,5 +230,53 @@ describe("ReaderFeedController", () => {
     }
     expect(feed.getState().chaptersById["1"]).toBeDefined();
     expect(feed.getState().visibleChapterId).toBe("1");
+  });
+
+  it("uses exact retained-edge cursors across two-chapter eviction reloads", async () => {
+    const requested: Array<{ cursor: string; reason: string }> = [];
+    const indexedResponse = (ids: number[]): ReaderChunkResponse => {
+      const chapters = ids.map((id) => chapter(String(id), String(id)));
+      return response(chapters, {
+        previousCursor: ids[0] > 1 ? `previous:${ids[0]}` : null,
+        nextCursor: ids.at(-1)! < 12 ? `next:${ids.at(-1)}` : null,
+        hasMorePrevious: ids[0] > 1,
+        hasMoreNext: ids.at(-1)! < 12,
+        boundariesByChapterId: Object.fromEntries(ids.map((id) => [String(id), {
+          chapterId: String(id),
+          previousCursor: id > 1 ? `previous:${id}` : null,
+          nextCursor: id < 12 ? `next:${id}` : null,
+          hasMorePrevious: id > 1,
+          hasMoreNext: id < 12,
+        }])),
+      });
+    };
+    const fetcher = vi.fn<ReaderChunkFetcher>((request) => {
+      if (request.startChapterId) return Promise.resolve(indexedResponse([1, 2]));
+      requested.push({ cursor: request.cursor ?? "", reason: request.reason });
+      const boundary = Number(request.cursor?.split(":")[1]);
+      return Promise.resolve(request.direction === "next"
+        ? indexedResponse([boundary + 1, boundary + 2].filter((id) => id <= 12))
+        : indexedResponse([boundary - 2, boundary - 1].filter((id) => id >= 1)));
+    });
+    const feed = new ReaderFeedController(fetcher);
+
+    await feed.loadInitial("series", "1");
+    for (const visible of [2, 4, 6, 8, 10, 12]) {
+      if (visible > 2) await feed.loadNext("endReached");
+      feed.setVisibleChapterId(String(visible));
+    }
+    expect(feed.getState().orderedChapterIds).toEqual(["4", "5", "6", "7", "8", "9", "10", "11", "12"]);
+    expect(feed.getState().previousCursor).toBe("previous:4");
+
+    feed.setVisibleChapterId("4");
+    await feed.loadPrevious("prepend");
+    expect(requested.at(-1)).toEqual({ cursor: "previous:4", reason: "prepend" });
+    expect(feed.getState().orderedChapterIds).toEqual(["2", "3", "4", "5", "6", "7", "8", "9", "10"]);
+    expect(new Set(feed.getState().orderedChapterIds).size).toBe(feed.getState().orderedChapterIds.length);
+
+    feed.setVisibleChapterId("10");
+    await feed.loadNext("endReached");
+    expect(requested.at(-1)).toEqual({ cursor: "next:10", reason: "evictionReload" });
+    expect(feed.getState().orderedChapterIds).toEqual(["4", "5", "6", "7", "8", "9", "10", "11", "12"]);
   });
 });

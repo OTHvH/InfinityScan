@@ -1,6 +1,7 @@
 from providers.base import (
     ProviderAdapter,
     ProviderError,
+    ProviderSecurityError,
     ProviderTimeout,
     NormalizedSeries,
     NormalizedChapter,
@@ -14,6 +15,7 @@ from providers.local import LocalContentAdapter
 __all__ = [
     "ProviderAdapter",
     "ProviderError",
+    "ProviderSecurityError",
     "ProviderTimeout",
     "NormalizedSeries",
     "NormalizedChapter",

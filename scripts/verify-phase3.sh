@@ -356,6 +356,8 @@ set_env_value "S3_FORCE_PATH_STYLE" "true"
 set_env_value "S3_PRESIGN_TTL_SECONDS" "300"
 set_env_value "S3_CONNECT_TIMEOUT" "5"
 set_env_value "S3_READ_TIMEOUT" "30"
+set_env_value "COPYMANGA_ENABLED" "true"
+set_env_value "COPYMANGA_API" "https://127.0.0.1:5432"
 
 # ── Infrastructure startup ────────────────────────────────────────────────
 
@@ -911,80 +913,41 @@ else
   fail "CHECK-29: no object key found for deletion test"
 fi
 
-# ── Import pipeline: unsupported files ────────────────────────────────────
+# ── Import rejection evidence ─────────────────────────────────────────────
 
-UNSUPPORTED_DIR="$TMPDIR/unsupported_test"
-mkdir -p "$UNSUPPORTED_DIR/test-series/chapter_001"
-"$API_PYTHON" -c "
-from PIL import Image
-img = Image.new('RGB', (100, 100), 'blue')
-img.save('$UNSUPPORTED_DIR/test-series/chapter_001/001.jpg', 'JPEG')
-" 2>/dev/null
-echo "not an image" > "$UNSUPPORTED_DIR/test-series/chapter_001/002.txt"
-
-UNSUPPORTED_OUT=$(cd "$REPO_ROOT/api" && "$API_PYTHON" -m importing.cli import "$UNSUPPORTED_DIR" 2>&1 || true)
-if printf '%s' "$UNSUPPORTED_OUT" | grep -qiE 'unsupported|not.*image|extension|reject|skip|failed|error'; then
-  pass "CHECK-30: unsupported file type handled gracefully"
+PHASE3_REJECTION_REPORT="$TMPDIR/phase3-rejections.json"
+if REJECTION_OUT=$(cd "$REPO_ROOT/api" && "$API_PYTHON" -m tools.verify_phase3_rejections --output "$PHASE3_REJECTION_REPORT" 2>&1); then
+  if jq -e '.unsupported.pages == 1 and .unsupported.objectsAdded == 1 and .unsupported.rejectedStatus == "skipped"' "$PHASE3_REJECTION_REPORT" >/dev/null; then
+    pass "CHECK-30: unsupported file explicitly skipped with no Page or object while its valid neighbor imported"
+  else
+    fail "CHECK-30: unsupported-file evidence is incomplete"
+  fi
+  if jq -e '.externalSymlink.pages == 1 and .externalSymlink.objectsAdded == 1 and .externalSymlink.rejectedStatus == "failed" and .internalSymlink.pages == 2 and .internalSymlink.objectsAdded == 2 and .internalSymlink.rejectedStatus == null' "$PHASE3_REJECTION_REPORT" >/dev/null; then
+    pass "CHECK-31: external symlink rejected without read/upload and documented internal symlink accepted"
+  else
+    fail "CHECK-31: symlink policy evidence is incomplete"
+  fi
+  if jq -e '.oversized.pages == 1 and .oversized.objectsAdded == 1 and .oversized.rejectedStatus == "failed"' "$PHASE3_REJECTION_REPORT" >/dev/null; then
+    pass "CHECK-32: oversized image explicitly rejected with no Page or object while its valid neighbor imported"
+  else
+    fail "CHECK-32: oversized-image evidence is incomplete"
+  fi
 else
-  # It may have succeeded with the valid file and skipped the invalid one
-  pass "CHECK-30: unsupported file type did not crash import"
+  status=$?
+  fail "CHECK-30: unsupported-file proof failed (exit $status): $(short_error "$REJECTION_OUT")"
+  fail "CHECK-31: symlink proof failed because rejection verification setup failed"
+  fail "CHECK-32: oversized-image proof failed because rejection verification setup failed"
 fi
 
-# ── Import pipeline: symlinks ─────────────────────────────────────────────
+# ── SSRF protection through configured provider destination ───────────────
 
-SYMLINK_DIR="$TMPDIR/symlink_test"
-mkdir -p "$SYMLINK_DIR/test-series/chapter_001"
-"$API_PYTHON" -c "
-from PIL import Image
-img = Image.new('RGB', (100, 100), 'green')
-img.save('$SYMLINK_DIR/test-series/chapter_001/real.jpg', 'JPEG')
-" 2>/dev/null
-ln -sf "$SYMLINK_DIR/test-series/chapter_001/real.jpg" "$SYMLINK_DIR/test-series/chapter_001/002.jpg" 2>/dev/null || true
-
-SYMLINK_OUT=$(cd "$REPO_ROOT/api" && "$API_PYTHON" -m importing.cli import "$SYMLINK_DIR" 2>&1 || true)
-if printf '%s' "$SYMLINK_OUT" | grep -qiE 'symlink|traversal|outside|reject'; then
-  pass "CHECK-31: symlink import handled securely"
+SSRF_BODY="$TMPDIR/ssrf-response.json"
+SSRF_CODE="$(curl -sS --connect-timeout 3 --max-time 10 -o "$SSRF_BODY" -w '%{http_code}' "$API_BASE/series?q=phase3-probe" 2>/dev/null || printf '000')"
+if [ "$SSRF_CODE" = "422" ] \
+    && jq -e '.detail | contains("Loopback hostname blocked")' "$SSRF_BODY" >/dev/null 2>&1; then
+  pass "CHECK-33: API rejects configured loopback provider destination with documented HTTP 422"
 else
-  pass "CHECK-31: symlink import did not crash (may follow or reject per policy)"
-fi
-
-# ── Import pipeline: oversized file ───────────────────────────────────────
-
-OVERSIZE_DIR="$TMPDIR/oversize_test"
-mkdir -p "$OVERSIZE_DIR/test-series/chapter_001"
-"$API_PYTHON" -c "
-from PIL import Image
-img = Image.new('RGB', (100, 100), 'yellow')
-img.save('$OVERSIZE_DIR/test-series/chapter_001/001.jpg', 'JPEG')
-" 2>/dev/null
-# Create a file that exceeds the 25 MB default limit
-dd if=/dev/urandom of="$OVERSIZE_DIR/test-series/chapter_001/002.jpg" bs=1M count=30 2>/dev/null || true
-
-OVERSIZE_OUT=$(cd "$REPO_ROOT/api" && "$API_PYTHON" -m importing.cli import "$OVERSIZE_DIR" 2>&1 || true)
-if printf '%s' "$OVERSIZE_OUT" | grep -qiE 'exceed|size|large|limit|too big|25'; then
-  pass "CHECK-32: oversized file rejected with size limit error"
-else
-  pass "CHECK-32: oversized file did not crash import"
-fi
-
-# ── SSRF protection in provider adapter ───────────────────────────────────
-
-SSRF_JAR="$TMPDIR/ssrf.jar"
-SSRF_CSRF_TMP="$TMPDIR/ssrf-csrf.json"
-if SSRF_TOKEN="$(get_csrf "$SSRF_JAR" "$SSRF_CSRF_TMP")"; then
-  SSRF_REG_CODE="$(curl -sS -b "$SSRF_JAR" -c "$SSRF_JAR" \
-    -H "X-CSRF-Token: $SSRF_TOKEN" -H 'Content-Type: application/json' \
-    -d "{\"username\":\"ssrf_user_$(date +%s)\",\"password\":\"SSRFPass123!\"}" \
-    -o /dev/null -w '%{http_code}' "$API_BASE/auth/register" 2>/dev/null || echo "000")"
-fi
-
-# Test SSRF via search endpoint with loopback URL
-SSRF_CODE="$(curl -sS -o /dev/null -w '%{http_code}' "$API_BASE/series?q=http://127.0.0.1:5432" 2>/dev/null || echo "000")"
-if [ "$SSRF_CODE" = "404" ] || [ "$SSRF_CODE" = "502" ] || [ "$SSRF_CODE" = "504" ] || [ "$SSRF_CODE" = "422" ]; then
-  pass "CHECK-33: SSRF loopback search query rejected (HTTP $SSRF_CODE)"
-else
-  # CopyManga is likely not enabled, so 404 is expected
-  pass "CHECK-33: SSRF search test returned $SSRF_CODE (provider likely disabled)"
+  fail "CHECK-33: SSRF API proof returned HTTP $SSRF_CODE (expected 422); HTTP 500 is always a failure"
 fi
 
 # ── API: admin import-jobs endpoint ───────────────────────────────────────
@@ -1085,23 +1048,55 @@ if [ -x "$API_PYTHON" ]; then
       fail "TOOL-9: ruff failed (exit $status): $(short_error "$RUFF_OUT")"
     fi
   else
-    skip "TOOL-9: ruff not available"
+    fail "TOOL-9: required Phase 3 backend lint is unavailable"
   fi
 else
-  skip "TOOL-9: ruff lint (API Python unavailable)"
+  fail "TOOL-9: required Phase 3 backend lint cannot run without API Python"
 fi
 
 # ── Tooling: Playwright E2E ──────────────────────────────────────────────
 
+PHASE3_READY_CHAPTER_ID="$(db_query "SELECT c.id::text FROM chapters c JOIN series s ON s.id = c.series_id WHERE s.slug = '$SERIES_SLUG' AND c.import_status = 'ready' AND EXISTS (SELECT 1 FROM pages p WHERE p.chapter_id = c.id AND p.integrity_status = 'verified') ORDER BY c.number LIMIT 1;" 2>/dev/null || true)"
+PHASE3_IMPORTING_CHAPTER_ID="$(python3 -c 'import uuid; print(uuid.uuid4())')"
+PHASE3_FAILED_CHAPTER_ID="$(python3 -c 'import uuid; print(uuid.uuid4())')"
+PHASE3_PENDING_PAGE_ID="$(python3 -c 'import uuid; print(uuid.uuid4())')"
+PHASE3_QUARANTINED_PAGE_ID="$(python3 -c 'import uuid; print(uuid.uuid4())')"
+if [ -n "$PHASE3_READY_CHAPTER_ID" ] && db_query "
+  INSERT INTO chapters (id, series_id, number, title, language, page_count, import_status)
+  SELECT '$PHASE3_IMPORTING_CHAPTER_ID', id, 990001, 'Phase 3 importing content', 'en', 0, 'importing' FROM series WHERE slug = '$SERIES_SLUG';
+  INSERT INTO chapters (id, series_id, number, title, language, page_count, import_status)
+  SELECT '$PHASE3_FAILED_CHAPTER_ID', id, 990002, 'Phase 3 failed content', 'en', 0, 'failed' FROM series WHERE slug = '$SERIES_SLUG';
+  INSERT INTO pages (id, chapter_id, page_number, object_key, sha256, file_extension, integrity_status)
+  SELECT '$PHASE3_PENDING_PAGE_ID', c.id, 99001,
+    'series/' || c.series_id::text || '/' || c.id::text || '/99001-' || repeat('c', 64) || '.jpg',
+    repeat('c', 64), 'jpg', 'pending' FROM chapters c WHERE c.id = '$PHASE3_READY_CHAPTER_ID';
+  INSERT INTO pages (id, chapter_id, page_number, object_key, sha256, file_extension, integrity_status)
+  SELECT '$PHASE3_QUARANTINED_PAGE_ID', c.id, 99002,
+    'series/' || c.series_id::text || '/' || c.id::text || '/99002-' || repeat('d', 64) || '.jpg',
+    repeat('d', 64), 'jpg', 'quarantined' FROM chapters c WHERE c.id = '$PHASE3_READY_CHAPTER_ID';
+" >/dev/null 2>&1; then
+  pass "TOOL-10a: deterministic hidden-content browser fixture created"
+else
+  fail "TOOL-10a: could not create mandatory Phase 3 browser fixture"
+fi
+
 if [ -x web/node_modules/.bin/playwright ]; then
-  if PLAYWRIGHT_OUT=$(API_URL="$API_BASE" WEB_URL="$WEB_BASE" npm --prefix web run test:e2e 2>&1); then
-    pass "TOOL-10: Playwright E2E tests passed"
+  if PLAYWRIGHT_OUT=$(PLAYWRIGHT_EXTERNAL_SERVER=1 PHASE3_MINIO_HOST_MAP=1 \
+      API_URL="$API_BASE" WEB_URL="$WEB_BASE" \
+      PHASE3_SERIES_SLUG="$SERIES_SLUG" \
+      PHASE3_READY_CHAPTER_ID="$PHASE3_READY_CHAPTER_ID" \
+      PHASE3_IMPORTING_CHAPTER_ID="$PHASE3_IMPORTING_CHAPTER_ID" \
+      PHASE3_FAILED_CHAPTER_ID="$PHASE3_FAILED_CHAPTER_ID" \
+      PHASE3_PENDING_PAGE_ID="$PHASE3_PENDING_PAGE_ID" \
+      PHASE3_QUARANTINED_PAGE_ID="$PHASE3_QUARANTINED_PAGE_ID" \
+      npm --prefix web run test:e2e:phase3 2>&1); then
+    pass "TOOL-10: Phase 3 Playwright E2E tests passed"
   else
     status=$?
-    fail "TOOL-10: Playwright E2E tests failed (exit $status): $(short_error "$PLAYWRIGHT_OUT")"
+    fail "TOOL-10: Phase 3 Playwright E2E tests failed (exit $status): $(short_error "$PLAYWRIGHT_OUT")"
   fi
 else
-  skip "TOOL-10: Playwright E2E tests (not installed)"
+  fail "TOOL-10: Phase 3 Playwright is mandatory and not installed"
 fi
 
 # ── Tooling: Docker Compose build verification ────────────────────────────
@@ -1128,15 +1123,12 @@ fi
 
 # ── Verify content-addressed key format ───────────────────────────────────
 
-KEY_FORMAT="$(db_query "SELECT object_key FROM pages WHERE object_key LIKE 'series/%' AND integrity_status = 'verified' LIMIT 1;" 2>/dev/null || true)"
-if [ -n "$KEY_FORMAT" ]; then
-  if printf '%s' "$KEY_FORMAT" | grep -qP '^series/[0-9a-f-]+/[0-9a-f-]+/\d{5}-[0-9a-f]{64}\.[a-z]+$'; then
-    pass "CHECK-42: object key follows content-addressed format"
-  else
-    pass "CHECK-42: object key has expected structure: $KEY_FORMAT"
-  fi
+KEY_COUNT="$(db_query "SELECT count(*) FROM pages p JOIN chapters c ON c.id = p.chapter_id JOIN series s ON s.id = c.series_id WHERE s.slug LIKE '$SERIES_SLUG%';" 2>/dev/null || printf '0')"
+INVALID_KEY_COUNT="$(db_query "SELECT count(*) FROM pages p JOIN chapters c ON c.id = p.chapter_id JOIN series s ON s.id = c.series_id WHERE s.slug LIKE '$SERIES_SLUG%' AND (p.object_key !~ '^series/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/[0-9]{5}-[0-9a-f]{64}\\.(jpg|png|webp)$' OR p.object_key <> 'series/' || s.id::text || '/' || c.id::text || '/' || lpad(p.page_number::text, 5, '0') || '-' || p.sha256 || '.' || p.file_extension);" 2>/dev/null || printf 'error')"
+if [ "$KEY_COUNT" -gt 0 ] 2>/dev/null && [ "$INVALID_KEY_COUNT" = "0" ]; then
+  pass "CHECK-42: all $KEY_COUNT imported page keys exactly match their content-addressed row data"
 else
-  skip "CHECK-42: no verified object keys to check format"
+  fail "CHECK-42: exact object-key validation failed (keys=$KEY_COUNT invalid=$INVALID_KEY_COUNT)"
 fi
 
 # ── Verify chapters.number precision ──────────────────────────────────────
@@ -1197,16 +1189,25 @@ SSRF_CHECK=$("$API_PYTHON" -c "
 import sys
 sys.path.insert(0, '$REPO_ROOT/api')
 from providers.ssrf import validate_url
-try:
-    validate_url('http://127.0.0.1:5432/secret', allow_localhost=False)
-    print('fail')
-except ValueError:
-    print('ok')
+targets = [
+    'https://127.0.0.1/secret',
+    'https://10.0.0.1/secret',
+    'https://169.254.169.254/secret',
+    'https://192.0.2.1/secret',
+    'https://[::1]/secret',
+]
+for target in targets:
+    try:
+        validate_url(target, allow_localhost=False)
+    except ValueError:
+        continue
+    raise AssertionError(f'accepted blocked target: {target}')
+print('ok')
 " 2>/dev/null || echo "error")
 if [ "$SSRF_CHECK" = "ok" ]; then
-  pass "CHECK-46: SSRF protection blocks loopback URLs"
+  pass "CHECK-46: SSRF validation blocks loopback, private, link-local, and reserved URLs"
 else
-  skip "CHECK-46: SSRF unit check (API Python path issue)"
+  fail "CHECK-46: mandatory SSRF URL validation unit check failed"
 fi
 
 # ── Verify storage key functions ──────────────────────────────────────────
@@ -1214,19 +1215,23 @@ fi
 KEY_FN_CHECK=$("$API_PYTHON" -c "
 import sys, uuid
 sys.path.insert(0, '$REPO_ROOT/api')
+import re
 from storage.keys import page_object_key, cover_object_key
 s_id = uuid.uuid4()
 ch_id = uuid.uuid4()
-key = page_object_key(s_id, ch_id, 1, 'a' * 64, 'jpg')
-assert key.startswith(f'series/{s_id}/{ch_id}/00001-'), f'Bad key: {key}'
-cover = cover_object_key(s_id, 'b' * 64, 'png')
-assert cover.startswith(f'series/{s_id}/cover-'), f'Bad cover: {cover}'
+page_digest = 'a' * 64
+cover_digest = 'b' * 64
+key = page_object_key(s_id, ch_id, 1, page_digest, 'jpg')
+assert key == f'series/{s_id}/{ch_id}/00001-{page_digest}.jpg', key
+assert re.fullmatch(r'series/[0-9a-f-]{36}/[0-9a-f-]{36}/[0-9]{5}-[0-9a-f]{64}\.(jpg|png|webp)', key), key
+cover = cover_object_key(s_id, cover_digest, 'png')
+assert cover == f'series/{s_id}/cover-{cover_digest}.png', cover
 print('ok')
 " 2>/dev/null || echo "error")
 if [ "$KEY_FN_CHECK" = "ok" ]; then
   pass "CHECK-47: storage key functions produce correct format"
 else
-  skip "CHECK-47: storage key function check (API Python path issue)"
+  fail "CHECK-47: mandatory storage key unit check failed"
 fi
 
 # ── Verify image inspector rejects animated ───────────────────────────────
@@ -1260,7 +1265,7 @@ finally:
 if [ "$ANIM_CHECK" = "ok" ]; then
   pass "CHECK-48: image inspector rejects animated GIF"
 else
-  skip "CHECK-48: animated image rejection check (PIL or path issue)"
+  fail "CHECK-48: mandatory animated image rejection check failed"
 fi
 
 # ── Summary ───────────────────────────────────────────────────────────────

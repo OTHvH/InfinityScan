@@ -20,7 +20,7 @@ import {
   type ProgressStatus,
 } from "@/features/reader/progress";
 import { ReaderUrlSynchronizer, selectViewportCenterPage } from "@/features/reader/synchronization";
-import type { ReaderChapter, ReaderDirection, ReaderPage, ReadingDirection, ReadingMode, SpreadMode } from "@/features/reader/types";
+import type { ReaderChapter, ReaderDirection, ReaderPage, ReaderRequestReason, ReadingDirection, ReadingMode, SpreadMode } from "@/features/reader/types";
 import { useAuthStore } from "@/stores/auth";
 
 interface ReaderProps {
@@ -62,6 +62,7 @@ export default function EnhancedReader({ params }: ReaderProps) {
   const [resumeReady, setResumeReady] = useState(false);
   const [progressStatus, setProgressStatus] = useState<ProgressStatus>("saved");
   const resumeStarted = useRef(false);
+  const nextRequestReason = useRef<Extract<ReaderRequestReason, "modeTransition"> | null>(null);
   const [urlSynchronizer] = useState(() => new ReaderUrlSynchronizer(router, seriesSlug, requestedChapterId));
   const [progressController] = useState(() => new ReaderProgressController({
     seriesSlug,
@@ -70,7 +71,9 @@ export default function EnhancedReader({ params }: ReaderProps) {
   }));
 
   useEffect(() => {
-    void feed.loadInitial(seriesSlug, requestedChapterId).catch(() => undefined);
+    const navigation = performance.getEntriesByType("navigation")[0] as PerformanceNavigationTiming | undefined;
+    const reason = navigation?.type === "reload" || navigation?.type === "back_forward" ? "resume" : "initial";
+    void feed.loadInitial(seriesSlug, requestedChapterId, reason).catch(() => undefined);
     return () => feed.dispose();
   }, [feed, requestedChapterId, seriesSlug]);
 
@@ -78,8 +81,12 @@ export default function EnhancedReader({ params }: ReaderProps) {
     progressController.setAuthenticated(!!user);
   }, [progressController, user]);
 
-  const loadNext = useCallback(() => feed.loadNext(), [feed]);
-  const loadPrevious = useCallback(() => feed.loadPrevious(), [feed]);
+  const loadNext = useCallback((reason: Extract<ReaderRequestReason, "endReached" | "footerObserver" | "modeTransition">) => {
+    const effectiveReason = nextRequestReason.current ?? reason;
+    nextRequestReason.current = null;
+    return feed.loadNext(effectiveReason);
+  }, [feed]);
+  const loadPrevious = useCallback((reason: Extract<ReaderRequestReason, "prepend" | "modeTransition">) => feed.loadPrevious(reason), [feed]);
   const retryFeed = useCallback(() => feed.retry(), [feed]);
   const registerPageCleanup = useCallback(
     (pageId: string, cleanup: () => void) => feed.registerPageCleanup(pageId, cleanup),
@@ -256,6 +263,7 @@ export default function EnhancedReader({ params }: ReaderProps) {
   const handleModeChange = useCallback((mode: ReadingMode) => {
     if (mode === readingMode) return;
     if (activeChapter) feed.setVisibleChapterId(activeChapter.id);
+    if (mode === "continuous") nextRequestReason.current = "modeTransition";
     setReadingMode(mode);
   }, [activeChapter, feed, readingMode]);
 
@@ -371,6 +379,8 @@ export default function EnhancedReader({ params }: ReaderProps) {
           data-rendered-pages={diagnostics.renderedPageCount}
           data-active-next-requests={diagnostics.activeNextRequests}
           data-active-previous-requests={diagnostics.activePreviousRequests}
+          data-has-more-next={feedState.hasMoreNext ? "1" : "0"}
+          data-has-more-previous={feedState.hasMorePrevious ? "1" : "0"}
         />
       )}
     </div>

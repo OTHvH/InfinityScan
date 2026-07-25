@@ -140,6 +140,18 @@ def _initial(client, fixture: Phase4ReaderFixture, index: int = 0, **params):
     )
 
 
+def _assert_boundary_contract(chunk: dict) -> None:
+    boundaries = chunk["chapter_boundaries"]
+    assert [boundary["chapter_id"] for boundary in boundaries] == [
+        chapter["id"] for chapter in chunk["chapters"]
+    ]
+    assert chunk["previous_cursor"] == boundaries[0]["previous_cursor"]
+    assert chunk["next_cursor"] == boundaries[-1]["next_cursor"]
+    for boundary in boundaries:
+        assert boundary["has_more_next"] == (boundary["next_cursor"] is not None)
+        assert boundary["has_more_previous"] == (boundary["previous_cursor"] is not None)
+
+
 def test_phase4_large_fixture_cursor_contract_and_filters(client, db, phase4_reader_fixture):
     fixture = phase4_reader_fixture
     assert fixture.tiny_image.read_bytes() == TINY_PNG
@@ -150,6 +162,7 @@ def test_phase4_large_fixture_cursor_contract_and_filters(client, db, phase4_rea
     body = initial.json()
     assert len(body["chapters"]) == 5
     assert [chapter["id"] for chapter in body["chapters"]] == expected_ids[:5]
+    _assert_boundary_contract(body)
     assert body["previous_cursor"] is None
     assert body["next_cursor"] is not None
 
@@ -163,6 +176,7 @@ def test_phase4_large_fixture_cursor_contract_and_filters(client, db, phase4_rea
         assert response.status_code == 200
         chunk = response.json()
         assert len(chunk["chapters"]) <= 5
+        _assert_boundary_contract(chunk)
         traversed.extend(chunk["chapters"])
         cursor = chunk["next_cursor"]
 
@@ -192,11 +206,13 @@ def test_phase4_large_fixture_cursor_contract_and_filters(client, db, phase4_rea
     assert str(_id(9_100_002)) not in serialized
 
     middle = _initial(client, fixture, 100, direction="previous", limit=5).json()
+    _assert_boundary_contract(middle)
     assert [chapter["id"] for chapter in middle["chapters"]] == expected_ids[96:101]
     previous = client.get(
         f"/reader/{fixture.series.slug}/chunks",
         params={"cursor": middle["previous_cursor"], "direction": "previous", "limit": 5},
     ).json()
+    _assert_boundary_contract(previous)
     assert [chapter["id"] for chapter in previous["chapters"]] == expected_ids[91:96]
 
     assert _initial(client, fixture, limit=6).status_code == 422

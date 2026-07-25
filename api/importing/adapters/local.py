@@ -11,7 +11,7 @@ from typing import Optional
 
 from image_inspector import ImageInspector, ImageInspectionError
 
-from .base import ManifestChapter, ManifestPage, ManifestSeries
+from .base import ManifestChapter, ManifestPage, ManifestRejectedFile, ManifestSeries
 
 log = logging.getLogger("importing.local")
 
@@ -96,6 +96,14 @@ class LocalAdapter:
         imgs.sort(key=lambda p: natural_key(p.name))
         return imgs
 
+    def _list_files(self, folder: Path) -> list[Path]:
+        files = [path for path in folder.iterdir() if path.is_file() and not path.name.startswith(".")]
+        files.sort(key=lambda path: natural_key(path.name))
+        return files
+
+    def _source_reference(self, path: Path) -> str:
+        return path.relative_to(self.root).as_posix()
+
     def _list_subdirs(self, folder: Path) -> list[Path]:
         dirs = [p for p in folder.iterdir() if p.is_dir() and not p.name.startswith(".")]
         dirs.sort(key=lambda p: natural_key(p.name))
@@ -116,15 +124,30 @@ class LocalAdapter:
 
     def _scan_chapter(
         self, series_id: uuid.UUID, folder: Path, chapter_number: Decimal
-    ) -> ManifestChapter:
+    ) -> tuple[ManifestChapter, list[ManifestRejectedFile]]:
         chapter_id = stable_chapter_id(series_id, chapter_number, self.language)
-        pages_paths = self._list_images(folder)
         pages: list[ManifestPage] = []
-        for i, img in enumerate(pages_paths, start=1):
-            page = self._inspect_page(img)
+        rejected: list[ManifestRejectedFile] = []
+        for image_path in self._list_files(folder):
+            if image_path.suffix.casefold() not in _IMAGE_EXTS:
+                rejected.append(ManifestRejectedFile(
+                    source_reference=self._source_reference(image_path),
+                    status="skipped",
+                    reason="file extension is not an image candidate",
+                ))
+                continue
+            try:
+                page = self._inspect_page(image_path)
+            except ImageInspectionError as exc:
+                rejected.append(ManifestRejectedFile(
+                    source_reference=self._source_reference(image_path),
+                    status="failed",
+                    reason=str(exc),
+                ))
+                continue
             pages.append(
                 ManifestPage(
-                    page_number=i,
+                    page_number=len(pages) + 1,
                     source_path=page.source_path,
                     sha256=page.sha256,
                     mime_type=page.mime_type,
@@ -140,13 +163,16 @@ class LocalAdapter:
             folder.name,
             flags=re.IGNORECASE,
         ).strip(" -_.")
-        return ManifestChapter(
-            chapter_id=chapter_id,
-            folder_name=folder.name,
-            number=chapter_number,
-            title=title_clean or None,
-            language=self.language,
-            pages=tuple(pages),
+        return (
+            ManifestChapter(
+                chapter_id=chapter_id,
+                folder_name=folder.name,
+                number=chapter_number,
+                title=title_clean or None,
+                language=self.language,
+                pages=tuple(pages),
+            ),
+            rejected,
         )
 
     def _scan_series(self, folder: Path) -> ManifestSeries | None:
@@ -154,6 +180,7 @@ class LocalAdapter:
         series_id = stable_series_id(slug)
         chapter_dirs = self._list_subdirs(folder)
         chapters: list[ManifestChapter] = []
+        rejected_files: list[ManifestRejectedFile] = []
         cover_path: Path | None = None
 
         top_imgs = self._list_images(folder)
@@ -164,7 +191,9 @@ class LocalAdapter:
             if not self._list_images(ch_dir):
                 continue
             num = extract_chapter_number(ch_dir.name)
-            chapters.append(self._scan_chapter(series_id, ch_dir, num))
+            chapter, rejected = self._scan_chapter(series_id, ch_dir, num)
+            chapters.append(chapter)
+            rejected_files.extend(rejected)
 
         if not chapters:
             if top_imgs:
@@ -228,6 +257,7 @@ class LocalAdapter:
             cover_sha256=cover_sha256,
             cover_mime_type=cover_mime_type,
             cover_file_extension=cover_file_ext,
+            rejected_files=tuple(rejected_files),
         )
 
     def scan(self) -> list[ManifestSeries]:

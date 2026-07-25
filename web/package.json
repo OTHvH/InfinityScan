@@ -9,7 +9,10 @@
     "lint": "eslint",
     "test": "vitest run",
     "test:watch": "vitest",
-    "test:e2e": "playwright test",
+    "test:e2e:phase2": "playwright test e2e/phase2 --project=chromium --workers=1",
+    "test:e2e:phase3": "playwright test e2e/phase3 --project=chromium --workers=1",
+    "test:e2e:phase4": "playwright test e2e/phase4 --project=chromium --workers=1",
+    "test:e2e:all": "playwright test e2e/phase2 e2e/phase3 e2e/phase4 --project=chromium --workers=1",
     "test:e2e:ui": "playwright test --ui"
   },
   "dependencies": {

@@ -65,6 +65,7 @@ def validate_url(url: str, *, allow_localhost: bool = False, require_https: bool
         for net in _BLOCKED_NETWORKS:
             if ip in net:
                 raise ValueError(f"IP {ip} is in blocked network {net}")
+    return parsed.geturl()
 
 
 def _is_loopback_ip(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:

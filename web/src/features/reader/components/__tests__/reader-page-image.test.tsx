@@ -119,6 +119,21 @@ describe("ReaderPage resilient image loading", () => {
     expect(screen.getByRole("img")).toHaveAttribute("src", "blob:reader-page-1");
   });
 
+  it("retries an active AbortError that was not caused by its own signal", async () => {
+    vi.useFakeTimers();
+    fetchMock
+      .mockRejectedValueOnce(new DOMException("transport interrupted", "AbortError"))
+      .mockResolvedValueOnce(mediaResponse());
+    render(<ReaderPage item={page()} zoom={100} fitWidth />);
+    await flushPromises();
+    expect(screen.getByRole("status")).toHaveTextContent("Temporary image loading failure");
+
+    await act(async () => { await vi.advanceTimersByTimeAsync(500); });
+    await flushPromises();
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(fetchMock.mock.calls[1][0]).toBe("http://localhost:3000/media/pages/page-id?attempt=2");
+  });
+
   it("treats a media endpoint 404 as unavailable without retrying", async () => {
     fetchMock.mockResolvedValue(mediaResponse(404));
     render(<ReaderPage item={page()} zoom={100} fitWidth />);

@@ -97,7 +97,7 @@ def test_initial_contract_decimal_strings_and_media_safety(client, db):
     assert response.status_code == 200
     body = response.json()
     assert set(body) == {
-        "series", "chapters", "next_cursor", "previous_cursor", "has_more_next", "has_more_previous",
+        "series", "chapters", "chapter_boundaries", "next_cursor", "previous_cursor", "has_more_next", "has_more_previous",
     }
     assert body["series"] == {"id": str(series.id), "slug": series.slug, "title": series.title}
     assert [chapter["number"] for chapter in body["chapters"]] == ["1.5", "1.75"]
@@ -110,6 +110,11 @@ def test_initial_contract_decimal_strings_and_media_safety(client, db):
     }
     assert body["previous_cursor"] is not None
     assert body["next_cursor"] is not None
+    assert [boundary["chapter_id"] for boundary in body["chapter_boundaries"]] == [
+        chapter["id"] for chapter in body["chapters"]
+    ]
+    assert body["previous_cursor"] == body["chapter_boundaries"][0]["previous_cursor"]
+    assert body["next_cursor"] == body["chapter_boundaries"][-1]["next_cursor"]
     assert "object_key" not in json.dumps(body)
     assert "X-Amz" not in json.dumps(body)
     assert "https://" not in json.dumps(body)
@@ -134,6 +139,41 @@ def test_next_and_previous_cursors_skip_unready_chapters(client, db):
     assert all(chapter["number"] not in {"11", "13"} for chapter in following.json()["chapters"])
 
 
+def test_chapter_boundary_cursors_resume_from_each_retained_edge(client, db):
+    series, chapters, _, _ = _reader_fixture(db)
+    body = _get_initial(client, series, chapters["1.5"], limit=3).json()
+    boundaries = body["chapter_boundaries"]
+
+    assert [boundary["chapter_id"] for boundary in boundaries] == [
+        str(chapters["1.5"].id),
+        str(chapters["1.75"].id),
+        str(chapters["10"].id),
+    ]
+    assert all(boundary["has_more_next"] == (boundary["next_cursor"] is not None) for boundary in boundaries)
+    assert all(
+        boundary["has_more_previous"] == (boundary["previous_cursor"] is not None)
+        for boundary in boundaries
+    )
+
+    after_first = client.get(
+        f"/reader/{series.slug}/chunks",
+        params={"cursor": boundaries[0]["next_cursor"], "direction": "next", "limit": 1},
+    )
+    before_middle = client.get(
+        f"/reader/{series.slug}/chunks",
+        params={"cursor": boundaries[1]["previous_cursor"], "direction": "previous", "limit": 1},
+    )
+
+    assert after_first.status_code == 200
+    assert [chapter["id"] for chapter in after_first.json()["chapters"]] == [
+        str(chapters["1.75"].id)
+    ]
+    assert before_middle.status_code == 200
+    assert [chapter["id"] for chapter in before_middle.json()["chapters"]] == [
+        str(chapters["1.5"].id)
+    ]
+
+
 def test_first_and_final_boundaries_return_null_cursors(client, db):
     series, chapters, _, _ = _reader_fixture(db)
 
@@ -142,8 +182,12 @@ def test_first_and_final_boundaries_return_null_cursors(client, db):
 
     assert first["previous_cursor"] is None
     assert first["has_more_previous"] is False
+    assert first["chapter_boundaries"][0]["previous_cursor"] is None
+    assert first["chapter_boundaries"][0]["has_more_previous"] is False
     assert final["next_cursor"] is None
     assert final["has_more_next"] is False
+    assert final["chapter_boundaries"][-1]["next_cursor"] is None
+    assert final["chapter_boundaries"][-1]["has_more_next"] is False
 
 
 def test_decimal_order_and_duplicate_number_uuid_tiebreak(client, db):
@@ -173,6 +217,10 @@ def test_validation_rejects_missing_both_mutually_exclusive_and_bad_cursors(clie
     assert client.get(f"/reader/{series.slug}/chunks", params={"cursor": tampered, "direction": "next"}).status_code == 400
     unsupported = encode_cursor(series.id, Decimal("1"), chapters["1"].id, ReaderDirection.next, version=2)
     assert client.get(f"/reader/{series.slug}/chunks", params={"cursor": unsupported, "direction": "next"}).status_code == 400
+    assert client.get(
+        f"/reader/{series.slug}/chunks",
+        params={"cursor": valid_cursor, "direction": "previous"},
+    ).status_code == 400
 
 
 def test_cross_series_start_and_cursor_are_rejected(client, db):

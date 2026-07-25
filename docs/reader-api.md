@@ -49,6 +49,15 @@ cursor with another series/direction. Chapter UUIDs are the stable identities.
       ]
     }
   ],
+  "chapter_boundaries": [
+    {
+      "chapter_id": "uuid",
+      "next_cursor": "opaque-or-null",
+      "previous_cursor": "opaque-or-null",
+      "has_more_next": true,
+      "has_more_previous": false
+    }
+  ],
   "next_cursor": "opaque-or-null",
   "previous_cursor": "opaque-or-null",
   "has_more_next": true,
@@ -60,6 +69,13 @@ Chapter numbers are decimal strings for display only. Ordering is numeric by
 `(chapter.number, chapter.id)`, which supports decimals, gaps, and duplicate
 numbers without frontend arithmetic. Only chapters with `ready` import status
 and pages with `verified` integrity status are returned.
+
+`chapter_boundaries` has one entry for each chapter at the same array index.
+Its cursors resume immediately after or before that chapter, allowing a bounded
+client to evict chapter data and later reload from its retained edges. The
+top-level cursors are the last chapter's `next_cursor` and the first chapter's
+`previous_cursor`, respectively. A cursor and its corresponding `has_more`
+value are null/false at an exhausted series boundary.
 
 `media_path` is a same-API path. Reader responses never expose object keys,
 bucket names, storage endpoints, credentials, or presigned URLs. Clients fetch

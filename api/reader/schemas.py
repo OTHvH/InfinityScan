@@ -42,9 +42,18 @@ class ReaderChapterOut(_Strict):
         return "0" if normalized == 0 else format(normalized, "f")
 
 
+class ReaderChapterBoundaryOut(_Strict):
+    chapter_id: UUID
+    next_cursor: str | None
+    previous_cursor: str | None
+    has_more_next: bool
+    has_more_previous: bool
+
+
 class ReaderChunksOut(_Strict):
     series: ReaderSeriesOut
     chapters: list[ReaderChapterOut]
+    chapter_boundaries: list[ReaderChapterBoundaryOut]
     next_cursor: str | None
     previous_cursor: str | None
     has_more_next: bool

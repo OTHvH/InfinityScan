@@ -525,6 +525,22 @@ class ImportService:
             series.cover_object_key = cover_key
             self._session.flush()
 
+        for rejected in series_manifest.rejected_files:
+            item = ImportJobItem(
+                job_id=job.id,
+                source_reference=rejected.source_reference,
+                object_key="",
+                status=(
+                    ImportJobItemStatus.skipped
+                    if rejected.status == "skipped"
+                    else ImportJobItemStatus.failed
+                ),
+                error=rejected.reason[:2000],
+            )
+            self._session.add(item)
+        if series_manifest.rejected_files:
+            self._session.flush()
+
         for chapter_manifest in series_manifest.chapters:
             try:
                 self._process_chapter(

@@ -3,11 +3,13 @@ import { buildReaderItems } from "./items";
 import type {
   ReaderChapter,
   ReaderChunkResponse,
+  ReaderChapterBoundary,
   ReaderDirection,
   ReaderFeedState,
   ReaderPage,
   ReaderRetryState,
   ReaderChunkRequest,
+  ReaderRequestReason,
 } from "./types";
 
 export const MAX_RETAINED_CHAPTERS = 9;
@@ -42,6 +44,25 @@ export interface ReaderDiagnostics {
 export type ReaderChunkFetcher = (request: ReaderChunkRequest) => Promise<ReaderChunkResponse>;
 type Listener = () => void;
 type EvictionCleanup = () => void;
+let controllerSequence = 0;
+
+export interface ReaderRequestDebugEvent {
+  phase: "start" | "settle";
+  controllerId: number;
+  generation: number;
+  requestId: number;
+  direction: ReaderDirection;
+  cursor: string;
+  reason: ReaderRequestReason;
+  outcome?: "succeeded" | "failed" | "cancelled";
+  retainedChapterIds: string[];
+  evictedChapterIds: string[];
+}
+
+function emitRequestDebug(event: ReaderRequestDebugEvent): void {
+  if (typeof window === "undefined" || localStorage.getItem("infinityscan_reader_debug") !== "1") return;
+  window.dispatchEvent(new CustomEvent("infinityscan:reader-request", { detail: event }));
+}
 
 function initialState(): ReaderFeedState {
   return {
@@ -72,17 +93,18 @@ function isAbortError(error: unknown): boolean {
 }
 
 export class ReaderFeedController {
+  private readonly controllerId = ++controllerSequence;
+  private requestSequence = 0;
   private state = initialState();
   private generation = 0;
   private controller = new AbortController();
   private readonly listeners = new Set<Listener>();
   private readonly inFlight = new Map<ReaderDirection, Promise<ReaderChunkResponse>>();
-  private readonly previousCursors = new Map<string, string | null>();
-  private readonly nextCursors = new Map<string, string | null>();
+  private readonly boundaries = new Map<string, ReaderChapterBoundary>();
+  private readonly cursorHistory = new Map<string, Set<string>>();
+  private readonly evictedChapterIds = new Set<string>();
   private readonly protectedChapters = new Set<string>();
   private readonly pageCleanups = new Map<string, Set<EvictionCleanup>>();
-  private previousFallbackCursor: string | null = null;
-  private nextFallbackCursor: string | null = null;
   private readonly retention: ReaderRetentionConfig;
   private readonly onEvict?: (pages: ReaderPage[]) => void;
 
@@ -101,17 +123,24 @@ export class ReaderFeedController {
     return () => this.listeners.delete(listener);
   };
 
-  loadInitial(seriesSlug: string, chapterId: string): Promise<ReaderChunkResponse> {
+  loadInitial(
+    seriesSlug: string,
+    chapterId: string,
+    reason: Extract<ReaderRequestReason, "initial" | "resume"> = "initial",
+  ): Promise<ReaderChunkResponse> {
     this.resetForRequest();
     this.state = { ...initialState(), initialChapterId: chapterId, loadingInitial: true };
     this.publish();
     const requestGeneration = this.generation;
+    const requestId = ++this.requestSequence;
+    let outcome: "succeeded" | "failed" | "cancelled" = "succeeded";
     const request = this.fetcher({
       seriesSlug,
       startChapterId: chapterId,
       direction: "next",
       limit: 2,
       signal: this.controller.signal,
+      reason,
     });
     const trackedPromise = request
       .then((response) => {
@@ -123,10 +152,23 @@ export class ReaderFeedController {
         return response;
       })
       .catch((error: unknown) => {
+        outcome = isAbortError(error) ? "cancelled" : "failed";
         if (requestGeneration === this.generation && !isAbortError(error)) this.fail(error, { kind: "initial", seriesSlug, chapterId });
         throw error;
       })
       .finally(() => {
+        emitRequestDebug({
+          phase: "settle",
+          controllerId: this.controllerId,
+          generation: requestGeneration,
+          requestId,
+          direction: "next",
+          cursor: `start:${chapterId}`,
+          reason,
+          outcome,
+          retainedChapterIds: [...this.state.orderedChapterIds],
+          evictedChapterIds: [...this.evictedChapterIds],
+        });
         if (this.inFlight.get("next") === trackedPromise) {
           this.inFlight.delete("next");
           if (requestGeneration === this.generation) {
@@ -136,22 +178,33 @@ export class ReaderFeedController {
         }
       });
     this.inFlight.set("next", trackedPromise);
+    emitRequestDebug({
+      phase: "start",
+      controllerId: this.controllerId,
+      generation: requestGeneration,
+      requestId,
+      direction: "next",
+      cursor: `start:${chapterId}`,
+      reason,
+      retainedChapterIds: [],
+      evictedChapterIds: [...this.evictedChapterIds],
+    });
     return trackedPromise;
   }
 
-  loadNext(): Promise<ReaderChunkResponse> | null {
-    return this.load("next");
+  loadNext(reason: Extract<ReaderRequestReason, "endReached" | "footerObserver" | "modeTransition"> = "endReached"): Promise<ReaderChunkResponse> | null {
+    return this.load("next", reason);
   }
 
-  loadPrevious(): Promise<ReaderChunkResponse> | null {
-    return this.load("previous");
+  loadPrevious(reason: Extract<ReaderRequestReason, "prepend" | "modeTransition"> = "prepend"): Promise<ReaderChunkResponse> | null {
+    return this.load("previous", reason);
   }
 
   retry(): Promise<ReaderChunkResponse> | null {
     const retryState = this.state.retryState;
     if (!retryState) return null;
-    if (retryState.kind === "initial") return this.loadInitial(retryState.seriesSlug, retryState.chapterId);
-    return this.load(retryState.kind);
+    if (retryState.kind === "initial") return this.loadInitial(retryState.seriesSlug, retryState.chapterId, "initial");
+    return this.load(retryState.kind, "retry");
   }
 
   setVisibleChapterId(chapterId: string | null): void {
@@ -198,7 +251,7 @@ export class ReaderFeedController {
     this.publish();
   }
 
-  private load(direction: ReaderDirection): Promise<ReaderChunkResponse> | null {
+  private load(direction: ReaderDirection, requestedReason: ReaderRequestReason): Promise<ReaderChunkResponse> | null {
     const cursor = direction === "next" ? this.state.nextCursor : this.state.previousCursor;
     const canLoad = direction === "next" ? this.state.hasMoreNext : this.state.hasMorePrevious;
     const existing = this.inFlight.get(direction);
@@ -213,17 +266,24 @@ export class ReaderFeedController {
       error: null,
       retryState: null,
     };
-    this.publish();
+    const priorChapterIds = this.cursorHistory.get(cursor);
+    const reason = priorChapterIds?.size && [...priorChapterIds].some((id) => !this.state.chaptersById[id])
+      ? "evictionReload"
+      : requestedReason;
+    const requestId = ++this.requestSequence;
+    let outcome: "succeeded" | "failed" | "cancelled" = "succeeded";
     const request = this.fetcher({
       seriesSlug: series.slug,
       cursor,
       direction,
       limit: 2,
       signal: this.controller.signal,
+      reason,
     });
     const trackedPromise = request
       .then((response) => {
         if (requestGeneration === this.generation) {
+          this.cursorHistory.set(cursor, new Set(response.chapters.map((chapter) => chapter.id)));
           this.merge(response, direction, false);
           this.state = {
             ...this.state,
@@ -237,12 +297,25 @@ export class ReaderFeedController {
         return response;
       })
       .catch((error: unknown) => {
+        outcome = isAbortError(error) ? "cancelled" : "failed";
         if (requestGeneration === this.generation && !isAbortError(error)) {
           this.fail(error, { kind: direction });
         }
         throw error;
       })
       .finally(() => {
+        emitRequestDebug({
+          phase: "settle",
+          controllerId: this.controllerId,
+          generation: requestGeneration,
+          requestId,
+          direction,
+          cursor,
+          reason,
+          outcome,
+          retainedChapterIds: [...this.state.orderedChapterIds],
+          evictedChapterIds: [...this.evictedChapterIds],
+        });
         if (this.inFlight.get(direction) === trackedPromise) {
           this.inFlight.delete(direction);
           if (requestGeneration === this.generation) {
@@ -252,6 +325,18 @@ export class ReaderFeedController {
         }
       });
     this.inFlight.set(direction, trackedPromise);
+    emitRequestDebug({
+      phase: "start",
+      controllerId: this.controllerId,
+      generation: requestGeneration,
+      requestId,
+      direction,
+      cursor,
+      reason,
+      retainedChapterIds: [...this.state.orderedChapterIds],
+      evictedChapterIds: [...this.evictedChapterIds],
+    });
+    this.publish();
     return trackedPromise;
   }
 
@@ -260,46 +345,34 @@ export class ReaderFeedController {
     const currentById = { ...this.state.chaptersById };
     for (const [id, chapter] of incomingById) currentById[id] = mergeChapter(currentById[id], chapter);
     const incomingIds = [...incomingById.keys()];
-    const currentIds = this.state.orderedChapterIds.filter((id) => !incomingById.has(id));
+    const currentIds = [...this.state.orderedChapterIds];
+    const currentIdSet = new Set(currentIds);
+    const novelIds = incomingIds.filter((id) => !currentIdSet.has(id));
     let orderedIds = initial
       ? incomingIds
       : direction === "previous"
-        ? [...incomingIds, ...currentIds]
-        : [...currentIds, ...incomingIds];
+        ? [...novelIds, ...currentIds]
+        : [...currentIds, ...novelIds];
     const wasEmpty = this.state.orderedChapterIds.length === 0;
-    if (incomingIds.length > 0) {
-      this.previousCursors.set(incomingIds[0], response.previousCursor);
-      this.nextCursors.set(incomingIds[incomingIds.length - 1], response.nextCursor);
-      this.previousFallbackCursor = response.previousCursor;
-      this.nextFallbackCursor = response.nextCursor;
+    for (const [chapterId, boundary] of Object.entries(response.boundariesByChapterId)) {
+      this.boundaries.set(chapterId, boundary);
+      this.evictedChapterIds.delete(chapterId);
     }
     let firstItemIndex = this.state.firstItemIndex;
-    if (direction === "previous" && !initial) firstItemIndex -= countItemsForIds(incomingIds, currentById);
+    if (direction === "previous" && !initial) firstItemIndex -= countItemsForIds(novelIds, currentById);
     const trimmed = this.trimWindow(orderedIds, currentById, firstItemIndex, new Set(incomingIds));
     orderedIds = trimmed.orderedIds;
     firstItemIndex = trimmed.firstItemIndex;
-    const firstId = orderedIds[0];
-    const lastId = orderedIds[orderedIds.length - 1];
-    const previousCursor = firstId && this.previousCursors.has(firstId)
-      ? this.previousCursors.get(firstId) ?? null
-      : this.previousFallbackCursor;
-    const nextCursor = lastId && this.nextCursors.has(lastId)
-      ? this.nextCursors.get(lastId) ?? null
-      : this.nextFallbackCursor;
-    this.state = {
+    this.state = this.withEdgeMetadata({
       ...this.state,
       series: response.series,
       chaptersById: Object.fromEntries(orderedIds.map((id) => [id, currentById[id]])),
       orderedChapterIds: orderedIds,
       items: buildReaderItems(currentById, orderedIds),
-      nextCursor,
-      previousCursor,
-      hasMoreNext: nextCursor !== null,
-      hasMorePrevious: previousCursor !== null,
       visibleChapterId: this.state.visibleChapterId ?? incomingIds[0] ?? null,
       initialChapterId: this.state.initialChapterId,
       firstItemIndex: wasEmpty && initial ? INITIAL_ITEM_INDEX : firstItemIndex,
-    };
+    }, orderedIds);
   }
 
   private trimVisibleWindow(): void {
@@ -315,15 +388,13 @@ export class ReaderFeedController {
     const chaptersById = Object.fromEntries(
       trimmed.orderedIds.map((id) => [id, this.state.chaptersById[id]]),
     );
-    this.state = {
+    this.state = this.withEdgeMetadata({
       ...this.state,
       chaptersById,
       orderedChapterIds: trimmed.orderedIds,
       items: buildReaderItems(chaptersById, trimmed.orderedIds),
       firstItemIndex: trimmed.firstItemIndex,
-      previousCursor: this.boundaryCursor(trimmed.orderedIds[0], this.previousCursors, this.previousFallbackCursor),
-      nextCursor: this.boundaryCursor(trimmed.orderedIds.at(-1), this.nextCursors, this.nextFallbackCursor),
-    };
+    }, trimmed.orderedIds);
   }
 
   private trimWindow(
@@ -354,6 +425,7 @@ export class ReaderFeedController {
           id !== this.state.visibleChapterId &&
           !protectedIds.has(id) &&
           !this.protectedChapters.has(id) &&
+          (index === 0 || index === orderedIds.length - 1) &&
           (orderedIds.length > this.retention.maxRetainedChapters || index < keepStart || index >= keepEnd),
         );
       if (candidates.length === 0) break;
@@ -379,15 +451,20 @@ export class ReaderFeedController {
       cleanups?.forEach((cleanup) => cleanup());
       this.pageCleanups.delete(page.id);
     }
-    this.removeCursor(chapterId);
+    this.boundaries.delete(chapterId);
+    this.evictedChapterIds.add(chapterId);
   }
 
-  private boundaryCursor(
-    chapterId: string | undefined,
-    cursors: Map<string, string | null>,
-    fallback: string | null,
-  ): string | null {
-    return chapterId && cursors.has(chapterId) ? cursors.get(chapterId) ?? null : fallback;
+  private withEdgeMetadata(state: ReaderFeedState, orderedIds: string[]): ReaderFeedState {
+    const first = this.boundaries.get(orderedIds[0] ?? "");
+    const last = this.boundaries.get(orderedIds.at(-1) ?? "");
+    return {
+      ...state,
+      previousCursor: first?.previousCursor ?? null,
+      nextCursor: last?.nextCursor ?? null,
+      hasMorePrevious: first?.hasMorePrevious ?? false,
+      hasMoreNext: last?.hasMoreNext ?? false,
+    };
   }
 
   private fail(error: unknown, retryState: Exclude<ReaderRetryState, null>): void {
@@ -408,18 +485,12 @@ export class ReaderFeedController {
     this.controller.abort();
     this.controller = new AbortController();
     this.inFlight.clear();
-    this.previousCursors.clear();
-    this.nextCursors.clear();
-    this.previousFallbackCursor = null;
-    this.nextFallbackCursor = null;
+    this.boundaries.clear();
+    this.cursorHistory.clear();
+    this.evictedChapterIds.clear();
     this.pageCleanups.forEach((cleanups) => cleanups.forEach((cleanup) => cleanup()));
     this.pageCleanups.clear();
     this.protectedChapters.clear();
-  }
-
-  private removeCursor(chapterId: string): void {
-    this.previousCursors.delete(chapterId);
-    this.nextCursors.delete(chapterId);
   }
 
   private publish(): void {

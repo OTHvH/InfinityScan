@@ -15,7 +15,12 @@ export default defineConfig({
   projects: [
     {
       name: 'chromium',
-      use: { ...devices['Desktop Chrome'] },
+      use: {
+        ...devices['Desktop Chrome'],
+        launchOptions: process.env.PHASE3_MINIO_HOST_MAP === '1'
+          ? { args: ['--host-resolver-rules=MAP minio 127.0.0.1'] }
+          : undefined,
+      },
     },
   ],
   webServer: process.env.PLAYWRIGHT_EXTERNAL_SERVER === '1' ? undefined : [

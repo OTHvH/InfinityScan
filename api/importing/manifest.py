@@ -48,6 +48,14 @@ def manifest_to_dict(manifest: list[ManifestSeries]) -> dict[str, Any]:
             "cover_sha256": s.cover_sha256,
             "cover_mime_type": s.cover_mime_type,
             "cover_file_extension": s.cover_file_extension,
+            "rejected_files": [
+                {
+                    "source_reference": rejected.source_reference,
+                    "status": rejected.status,
+                    "reason": rejected.reason,
+                }
+                for rejected in s.rejected_files
+            ],
             "chapter_count": len(s.chapters),
             "chapters": [_chapter_dict(c) for c in s.chapters],
         }

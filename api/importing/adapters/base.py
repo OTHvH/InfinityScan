@@ -5,7 +5,7 @@ from __future__ import annotations
 import uuid
 from dataclasses import dataclass
 from decimal import Decimal
-from typing import Protocol, runtime_checkable
+from typing import Literal, Protocol, runtime_checkable
 
 
 @dataclass(frozen=True)
@@ -35,6 +35,15 @@ class ManifestChapter:
 
 
 @dataclass(frozen=True)
+class ManifestRejectedFile:
+    """A safely rejected source file retained as durable import evidence."""
+
+    source_reference: str
+    status: Literal["skipped", "failed"]
+    reason: str
+
+
+@dataclass(frozen=True)
 class ManifestSeries:
     """A series manifest ready for validation and import."""
 
@@ -49,6 +58,7 @@ class ManifestSeries:
     cover_sha256: str | None = None
     cover_mime_type: str | None = None
     cover_file_extension: str | None = None
+    rejected_files: tuple[ManifestRejectedFile, ...] = ()
 
 
 @runtime_checkable

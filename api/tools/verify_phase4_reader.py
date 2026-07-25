@@ -10,6 +10,18 @@ from pathlib import Path
 import httpx
 
 
+def assert_boundary_contract(chunk: dict) -> None:
+    boundaries = chunk["chapter_boundaries"]
+    assert [boundary["chapter_id"] for boundary in boundaries] == [
+        chapter["id"] for chapter in chunk["chapters"]
+    ]
+    assert chunk["previous_cursor"] == boundaries[0]["previous_cursor"]
+    assert chunk["next_cursor"] == boundaries[-1]["next_cursor"]
+    for boundary in boundaries:
+        assert boundary["has_more_next"] == (boundary["next_cursor"] is not None)
+        assert boundary["has_more_previous"] == (boundary["previous_cursor"] is not None)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--api", required=True)
@@ -28,15 +40,43 @@ def main() -> None:
         initial_response.raise_for_status()
         initial = initial_response.json()
         assert len(initial["chapters"]) == 5
+        assert_boundary_contract(initial)
         assert initial["previous_cursor"] is None
         assert initial["next_cursor"]
+
+        after_first_response = client.get(
+            endpoint,
+            params={
+                "cursor": initial["chapter_boundaries"][0]["next_cursor"],
+                "direction": "next",
+                "limit": 1,
+            },
+        )
+        after_first_response.raise_for_status()
+        assert [chapter["id"] for chapter in after_first_response.json()["chapters"]] == [
+            initial["chapters"][1]["id"]
+        ]
+        before_second_response = client.get(
+            endpoint,
+            params={
+                "cursor": initial["chapter_boundaries"][1]["previous_cursor"],
+                "direction": "previous",
+                "limit": 1,
+            },
+        )
+        before_second_response.raise_for_status()
+        assert [chapter["id"] for chapter in before_second_response.json()["chapters"]] == [
+            initial["chapters"][0]["id"]
+        ]
 
         next_response = client.get(
             endpoint,
             params={"cursor": initial["next_cursor"], "direction": "next", "limit": 5},
         )
         next_response.raise_for_status()
-        assert len(next_response.json()["chapters"]) == 5
+        next_chunk = next_response.json()
+        assert len(next_chunk["chapters"]) == 5
+        assert_boundary_contract(next_chunk)
 
         middle_response = client.get(
             endpoint,
@@ -49,6 +89,7 @@ def main() -> None:
         middle_response.raise_for_status()
         middle = middle_response.json()
         assert len(middle["chapters"]) == 5
+        assert_boundary_contract(middle)
         assert middle["previous_cursor"]
         previous_response = client.get(
             endpoint,
@@ -59,7 +100,9 @@ def main() -> None:
             },
         )
         previous_response.raise_for_status()
-        assert len(previous_response.json()["chapters"]) == 5
+        previous_chunk = previous_response.json()
+        assert len(previous_chunk["chapters"]) == 5
+        assert_boundary_contract(previous_chunk)
 
         traversed = list(initial["chapters"])
         cursor = initial["next_cursor"]
@@ -72,6 +115,7 @@ def main() -> None:
             response.raise_for_status()
             chunk = response.json()
             assert chunk["chapters"]
+            assert_boundary_contract(chunk)
             traversed.extend(chunk["chapters"])
             cursor = chunk["next_cursor"]
             request_count += 1
@@ -106,6 +150,10 @@ def main() -> None:
         assert client.get(
             endpoint,
             params={"cursor": tampered, "direction": "next", "limit": 5},
+        ).status_code == 400
+        assert client.get(
+            endpoint,
+            params={"cursor": valid_cursor, "direction": "previous", "limit": 5},
         ).status_code == 400
 
         media_response = client.get(f'/media/pages/{fixture["sample_page_id"]}')

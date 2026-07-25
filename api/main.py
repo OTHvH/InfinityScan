@@ -41,7 +41,7 @@ from limiter import limiter
 from settings import get_settings
 from database import get_db
 from storage import ObjectStorage, StorageError, create_object_storage
-from providers.base import ProviderError, ProviderTimeout
+from providers.base import ProviderError, ProviderSecurityError, ProviderTimeout
 from providers.copymanga import CopyMangaAdapter
 from providers.local import LocalContentAdapter
 from models import (
@@ -256,70 +256,6 @@ def health() -> dict:
     return {"status": "ok"}
 
 
-# ---------------------------------------------------------------------------
-# Routes — series / content (CopyManga-backed)
-# ---------------------------------------------------------------------------
-
-
-@app.get("/series", summary="List local library or search series on CopyManga")
-async def search_series(
-    q: str | None = Query(
-        None,
-        min_length=1,
-        description="Search query — omit to list the local library",
-    ),
-    limit: int = Query(24, ge=1, le=100),
-    offset: int = Query(0, ge=0),
-) -> Any:
-    if q:
-        results = await copymanga("search/comic", q=q, limit=limit, offset=offset, platform=1)
-        comics = results.get("list") or []
-        for c in comics:
-            c["cover"] = _ensure_absolute_cover(c.get("cover"))
-        return {
-            "total": results.get("total", len(comics)),
-            "limit": limit,
-            "offset": offset,
-            "list": comics,
-        }
-
-    from database import get_db
-    db_gen = get_db()
-    db: Session = next(db_gen)
-    try:
-        total: int = db.scalar(select(func.count()).select_from(Series)) or 0
-        rows = list(
-            db.scalars(select(Series).order_by(Series.title).offset(offset).limit(limit)).all()
-        )
-    finally:
-        try:
-            next(db_gen)
-        except StopIteration:
-            pass
-
-    return {
-        "total": total,
-        "limit": limit,
-        "offset": offset,
-        "list": [
-            LocalSeriesOut(
-                id=str(s.id),
-                slug=s.slug,
-                title=s.title,
-                synopsis=s.synopsis,
-                cover_url=_local_cover_url(s.id, s.cover_object_key),
-                content_type=s.content_type.value
-                if hasattr(s.content_type, "value")
-                else s.content_type,
-                status=s.status.value if hasattr(s.status, "value") else s.status,
-                year=s.year,
-                is_nsfw=s.is_nsfw,
-            )
-            for s in rows
-        ],
-    }
-
-
 @app.get("/library/{slug}", response_model=LocalSeriesDetailOut, summary="Get local series by slug")
 def get_local_series(
     slug: str,
@@ -492,6 +428,8 @@ async def search_series(
             results = await _copymanga.search_series(q, limit=limit, offset=offset)
         except ProviderTimeout:
             raise HTTPException(status_code=504, detail="Search provider timed out")
+        except ProviderSecurityError as exc:
+            raise HTTPException(status_code=422, detail=f"Search provider URL rejected: {exc}")
         except ProviderError as exc:
             raise HTTPException(status_code=502, detail=f"Search provider error: {exc}")
         return ProviderSeriesListOut(
@@ -554,6 +492,8 @@ async def get_series(path_word: str = Path(...)) -> ProviderSeriesOut:
         series = await _copymanga.get_series(path_word)
     except ProviderTimeout:
         raise HTTPException(status_code=504, detail="Provider timed out")
+    except ProviderSecurityError as exc:
+        raise HTTPException(status_code=422, detail=f"Provider URL rejected: {exc}")
     except ProviderError as exc:
         raise HTTPException(status_code=502, detail=f"Provider error: {exc}")
     return ProviderSeriesOut(
@@ -584,6 +524,8 @@ async def list_chapters(
         chapters = await _copymanga.list_chapters(path_word, limit=limit, offset=offset)
     except ProviderTimeout:
         raise HTTPException(status_code=504, detail="Provider timed out")
+    except ProviderSecurityError as exc:
+        raise HTTPException(status_code=422, detail=f"Provider URL rejected: {exc}")
     except ProviderError as exc:
         raise HTTPException(status_code=502, detail=f"Provider error: {exc}")
     return ProviderChapterListOut(
@@ -620,6 +562,8 @@ async def get_chapter_pages(
         page_refs = await _copymanga.get_chapter_pages(path_word, chapter_uuid)
     except ProviderTimeout:
         raise HTTPException(status_code=504, detail="Provider timed out")
+    except ProviderSecurityError as exc:
+        raise HTTPException(status_code=422, detail=f"Provider URL rejected: {exc}")
     except ProviderError as exc:
         raise HTTPException(status_code=502, detail=f"Provider error: {exc}")
     return ChapterPagesOut(

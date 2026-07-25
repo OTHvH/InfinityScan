@@ -6,7 +6,7 @@ import { ChapterSeparator } from "./ChapterSeparator";
 import { ReaderErrorFooter } from "./ReaderErrorFooter";
 import { ReaderLoadingFooter } from "./ReaderLoadingFooter";
 import { ReaderPage } from "./ReaderPage";
-import type { ReaderItem } from "../types";
+import type { ReaderItem, ReaderRequestReason } from "../types";
 
 interface ContinuousReaderProps {
   items: ReaderItem[];
@@ -18,8 +18,8 @@ interface ContinuousReaderProps {
   error: string | null;
   zoom: number;
   fitWidth: boolean;
-  onLoadNext: () => Promise<unknown> | null;
-  onLoadPrevious: () => Promise<unknown> | null;
+  onLoadNext: (reason: Extract<ReaderRequestReason, "endReached" | "footerObserver" | "modeTransition">) => Promise<unknown> | null;
+  onLoadPrevious: (reason: Extract<ReaderRequestReason, "prepend" | "modeTransition">) => Promise<unknown> | null;
   onRetry: () => Promise<unknown> | null;
   onRangeChanged: (range: ListRange) => void;
   initialTopMostItemIndex?: number;
@@ -51,9 +51,9 @@ function ContinuousReaderView(props: ContinuousReaderProps) {
     onRetry,
   } = props;
   const nextRequestRef = useRef<Promise<unknown> | null>(null);
-  const triggerNext = useCallback(() => {
+  const triggerNext = useCallback((reason: Extract<ReaderRequestReason, "endReached" | "footerObserver">) => {
     if (!hasMoreNext || loadingNext || nextRequestRef.current) return;
-    const request = onLoadNext();
+    const request = onLoadNext(reason);
     if (!request) return;
     nextRequestRef.current = request;
     void request.then(
@@ -64,7 +64,7 @@ function ContinuousReaderView(props: ContinuousReaderProps) {
 
   const triggerPrevious = useCallback(() => {
     if (!hasMorePrevious || loadingPrevious) return;
-    void onLoadPrevious()?.catch(() => undefined);
+    void onLoadPrevious("prepend")?.catch(() => undefined);
   }, [hasMorePrevious, loadingPrevious, onLoadPrevious]);
 
   const triggerRetry = useCallback(() => {
@@ -90,14 +90,14 @@ function ContinuousReaderView(props: ContinuousReaderProps) {
           <>
             <ReaderLoadingFooter loading={props.loadingNext} />
             <ReaderErrorFooter error={props.error} onRetry={triggerRetry} />
-            <FooterSentinel onIntersect={triggerNext} />
+            <FooterSentinel onIntersect={() => triggerNext("footerObserver")} />
           </>
         ),
       }}
       itemContent={(_, item) => item.kind === "chapter-separator"
         ? <ChapterSeparator item={item} />
         : <ReaderPage item={item} zoom={props.zoom} fitWidth={props.fitWidth} registerCleanup={props.registerPageCleanup} />}
-      endReached={triggerNext}
+      endReached={() => triggerNext("endReached")}
       startReached={triggerPrevious}
       rangeChanged={props.onRangeChanged}
       style={{ height: "100%", paddingTop: 56, paddingBottom: 60 }}

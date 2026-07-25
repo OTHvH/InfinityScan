@@ -6,9 +6,16 @@ from typing import Any
 
 import httpx
 
-from providers.base import NormalizedChapter, NormalizedPageReference, NormalizedSeries, ProviderError, ProviderTimeout
+from providers.base import (
+    NormalizedChapter,
+    NormalizedPageReference,
+    NormalizedSeries,
+    ProviderError,
+    ProviderSecurityError,
+    ProviderTimeout,
+)
+from providers.ssrf import validate_redirect_url, validate_url
 from providers.cache import MetadataCache
-from providers.ssrf import validate_url
 
 logger = logging.getLogger(__name__)
 
@@ -78,8 +85,7 @@ class CopyMangaAdapter:
             self._client = httpx.AsyncClient(
                 headers=self._headers,
                 timeout=httpx.Timeout(self._timeout),
-                follow_redirects=True,
-                max_redirects=self._max_redirects,
+                follow_redirects=False,
             )
         return self._client
 
@@ -184,10 +190,24 @@ class CopyMangaAdapter:
         try:
             validate_url(url)
         except ValueError as exc:
-            raise ProviderError(f"URL validation failed: {exc}") from exc
+            raise ProviderSecurityError(f"URL validation failed: {exc}") from exc
         try:
             client = await self._get_client()
-            r = await client.get(url, params={k: v for k, v in (params or {}).items() if v is not None})
+            request_params = {k: v for k, v in (params or {}).items() if v is not None}
+            for redirect_count in range(self._max_redirects + 1):
+                r = await client.get(url, params=request_params if redirect_count == 0 else None)
+                if not r.is_redirect:
+                    break
+                location = r.headers.get("location")
+                if not location:
+                    raise ProviderError("Provider redirect is missing a location")
+                url = str(r.url.join(location))
+                try:
+                    validate_redirect_url(url)
+                except ValueError as exc:
+                    raise ProviderSecurityError(f"Redirect URL validation failed: {exc}") from exc
+            else:
+                raise ProviderError("Provider exceeded the redirect limit")
         except httpx.TimeoutException as exc:
             raise ProviderTimeout(f"Provider request timed out: {exc}") from exc
         except httpx.RequestError as exc:

@@ -529,7 +529,7 @@ else
 fi
 
 if [ -x web/node_modules/.bin/playwright ]; then
-  if PLAYWRIGHT_OUT=$(API_URL="$API_BASE" WEB_URL="$WEB_BASE" npm --prefix web run test:e2e -- e2e/auth-flow.spec.ts 2>&1); then
+  if PLAYWRIGHT_OUT=$(PLAYWRIGHT_EXTERNAL_SERVER=1 API_URL="$API_BASE" WEB_URL="$WEB_BASE" npm --prefix web run test:e2e:phase2 2>&1); then
     pass "CHECK-20: Playwright authentication tests"
   else
     status=$?
