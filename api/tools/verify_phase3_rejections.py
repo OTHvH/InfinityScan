@@ -29,6 +29,11 @@ def object_count(storage: object, series_id: uuid.UUID) -> int:
     return int(response.get("KeyCount", 0))
 
 
+def require(condition: bool, message: str) -> None:
+    if not condition:
+        raise RuntimeError(message)
+
+
 def assert_case(
     db: Session,
     service: ImportService,
@@ -44,37 +49,39 @@ def assert_case(
     series_id = stable_series_id(slug)
     before = object_count(storage, series_id)
     manifest = LocalAdapter(root).scan()
-    assert len(manifest) == 1 and manifest[0].slug == slug
+    require(len(manifest) == 1 and manifest[0].slug == slug, f"unexpected manifest for {slug}")
     job = service.run(manifest)
     db.refresh(job)
     series = db.query(Series).filter(Series.slug == slug).one()
     pages = db.query(Page).join(Page.chapter).filter_by(series_id=series.id).all()
-    assert len(pages) == expected_pages
+    require(len(pages) == expected_pages, f"{slug}: expected {expected_pages} pages, found {len(pages)}")
     after = object_count(storage, series_id)
-    assert after - before == expected_objects
+    require(after - before == expected_objects, f"{slug}: unexpected object count change {after - before}")
 
     rejected = db.query(ImportJobItem).filter(
         ImportJobItem.job_id == job.id,
         ImportJobItem.status.in_([ImportJobItemStatus.skipped, ImportJobItemStatus.failed]),
     ).all()
+    observed_status: ImportJobItemStatus | None = None
     if expected_status is None:
-        assert rejected == []
+        require(rejected == [], f"{slug}: unexpected rejected item")
     else:
-        assert len(rejected) == 1
+        require(len(rejected) == 1, f"{slug}: expected one rejected item, found {len(rejected)}")
         item = rejected[0]
-        assert item.status == expected_status
-        assert item.object_key == ""
-        assert item.sha256 is None
-        assert item.error and expected_error in item.error
-        assert str(root) not in item.error
-        assert "secret" not in item.error.lower()
+        observed_status = item.status
+        require(item.status == expected_status, f"{slug}: unexpected rejection status {item.status}")
+        require(item.object_key == "", f"{slug}: rejected item has an object key")
+        require(item.sha256 is None, f"{slug}: rejected item has a digest")
+        require(bool(item.error and expected_error and expected_error in item.error), f"{slug}: rejection error is incomplete")
+        require(str(root) not in (item.error or ""), f"{slug}: rejection error leaked the import root")
+        require("secret" not in (item.error or "").lower(), f"{slug}: rejection error leaked a secret")
 
     return {
         "slug": slug,
         "job": str(job.id),
         "pages": len(pages),
         "objectsAdded": after - before,
-        "rejectedStatus": expected_status.value if expected_status else None,
+        "rejectedStatus": observed_status.value if observed_status else None,
     }
 
 
@@ -95,7 +102,7 @@ def main() -> None:
             with Session(engine) as db:
                 service = ImportService.from_settings(db, settings=settings)
                 storage = service._storage
-                assert storage is not None
+                require(storage is not None, "object storage is unavailable")
 
                 unsupported_slug = f"phase3-unsupported-{suffix}"
                 unsupported_root = tmp / "unsupported"
@@ -154,9 +161,9 @@ def main() -> None:
                     expected_error="maximum byte size",
                 )
 
-                assert db.query(ImportJob).filter(ImportJob.id.in_([
+                require(db.query(ImportJob).filter(ImportJob.id.in_([
                     uuid.UUID(str(value["job"])) for value in results.values()
-                ])).count() == 4
+                ])).count() == 4, "expected four rejection verification jobs")
         finally:
             outside.unlink(missing_ok=True)
 

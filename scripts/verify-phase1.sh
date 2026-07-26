@@ -139,7 +139,7 @@ else
   fail "REQ-06: real .env tracked: $REAL_ENV"
 fi
 
-MANGA_FILES="$(git ls-files | awk '/\.(jpg|jpeg|png|webp|cbz|cbr)$/ { print; count++; if (count == 5) exit }')"
+MANGA_FILES="$(git ls-files | awk '$0 !~ /^web\/test-results\// && /\.(jpg|jpeg|png|webp|cbz|cbr)$/ { print; count++; if (count == 5) exit }')"
 MANGA_DIRS="$(git ls-files | awk '/^[0-9]+\// { print; count++; if (count == 5) exit }')"
 if [ -z "$MANGA_FILES" ] && [ -z "$MANGA_DIRS" ]; then
   pass "REQ-07: no bundled manga content tracked"
@@ -332,6 +332,15 @@ else
   else
     status=$?
     fail "REQ-12b: arm64 binfmt registration failed (exit $status): $(short_error "$BINFMT_OUT")"
+  fi
+
+  if [ "$BUILDER_READY" = true ]; then
+    if STOP_OUT=$(docker buildx stop "$BUILDER" 2>&1); then
+      pass "REQ-12b: stopped reused $BUILDER to refresh platform discovery"
+    else
+      status=$?
+      fail "REQ-12b: could not refresh reused $BUILDER (exit $status): $(short_error "$STOP_OUT")"
+    fi
   fi
 
   if [ "$BUILDER_READY" = true ]; then

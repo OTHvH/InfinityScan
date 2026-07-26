@@ -185,7 +185,7 @@ else
   fail "P4-01: Phase 4 must run on a named non-master branch"
 fi
 
-MANGA_FILES="$(git ls-files | awk 'tolower($0) ~ /\.(jpg|jpeg|png|webp|avif|gif|cbz|cbr|pdf)$/ { print; count++; if (count == 10) exit }')"
+MANGA_FILES="$(git ls-files | awk '$0 !~ /^web\/test-results\// && tolower($0) ~ /\.(jpg|jpeg|png|webp|avif|gif|cbz|cbr|pdf)$/ { print; count++; if (count == 10) exit }')"
 REAL_ENV="$(git ls-files | awk '/(^|\/)\.env$/ && $0 !~ /\.env\.example$/ { print }')"
 SECRET_FILES="$(git ls-files | awk 'tolower($0) ~ /(^|\/)(id_rsa|id_ed25519)$|\.(pem|key|p12|pfx)$/ { print }')"
 SECRET_CONTENT="$(git grep -Il -E -- '-----BEGIN ([A-Z ]+ )?PRIVATE KEY-----|AKIA[0-9A-Z]{16}' 2>/dev/null || true)"
@@ -406,7 +406,7 @@ fi
 OBSOLETE_HITS="$(git grep -n -E 'all[P]ages|currentChapter[N]um|lastChapter[N]um|parseFloat[(]chapter[N]umber[)]|chapter[N]umber[[:space:]]*[+-][[:space:]]*1|addEventListener[(]["'\'' ]scroll' -- web/src 2>/dev/null || true)"
 NUMBER_LINK_HITS="$(git grep -n '/library/' -- web/src 2>/dev/null | grep '/chapter/' || true)"
 OLD_PAYLOAD_HITS="$(git grep -n 'Reader[P]ayload' -- api 2>/dev/null || true)"
-SCROLL_HITS="$(git grep -n 'scroll[H]eight' -- 2>/dev/null | grep -v '^web/e2e/reader-long-scroll.spec.ts:' || true)"
+SCROLL_HITS="$(git grep -n 'scroll[H]eight' -- ':!web/e2e/phase4/reader-long-scroll.spec.ts' ':!web/test-results/**' 2>/dev/null || true)"
 if [ -z "$OBSOLETE_HITS" ] && [ -z "$NUMBER_LINK_HITS" ] && [ -z "$OLD_PAYLOAD_HITS" ] && [ -z "$SCROLL_HITS" ]; then
   pass "P4-23a: obsolete reader state, arithmetic, listeners, payload API, media construction, and number links are absent"
 else

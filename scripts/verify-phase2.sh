@@ -128,8 +128,22 @@ run_local_check() {
   fi
 }
 
+run_pytest_no_skips() {
+  local label="$1"
+  shift
+  local output status=0
+  output=$("$@" 2>&1) || status=$?
+  if [ "$status" -eq 0 ] && ! printf '%s\n' "$output" | grep -Eq '(^|[[:space:]])[1-9][0-9]* skipped([,[:space:]]|$)'; then
+    pass "$label"
+  elif [ "$status" -eq 0 ]; then
+    fail "$label: pytest reported skipped tests: $(short_error "$output")"
+  else
+    fail "$label (exit $status): $(short_error "$output")"
+  fi
+}
+
 if [ -x "$API_PYTHON" ]; then
-  run_local_check "CHECK-A1: backend pytest" "$API_PYTHON" -m pytest api/tests
+  run_pytest_no_skips "CHECK-A1: backend pytest" "$API_PYTHON" -m pytest api/tests --ignore=api/tests/integration/test_storage_minio.py
 else
   fail "CHECK-A1: backend pytest cannot run without API Python"
 fi

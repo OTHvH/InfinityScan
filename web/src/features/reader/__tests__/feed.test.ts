@@ -5,6 +5,7 @@ import {
   ReaderFeedController,
   type ReaderChunkFetcher,
 } from "../feed";
+import { cachePageImage, clearReaderPageImageCache } from "../media-cache";
 import type { ReaderChapter, ReaderChunkResponse } from "../types";
 
 function chapter(id: string, number: string, pageIds = [`${id}-page`]): ReaderChapter {
@@ -169,6 +170,89 @@ describe("ReaderFeedController", () => {
     expect(feed.loadNext()).toBeNull();
     expect(feed.loadPrevious()).toBeNull();
     expect(fetcher).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not speculate past the retention window until an edge can be evicted", async () => {
+    const fetcher = vi.fn<ReaderChunkFetcher>()
+      .mockResolvedValueOnce(response([chapter("1", "1"), chapter("2", "2")], { nextCursor: "next-2", hasMoreNext: true }))
+      .mockResolvedValueOnce(response([chapter("3", "3"), chapter("4", "4")], { nextCursor: "next-4", hasMoreNext: true }))
+      .mockResolvedValueOnce(response([chapter("5", "5"), chapter("6", "6")], { nextCursor: "next-6", hasMoreNext: true }));
+    const feed = new ReaderFeedController(fetcher, {
+      retention: { maxRetainedChapters: 4, retainBehindVisible: 1, retainAheadVisible: 1 },
+    });
+
+    await feed.loadInitial("series", "1");
+    await feed.loadNext();
+    expect(feed.getState().orderedChapterIds).toEqual(["1", "2", "3", "4"]);
+    expect(feed.getState().visibleChapterId).toBe("1");
+    expect(feed.getDiagnostics()?.activeNextRequests).toBe(0);
+    expect(feed.loadNext("footerObserver")).toBeNull();
+
+    feed.setVisibleChapterId("4");
+    feed.setChapterProtected("1", true);
+    expect(feed.loadNext("footerObserver")).toBeNull();
+    feed.setChapterProtected("1", false);
+    await feed.loadNext();
+    expect(feed.getState().orderedChapterIds).toEqual(["3", "4", "5", "6"]);
+    expect(feed.getDiagnostics()?.retainedChapterCount).toBe(4);
+  });
+
+  it("rejects a chapter that cannot fit within the page retention limit", async () => {
+    const pages = Array.from({ length: 5 }, (_, index) => `page-${index}`);
+    const feed = new ReaderFeedController(
+      async () => response([chapter("oversized", "1", pages)]),
+      { retention: { maxRetainedPages: 4 } },
+    );
+
+    await expect(feed.loadInitial("series", "oversized")).rejects.toThrow("page retention limit");
+    expect(feed.getDiagnostics()?.retainedPageCount).toBe(0);
+    expect(feed.getState().error).toContain("page retention limit");
+  });
+
+  it("releases cached page images when the feed is disposed", async () => {
+    const revoke = vi.spyOn(URL, "revokeObjectURL");
+    const feed = new ReaderFeedController(async () => response([chapter("cached", "1")]));
+    await feed.loadInitial("series", "cached");
+    cachePageImage("cached-page", "blob:cached-page");
+
+    feed.dispose();
+
+    expect(revoke).toHaveBeenCalledWith("blob:cached-page");
+    clearReaderPageImageCache();
+    revoke.mockRestore();
+  });
+
+  it("evicts a speculative incoming edge when its pages exceed the window", async () => {
+    const feed = new ReaderFeedController(
+      async () => response([
+        chapter("visible", "1", ["v1", "v2", "v3"]),
+        chapter("speculative", "2", ["s1", "s2", "s3"]),
+      ]),
+      { retention: { maxRetainedPages: 5 } },
+    );
+
+    await feed.loadInitial("series", "visible");
+    expect(feed.getState().orderedChapterIds).toEqual(["visible"]);
+    expect(feed.getDiagnostics()?.retainedPageCount).toBe(3);
+  });
+
+  it("hands off to the incoming chapter when adjacent pages exceed the window", async () => {
+    const currentPages = Array.from({ length: 200 }, (_, index) => `current-${index}`);
+    const nextPages = Array.from({ length: 60 }, (_, index) => `next-${index}`);
+    const fetcher = vi.fn<ReaderChunkFetcher>()
+      .mockResolvedValueOnce(response([chapter("current", "1", currentPages)], {
+        nextCursor: "next-current",
+        hasMoreNext: true,
+      }))
+      .mockResolvedValueOnce(response([chapter("next", "2", nextPages)]));
+    const feed = new ReaderFeedController(fetcher);
+
+    await feed.loadInitial("series", "current");
+    await feed.loadNext();
+
+    expect(feed.getState().orderedChapterIds).toEqual(["next"]);
+    expect(feed.getState().visibleChapterId).toBe("next");
+    expect(feed.getDiagnostics()?.retainedPageCount).toBe(60);
   });
 
   it("moves firstItemIndex by the prepended virtual items", async () => {

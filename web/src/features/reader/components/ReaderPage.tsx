@@ -2,6 +2,11 @@
 
 import { memo, useEffect, useRef, useState } from "react";
 import { resolvePageMediaRequest } from "@/lib/api";
+import {
+  cachedPageImage,
+  cachePageImage,
+  evictCachedPageImage,
+} from "../media-cache";
 import type { ReaderItem } from "../types";
 
 type PageItem = Extract<ReaderItem, { kind: "page" }>;
@@ -55,7 +60,6 @@ function ReaderPageView({ item, zoom, fitWidth, seeking = false, registerCleanup
       retryTimer = null;
     };
     const releaseObjectUrl = () => {
-      if (objectUrlRef.current) URL.revokeObjectURL(objectUrlRef.current);
       objectUrlRef.current = null;
     };
     const stop = () => {
@@ -72,6 +76,13 @@ function ReaderPageView({ item, zoom, fitWidth, seeking = false, registerCleanup
       if (!active || nextAttempt > MAX_ATTEMPTS) return;
       clearRetryTimer();
       controller?.abort();
+      const cachedSource = nextAttempt === 1 ? cachedPageImage(item.pageId) : null;
+      if (cachedSource) {
+        attempt = 1;
+        objectUrlRef.current = cachedSource;
+        setView({ status: "loading", error: null, source: cachedSource, attempt, generation });
+        return;
+      }
       const requestController = new AbortController();
       controller = requestController;
       releaseObjectUrl();
@@ -105,7 +116,7 @@ function ReaderPageView({ item, zoom, fitWidth, seeking = false, registerCleanup
 
       try {
         const response = await fetch(requestUrl, {
-          credentials: "include",
+          credentials: "omit",
           signal: requestController.signal,
         });
         if (!active || generationRef.current !== generation || controller !== requestController) return;
@@ -119,7 +130,7 @@ function ReaderPageView({ item, zoom, fitWidth, seeking = false, registerCleanup
         }
         const blob = await response.blob();
         if (!active || generationRef.current !== generation || controller !== requestController) return;
-        const source = URL.createObjectURL(blob);
+        const source = cachePageImage(item.pageId, URL.createObjectURL(blob));
         objectUrlRef.current = source;
         setView({
           status: attempt === 1 ? "loading" : "retrying",
@@ -128,7 +139,7 @@ function ReaderPageView({ item, zoom, fitWidth, seeking = false, registerCleanup
           attempt,
           generation,
         });
-      } catch (error) {
+      } catch {
         if (!active || generationRef.current !== generation || controller !== requestController) return;
         if (requestController.signal.aborted) return;
         scheduleRetry();
@@ -139,7 +150,10 @@ function ReaderPageView({ item, zoom, fitWidth, seeking = false, registerCleanup
       if (!active || attempt >= MAX_ATTEMPTS) return;
       void startRequest(attempt + 1);
     };
-    const unregister = registerCleanup?.(item.pageId, stop);
+    const unregister = registerCleanup?.(item.pageId, () => {
+      evictCachedPageImage(item.pageId);
+      stop();
+    });
     if (seeking) {
       queueMicrotask(() => { if (active) setView(initialState()); });
     } else {
@@ -161,7 +175,7 @@ function ReaderPageView({ item, zoom, fitWidth, seeking = false, registerCleanup
         : current);
     } catch {
       if (generationRef.current !== generation || objectUrlRef.current !== source) return;
-      if (source) URL.revokeObjectURL(source);
+      if (source) evictCachedPageImage(item.pageId, source);
       objectUrlRef.current = null;
       setView((current) => current.generation === generation
         ? { ...current, status: "unavailable", error: "decode", source: null }

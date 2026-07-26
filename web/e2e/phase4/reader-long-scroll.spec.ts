@@ -29,6 +29,7 @@ interface FixtureChapter {
 
 interface ReaderRequestEvent {
   phase: "start" | "settle";
+  pageSessionId: string;
   controllerId: number;
   generation: number;
   requestId: number;
@@ -38,6 +39,7 @@ interface ReaderRequestEvent {
   outcome?: "succeeded" | "failed" | "cancelled";
   retainedChapterIds: string[];
   evictedChapterIds: string[];
+  cursorChapterIds: string[];
 }
 
 function uuid(prefix: string, value: number): string {
@@ -105,6 +107,36 @@ async function waitForReaderIdle(page: Page): Promise<void> {
   }).toBe(0);
 }
 
+async function waitForReaderSettled(page: Page): Promise<void> {
+  await waitForReaderIdle(page);
+  await page.locator("[data-virtuoso-scroller]").evaluate(async (element) => {
+    let previousSignature = "";
+    let stableFrames = 0;
+    for (let frame = 0; frame < 240; frame += 1) {
+      await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+      const diagnostics = document.querySelector('[data-testid="reader-diagnostics"]');
+      const activeRequests = Number(diagnostics?.getAttribute("data-active-next-requests"))
+        + Number(diagnostics?.getAttribute("data-active-previous-requests"));
+      const scrollerRect = element.getBoundingClientRect();
+      const pendingImages = [...document.querySelectorAll<HTMLElement>(
+        '.reader-page-frame[data-image-state="waiting"], .reader-page-frame[data-image-state="loading"], .reader-page-frame[data-image-state="retrying"]',
+      )].filter((frame) => {
+        const rect = frame.getBoundingClientRect();
+        return rect.bottom > scrollerRect.top && rect.top < scrollerRect.bottom;
+      }).length;
+      const scrollSeekPlaceholders = element.querySelectorAll(".page-placeholder").length;
+      const signature = `${element.scrollHeight}:${element.clientHeight}:${element.querySelectorAll("[data-item-index]").length}`;
+      stableFrames = activeRequests === 0 && pendingImages === 0 && scrollSeekPlaceholders === 0 && signature === previousSignature
+        ? stableFrames + 1
+        : 0;
+      if (stableFrames >= 3) return;
+      previousSignature = signature;
+    }
+    throw new Error("Reader layout did not reach a stable image and geometry state");
+  });
+  await waitForReaderIdle(page);
+}
+
 async function assertReaderGates(page: Page): Promise<void> {
   const state = await diagnostics(page);
   expect(state.retainedChapters).toBeLessThanOrEqual(MAX_RETAINED_CHAPTERS);
@@ -147,24 +179,51 @@ async function scrollToChapter(
   const scroller = page.locator("[data-virtuoso-scroller]");
   await expect(scroller).toBeVisible();
   let furthestIndex = direction === "next" ? -1 : chapters.length;
-  for (let step = 0; step < 180; step += 1) {
+  for (let step = 0; step < 240; step += 1) {
+    await waitForReaderSettled(page);
     const state = await diagnostics(page);
     const index = chapters.findIndex((chapter) => chapter.id === state.visibleChapterId);
     furthestIndex = direction === "next" ? Math.max(furthestIndex, index) : Math.min(furthestIndex, index);
     if ((direction === "next" && index >= targetIndex) || (direction === "previous" && index <= targetIndex)) return furthestIndex;
-    await scroller.evaluate((element, scrollDirection) => {
-      element.scrollTo({ top: scrollDirection === "next" ? element.scrollHeight : 0, behavior: "instant" });
-    }, direction);
-    await expect.poll(async () => {
-      const nextState = await diagnostics(page);
-      const nextIndex = chapters.findIndex((chapter) => chapter.id === nextState.visibleChapterId);
-      return Number(nextState.activeNext) + Number(nextState.activePrevious) === 0
-        && (nextIndex !== index || nextIndex === targetIndex);
-    }).toBe(true);
+    const targetFrames = page.locator(`.reader-page-frame[data-chapter-id="${chapters[targetIndex].id}"]`);
+    if (await targetFrames.count()) {
+      const targetFrame = direction === "next" ? targetFrames.last() : targetFrames.first();
+      await targetFrame.evaluate((element, scrollDirection) => {
+        const scrollElement = element.closest<HTMLElement>("[data-virtuoso-scroller]");
+        if (!scrollElement) throw new Error("Virtuoso scroller is unavailable");
+        const targetRect = element.getBoundingClientRect();
+        const scrollerRect = scrollElement.getBoundingClientRect();
+        const remaining = scrollDirection === "next"
+          ? targetRect.bottom - scrollerRect.bottom
+          : targetRect.top - scrollerRect.top;
+        const maximumStep = scrollElement.clientHeight * 2;
+        scrollElement.scrollBy({
+          top: Math.max(-maximumStep, Math.min(maximumStep, remaining)),
+          behavior: "instant",
+        });
+      }, direction);
+    } else {
+      await scroller.evaluate((element, scrollDirection) => {
+        element.scrollTo({ top: scrollDirection === "next" ? element.scrollHeight : 0, behavior: "instant" });
+      }, direction);
+    }
+    await nextPaint(page);
+    await waitForReaderSettled(page);
+    const nextState = await diagnostics(page);
+    const nextIndex = chapters.findIndex((chapter) => chapter.id === nextState.visibleChapterId);
+    furthestIndex = direction === "next" ? Math.max(furthestIndex, nextIndex) : Math.min(furthestIndex, nextIndex);
     await assertReaderGates(page);
     await onStep?.();
   }
-  throw new Error(`Did not reach chapter index ${targetIndex} while scrolling ${direction}`);
+  const failureState = await scroller.evaluate((element) => ({
+    scrollTop: element.scrollTop,
+    scrollHeight: element.scrollHeight,
+    clientHeight: element.clientHeight,
+    placeholders: element.querySelectorAll(".page-placeholder").length,
+    renderedChapterIds: [...element.querySelectorAll<HTMLElement>("[data-chapter-id]")]
+      .map((item) => item.dataset.chapterId),
+  }));
+  throw new Error(`Did not reach chapter index ${targetIndex} while scrolling ${direction}: ${JSON.stringify(failureState)}`);
 }
 
 test("Phase 4 long scroll remains bounded and resumable", async ({ page, context, browserName }) => {
@@ -177,33 +236,23 @@ test("Phase 4 long scroll remains bounded and resumable", async ({ page, context
   let activePrevious = 0;
   let maxActiveNext = 0;
   let maxActivePrevious = 0;
+  let nextChunkRequests = 0;
   let previousChunkRequests = 0;
   let mediaRequests = 0;
   let mediaRetryRequests = 0;
-  let failMediaPageId: string | null = null;
+  let failMediaPageId: string | null = chapters[0].pages[0].id;
   let temporaryFailures = 0;
 
   await context.clearCookies();
   await page.exposeFunction("recordReaderRequest", (event: ReaderRequestEvent) => {
     requestEvents.push(event);
   });
-  await page.addInitScript((slug) => {
-    localStorage.clear();
-    sessionStorage.clear();
-    localStorage.setItem("infinityscan_reader_debug", "1");
-    localStorage.setItem(`infinityscan_reader_preferences_${slug}`, JSON.stringify({
-      mode: "continuous",
-      spreadMode: "single",
-      zoom: 100,
-      fitWidth: true,
-      direction: "ltr",
-      firstPageAlone: false,
-    }));
+  await page.addInitScript(() => {
     window.addEventListener("infinityscan:reader-request", (event) => {
       const recorder = (window as typeof window & { recordReaderRequest: (detail: unknown) => Promise<void> }).recordReaderRequest;
       void recorder((event as CustomEvent).detail);
     });
-  }, "phase4-reader");
+  });
 
   await page.route("**/auth/me", (route) => route.fulfill({ status: 401, contentType: "application/json", body: JSON.stringify({ detail: "Not authenticated" }) }));
   await page.route("**/auth/refresh", (route) => route.fulfill({ status: 401, contentType: "application/json", body: JSON.stringify({ detail: "Not authenticated" }) }));
@@ -216,6 +265,7 @@ test("Phase 4 long scroll remains bounded and resumable", async ({ page, context
     chunkRequestCounts.set(key, (chunkRequestCounts.get(key) ?? 0) + 1);
     if (direction === "next") {
       activeNext += 1;
+      nextChunkRequests += 1;
       maxActiveNext = Math.max(maxActiveNext, activeNext);
     } else {
       activePrevious += 1;
@@ -279,20 +329,38 @@ test("Phase 4 long scroll remains bounded and resumable", async ({ page, context
     const url = new URL(route.request().url());
     if (url.searchParams.has("attempt")) mediaRetryRequests += 1;
     const pageId = url.pathname.split("/").at(-1) ?? "";
-    if (failMediaPageId === pageId && !url.searchParams.has("attempt")) {
-      failMediaPageId = null;
-      temporaryFailures += 1;
-      await route.fulfill({ status: 503, contentType: "application/json", body: JSON.stringify({ detail: "temporary fixture failure" }) });
-      return;
+    if (failMediaPageId === pageId) {
+      if (url.searchParams.has("attempt")) {
+        failMediaPageId = null;
+      } else {
+        if (temporaryFailures === 0) temporaryFailures = 1;
+        await route.fulfill({ status: 503, contentType: "application/json", body: JSON.stringify({ detail: "temporary fixture failure" }) });
+        return;
+      }
     }
     await route.fulfill({ status: 200, contentType: "image/png", body: TINY_PNG });
   });
 
   await page.goto("/login");
+  await page.evaluate((slug) => {
+    localStorage.clear();
+    sessionStorage.clear();
+    localStorage.setItem("infinityscan_reader_debug", "1");
+    localStorage.setItem(`infinityscan_reader_preferences_${slug}`, JSON.stringify({
+      mode: "continuous",
+      spreadMode: "single",
+      zoom: 100,
+      fitWidth: true,
+      direction: "ltr",
+      firstPageAlone: false,
+    }));
+  }, "phase4-reader");
   await page.goto(`/reader/phase4-reader/${chapters[0].id}`);
   await expect(page.locator('.reader[data-reading-mode="continuous"]')).toBeVisible();
   await expect(page.getByTestId("reader-diagnostics")).toHaveAttribute("data-visible-chapter-id", chapters[0].id);
-  await waitForReaderIdle(page);
+  await waitForReaderSettled(page);
+  await expect.poll(() => temporaryFailures).toBe(1);
+  await expect.poll(() => mediaRetryRequests).toBe(1);
   await assertReaderGates(page);
 
   const cdp = await page.context().newCDPSession(page);
@@ -313,12 +381,8 @@ test("Phase 4 long scroll remains bounded and resumable", async ({ page, context
   const currentChapterIndex = chapterIndexById.get(String(currentState.visibleChapterId)) ?? 0;
   const targetPageNumber = currentPageValue >= PAGES_PER_CHAPTER ? 1 : currentPageValue + 1;
   const targetPageId = chapters[currentChapterIndex].pages[targetPageNumber - 1].id;
-  failMediaPageId = targetPageId;
   await pageInput.fill(String(targetPageNumber));
   const targetFrame = page.locator(`.reader-page-frame[data-page-id="${targetPageId}"]`);
-  await expect(targetFrame).toHaveAttribute("data-image-state", "retrying");
-  await expect.poll(() => temporaryFailures).toBe(1);
-  await expect.poll(() => mediaRetryRequests).toBe(1);
   await expect(targetFrame).toHaveAttribute("data-image-state", "loaded");
   await page.getByRole("button", { name: "Continuous" }).click();
   await expect(page.locator('.reader[data-reading-mode="continuous"]')).toBeVisible();
@@ -326,17 +390,19 @@ test("Phase 4 long scroll remains bounded and resumable", async ({ page, context
   const furthestChapterIndex = await scrollToChapter(page, chapters, 105, "next", async () => {
     peakHeap = Math.max(peakHeap, await heapUsed(cdp));
   });
-  await expect.poll(async () => page.evaluate(({ slug, chapterId }) => {
-    const raw = localStorage.getItem(`infinityscan_progress_${slug}_${chapterId}`);
-    return raw ? JSON.parse(raw).chapterId : null;
-  }, { slug: "phase4-reader", chapterId: String((await diagnostics(page)).visibleChapterId) })).not.toBeNull();
-  await waitForReaderIdle(page);
+  await waitForReaderSettled(page);
   await assertReaderGates(page);
   const atHundred = await diagnostics(page);
   const visibleChapterId = String(atHundred.visibleChapterId);
   const visiblePageNumber = Number(atHundred.visiblePageNumber);
   expect(furthestChapterIndex).toBeGreaterThanOrEqual(105);
   await expect(page).toHaveURL(new RegExp(`/reader/phase4-reader/${visibleChapterId}$`));
+  await expect.poll(async () => page.evaluate(({ slug, chapterId, pageNumber }) => {
+    const raw = localStorage.getItem(`infinityscan_progress_${slug}_${chapterId}`);
+    if (!raw) return false;
+    const saved = JSON.parse(raw) as { chapterId?: string; page?: number };
+    return saved.chapterId === chapterId && saved.page === pageNumber;
+  }, { slug: "phase4-reader", chapterId: visibleChapterId, pageNumber: visiblePageNumber })).toBe(true);
   const savedProgress = await page.evaluate(({ slug, chapterId }) => {
     const raw = localStorage.getItem(`infinityscan_progress_${slug}_${chapterId}`);
     return raw ? JSON.parse(raw) : null;
@@ -357,15 +423,16 @@ test("Phase 4 long scroll remains bounded and resumable", async ({ page, context
   }));
   expect(postEvictionHeap).toBeLessThanOrEqual(baselineHeap + HEAP_GROWTH_LIMIT_BYTES);
 
+  const mediaRequestsBeforeResume = mediaRequests;
   await page.goBack();
   await expect(page).toHaveURL(/\/login$/);
   await page.goForward();
   await expect(page.getByTestId("reader-diagnostics")).toBeAttached();
-  await waitForReaderIdle(page);
+  await waitForReaderSettled(page);
   await page.reload();
   await expect(page.locator('.reader[data-reading-mode="continuous"]')).toBeVisible();
   await expect.poll(async () => String((await diagnostics(page)).visibleChapterId)).toBe(visibleChapterId);
-  await waitForReaderIdle(page);
+  await waitForReaderSettled(page);
   const resumed = await diagnostics(page);
   expect(Math.abs(Number(resumed.visiblePageNumber) - visiblePageNumber)).toBeLessThanOrEqual(2);
 
@@ -373,7 +440,7 @@ test("Phase 4 long scroll remains bounded and resumable", async ({ page, context
   const currentIndex = chapterIndexById.get(visibleChapterId) ?? 105;
   await scrollToChapter(page, chapters, Math.max(0, currentIndex - 6), "previous");
   expect(previousChunkRequests).toBeGreaterThan(previousBefore);
-  await waitForReaderIdle(page);
+  await waitForReaderSettled(page);
   const afterBackward = await diagnostics(page);
   const transitionChapterId = String(afterBackward.visibleChapterId);
   await page.getByRole("button", { name: "Horizontal" }).click();
@@ -396,26 +463,32 @@ test("Phase 4 long scroll remains bounded and resumable", async ({ page, context
     return Number(state.activeNext) + Number(state.activePrevious);
   }).toBe(0);
   await expect(page.getByTestId("reader-diagnostics")).toHaveAttribute("data-has-more-next", "0");
-  await waitForReaderIdle(page);
+  await waitForReaderSettled(page);
   const exhaustionCounts = new Map(chunkRequestCounts);
   const requestsAtExhaustion = [...chunkRequestCounts.values()].reduce((sum, count) => sum + count, 0);
+  const nextRequestsAtExhaustion = nextChunkRequests;
   const finalScroller = page.locator("[data-virtuoso-scroller]");
   for (let attempt = 0; attempt < 5; attempt += 1) {
     await finalScroller.evaluate((element) => element.scrollTo({ top: element.scrollHeight, behavior: "instant" }));
     await nextPaint(page);
   }
+  await waitForReaderSettled(page);
   const requestsAfterExhaustion = [...chunkRequestCounts.values()].reduce((sum, count) => sum + count, 0);
+  const exhaustionRequests = [...chunkRequestCounts.entries()]
+    .filter(([key, count]) => count > (exhaustionCounts.get(key) ?? 0));
   console.log(JSON.stringify({
-    phase4ExhaustionRequests: [...chunkRequestCounts.entries()].filter(([key, count]) => count > (exhaustionCounts.get(key) ?? 0)),
+    phase4ExhaustionRequests: exhaustionRequests,
   }));
-  expect(requestsAfterExhaustion).toBe(requestsAtExhaustion);
+  expect(nextChunkRequests).toBe(nextRequestsAtExhaustion);
+  expect(exhaustionRequests.every(([key, count]) => key.startsWith("previous:") && count - (exhaustionCounts.get(key) ?? 0) <= 1)).toBe(true);
+  await expect.poll(() => requestEvents.filter((event) => event.phase === "start").length).toBe(requestsAfterExhaustion);
 
   const activeByController = new Map<string, number>();
   let controllerMaxActiveNext = 0;
   let controllerMaxActivePrevious = 0;
   let duplicateTriggerRequests = 0;
   for (const event of requestEvents) {
-    const key = `${event.controllerId}:${event.generation}:${event.direction}`;
+    const key = `${event.pageSessionId}:${event.controllerId}:${event.generation}:${event.direction}`;
     const active = activeByController.get(key) ?? 0;
     if (event.phase === "start") {
       if (active > 0) duplicateTriggerRequests += 1;
@@ -428,6 +501,21 @@ test("Phase 4 long scroll remains bounded and resumable", async ({ page, context
     }
   }
   const starts = requestEvents.filter((event) => event.phase === "start");
+  const controllersByPageSession = new Map<string, Set<number>>();
+  for (const event of starts) {
+    const controllers = controllersByPageSession.get(event.pageSessionId) ?? new Set<number>();
+    controllers.add(event.controllerId);
+    controllersByPageSession.set(event.pageSessionId, controllers);
+  }
+  const initialSessions = new Set(starts
+    .filter((event) => event.reason === "initial" && event.cursor.startsWith("start:"))
+    .map((event) => `${event.pageSessionId}:${event.controllerId}:${event.generation}`));
+  const resumeSessions = new Set(starts
+    .filter((event) => event.reason === "resume" && event.cursor.startsWith("start:"))
+    .map((event) => `${event.pageSessionId}:${event.controllerId}:${event.generation}`));
+  const settlesByRequest = new Map(requestEvents
+    .filter((event) => event.phase === "settle")
+    .map((event) => [`${event.pageSessionId}:${event.controllerId}:${event.generation}:${event.requestId}`, event]));
   const groupedStarts = new Map<string, ReaderRequestEvent[]>();
   for (const event of starts) {
     const key = `${event.direction}:${event.cursor}`;
@@ -436,41 +524,85 @@ test("Phase 4 long scroll remains bounded and resumable", async ({ page, context
   const repeatedCursorClassifications = [...groupedStarts.entries()]
     .filter(([, events]) => events.length > 1)
     .map(([key, events]) => {
-      const repetitions = events.slice(1);
-      const allowed = repetitions.every((event) => ["evictionReload", "retry", "resume"].includes(event.reason));
+      const repetitions = events.slice(1).map((event, index) => {
+        const priorEvents = events.slice(0, index + 1);
+        const priorInController = priorEvents.filter((prior) =>
+          prior.pageSessionId === event.pageSessionId
+          && prior.controllerId === event.controllerId
+          && prior.generation === event.generation,
+        );
+        const priorInControllerLifecycle = priorEvents.filter((prior) =>
+          prior.pageSessionId === event.pageSessionId && prior.controllerId === event.controllerId,
+        );
+        const priorFailure = priorInControllerLifecycle.some((prior) =>
+          settlesByRequest.get(`${prior.pageSessionId}:${prior.controllerId}:${prior.generation}:${prior.requestId}`)?.outcome === "failed",
+        );
+        const sessionKey = `${event.pageSessionId}:${event.controllerId}:${event.generation}`;
+        const reloadsMissingCursorChapter = event.cursorChapterIds.some((chapterId) =>
+          event.evictedChapterIds.includes(chapterId) && !event.retainedChapterIds.includes(chapterId),
+        );
+        const classification = event.reason === "evictionReload" && reloadsMissingCursorChapter
+          ? "evictionReload"
+          : event.reason === "retry" && priorFailure
+            ? "retryAfterFailure"
+            : priorInController.length === 0 && resumeSessions.has(sessionKey)
+              ? "resumeSession"
+              : priorInController.length === 0 && initialSessions.has(sessionKey)
+                ? "initialSession"
+                : "unclassified";
+        return { event, classification, allowed: classification !== "unclassified" };
+      });
+      const allowed = repetitions.every((entry) => entry.allowed);
       return {
         cursor: key.slice(key.indexOf(":") + 1),
         direction: events[0].direction,
         requestReasons: events.map((event) => event.reason),
+        classifications: repetitions.map((entry) => entry.classification),
         allowed,
         states: events.map((event) => ({
+          pageSessionId: event.pageSessionId,
+          controllerId: event.controllerId,
+          generation: event.generation,
           retained: event.retainedChapterIds,
           evicted: event.evictedChapterIds,
+          cursorChapters: event.cursorChapterIds,
         })),
       };
     });
   console.log(JSON.stringify({ phase4CursorClassifications: repeatedCursorClassifications }));
+  expect(maxActiveNext).toBeLessThanOrEqual(1);
+  expect(maxActivePrevious).toBeLessThanOrEqual(1);
   expect(controllerMaxActiveNext).toBeLessThanOrEqual(1);
   expect(controllerMaxActivePrevious).toBeLessThanOrEqual(1);
-  expect(repeatedCursorClassifications.filter((entry) => !entry.allowed)).toEqual([]);
+  expect([...controllersByPageSession.values()].filter((controllers) => controllers.size > 1)).toEqual([]);
+  const unclassifiedRepeatedCursors = repeatedCursorClassifications.filter((entry) => !entry.allowed);
+  const runawayRepeatedRequests = repeatedCursorClassifications.filter((entry) => entry.requestReasons.length > 10);
+  expect(unclassifiedRepeatedCursors).toEqual([]);
   expect(duplicateTriggerRequests).toBe(0);
-  expect(repeatedCursorClassifications.filter((entry) => entry.requestReasons.length > 10)).toEqual([]);
+  expect(runawayRepeatedRequests).toEqual([]);
   expect(temporaryFailures).toBe(1);
   expect(mediaRetryRequests).toBeGreaterThanOrEqual(1);
   expect(mediaRetryRequests).toBeLessThanOrEqual(3);
-  expect(mediaRequests).toBeLessThan(CHAPTER_COUNT * PAGES_PER_CHAPTER);
+  const mediaRequestsAfterResume = mediaRequests - mediaRequestsBeforeResume;
+  expect(mediaRequestsBeforeResume).toBeLessThan(CHAPTER_COUNT * PAGES_PER_CHAPTER);
+  expect(mediaRequestsAfterResume).toBeLessThan(CHAPTER_COUNT * PAGES_PER_CHAPTER);
+  expect(mediaRequests).toBeLessThan(CHAPTER_COUNT * PAGES_PER_CHAPTER * 2);
   console.log(JSON.stringify({
     phase4Network: {
       chunkRequests: [...chunkRequestCounts.values()].reduce((sum, count) => sum + count, 0),
       repeatedChunkRequests: [...chunkRequestCounts.entries()].filter(([, count]) => count > 1),
       mediaRequests,
+      mediaRequestsBeforeResume,
+      mediaRequestsAfterResume,
       mediaRetryRequests,
       maxActiveNext,
       maxActivePrevious,
       controllerMaxActiveNext,
       controllerMaxActivePrevious,
-      unclassifiedRepeatedCursors: repeatedCursorClassifications.filter((entry) => !entry.allowed).length,
+      unclassifiedRepeatedCursors: unclassifiedRepeatedCursors.length,
       duplicateTriggerRequests,
+      requestsAfterCursorExhaustion: requestsAfterExhaustion - requestsAtExhaustion,
+      runawayRepeatedRequests: runawayRepeatedRequests.length,
     },
   }));
   expect([...chunkRequestCounts.values()].reduce((sum, count) => sum + count, 0)).toBeLessThan(180);

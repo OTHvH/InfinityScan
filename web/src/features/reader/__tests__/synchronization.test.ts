@@ -84,6 +84,7 @@ describe("visible reader item selection", () => {
     expect(visible?.chapterId).toBe("chapter-b");
     expect(visible?.pageId).toBe("chapter-b-page-1");
   });
+
 });
 
 describe("reader URL synchronization", () => {

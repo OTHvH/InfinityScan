@@ -1,5 +1,6 @@
 import { ApiError } from "@/lib/api";
 import { buildReaderItems } from "./items";
+import { evictCachedPageImage } from "./media-cache";
 import type {
   ReaderChapter,
   ReaderChunkResponse,
@@ -17,6 +18,7 @@ export const MAX_RETAINED_PAGES = 250;
 export const RETAIN_BEHIND_VISIBLE = 3;
 export const RETAIN_AHEAD_VISIBLE = 5;
 const INITIAL_ITEM_INDEX = 100_000;
+const CHAPTERS_PER_REQUEST = 2;
 
 export interface ReaderRetentionConfig {
   maxRetainedChapters: number;
@@ -48,6 +50,7 @@ let controllerSequence = 0;
 
 export interface ReaderRequestDebugEvent {
   phase: "start" | "settle";
+  pageSessionId: string;
   controllerId: number;
   generation: number;
   requestId: number;
@@ -57,11 +60,16 @@ export interface ReaderRequestDebugEvent {
   outcome?: "succeeded" | "failed" | "cancelled";
   retainedChapterIds: string[];
   evictedChapterIds: string[];
+  cursorChapterIds: string[];
 }
 
-function emitRequestDebug(event: ReaderRequestDebugEvent): void {
-  if (typeof window === "undefined" || localStorage.getItem("infinityscan_reader_debug") !== "1") return;
-  window.dispatchEvent(new CustomEvent("infinityscan:reader-request", { detail: event }));
+const pageSessionId = typeof performance === "undefined" ? "server" : String(performance.timeOrigin);
+
+function emitRequestDebug(event: Omit<ReaderRequestDebugEvent, "pageSessionId">): void {
+  if (typeof window === "undefined" || window.localStorage?.getItem("infinityscan_reader_debug") !== "1") return;
+  window.dispatchEvent(new CustomEvent("infinityscan:reader-request", {
+    detail: { ...event, pageSessionId },
+  }));
 }
 
 function initialState(): ReaderFeedState {
@@ -126,7 +134,7 @@ export class ReaderFeedController {
   loadInitial(
     seriesSlug: string,
     chapterId: string,
-    reason: Extract<ReaderRequestReason, "initial" | "resume"> = "initial",
+    reason: Extract<ReaderRequestReason, "initial" | "resume" | "retry"> = "initial",
   ): Promise<ReaderChunkResponse> {
     this.resetForRequest();
     this.state = { ...initialState(), initialChapterId: chapterId, loadingInitial: true };
@@ -138,7 +146,7 @@ export class ReaderFeedController {
       seriesSlug,
       startChapterId: chapterId,
       direction: "next",
-      limit: 2,
+      limit: CHAPTERS_PER_REQUEST,
       signal: this.controller.signal,
       reason,
     });
@@ -168,6 +176,7 @@ export class ReaderFeedController {
           outcome,
           retainedChapterIds: [...this.state.orderedChapterIds],
           evictedChapterIds: [...this.evictedChapterIds],
+          cursorChapterIds: [],
         });
         if (this.inFlight.get("next") === trackedPromise) {
           this.inFlight.delete("next");
@@ -188,6 +197,7 @@ export class ReaderFeedController {
       reason,
       retainedChapterIds: [],
       evictedChapterIds: [...this.evictedChapterIds],
+      cursorChapterIds: [],
     });
     return trackedPromise;
   }
@@ -203,7 +213,7 @@ export class ReaderFeedController {
   retry(): Promise<ReaderChunkResponse> | null {
     const retryState = this.state.retryState;
     if (!retryState) return null;
-    if (retryState.kind === "initial") return this.loadInitial(retryState.seriesSlug, retryState.chapterId, "initial");
+    if (retryState.kind === "initial") return this.loadInitial(retryState.seriesSlug, retryState.chapterId, "retry");
     return this.load(retryState.kind, "retry");
   }
 
@@ -257,7 +267,7 @@ export class ReaderFeedController {
     const existing = this.inFlight.get(direction);
     if (existing) return existing;
     const series = this.state.series;
-    if (!cursor || !canLoad || !series || !this.state.initialChapterId) return null;
+    if (!cursor || !canLoad || !series || !this.state.initialChapterId || !this.hasEvictionRoom(direction)) return null;
     const requestGeneration = this.generation;
     this.state = {
       ...this.state,
@@ -276,7 +286,7 @@ export class ReaderFeedController {
       seriesSlug: series.slug,
       cursor,
       direction,
-      limit: 2,
+      limit: CHAPTERS_PER_REQUEST,
       signal: this.controller.signal,
       reason,
     });
@@ -315,6 +325,7 @@ export class ReaderFeedController {
           outcome,
           retainedChapterIds: [...this.state.orderedChapterIds],
           evictedChapterIds: [...this.evictedChapterIds],
+          cursorChapterIds: [...(this.cursorHistory.get(cursor) ?? [])],
         });
         if (this.inFlight.get(direction) === trackedPromise) {
           this.inFlight.delete(direction);
@@ -335,12 +346,30 @@ export class ReaderFeedController {
       reason,
       retainedChapterIds: [...this.state.orderedChapterIds],
       evictedChapterIds: [...this.evictedChapterIds],
+      cursorChapterIds: [...(priorChapterIds ?? [])],
     });
     this.publish();
     return trackedPromise;
   }
 
+  private hasEvictionRoom(direction: ReaderDirection): boolean {
+    const chapterIds = this.state.orderedChapterIds;
+    const requiredEvictions = Math.max(
+      0,
+      chapterIds.length + CHAPTERS_PER_REQUEST - this.retention.maxRetainedChapters,
+    );
+    if (requiredEvictions === 0) return true;
+    const visibleIndex = chapterIds.indexOf(this.state.visibleChapterId ?? "");
+    if (visibleIndex < 0) return false;
+    const evictableIds = direction === "next"
+      ? chapterIds.slice(0, Math.max(0, visibleIndex - this.retention.retainBehindVisible))
+      : chapterIds.slice(Math.min(chapterIds.length, visibleIndex + this.retention.retainAheadVisible + 1));
+    return evictableIds.filter((id) => !this.protectedChapters.has(id)).length >= requiredEvictions;
+  }
+
   private merge(response: ReaderChunkResponse, direction: ReaderDirection, initial: boolean): void {
+    const oversized = response.chapters.find((chapter) => chapter.pages.length > this.retention.maxRetainedPages);
+    if (oversized) throw new Error(`Chapter ${oversized.id} exceeds the reader page retention limit`);
     const incomingById = new Map(response.chapters.map((chapter) => [chapter.id, chapter]));
     const currentById = { ...this.state.chaptersById };
     for (const [id, chapter] of incomingById) currentById[id] = mergeChapter(currentById[id], chapter);
@@ -360,16 +389,25 @@ export class ReaderFeedController {
     }
     let firstItemIndex = this.state.firstItemIndex;
     if (direction === "previous" && !initial) firstItemIndex -= countItemsForIds(novelIds, currentById);
-    const trimmed = this.trimWindow(orderedIds, currentById, firstItemIndex, new Set(incomingIds));
+    const trimmed = this.trimWindow(
+      orderedIds,
+      currentById,
+      firstItemIndex,
+      new Set(incomingIds),
+      initial || direction === "previous" ? "end" : "start",
+    );
     orderedIds = trimmed.orderedIds;
     firstItemIndex = trimmed.firstItemIndex;
+    const visibleChapterId = this.state.visibleChapterId && orderedIds.includes(this.state.visibleChapterId)
+      ? this.state.visibleChapterId
+      : incomingIds.find((id) => orderedIds.includes(id)) ?? orderedIds[0] ?? null;
     this.state = this.withEdgeMetadata({
       ...this.state,
       series: response.series,
       chaptersById: Object.fromEntries(orderedIds.map((id) => [id, currentById[id]])),
       orderedChapterIds: orderedIds,
       items: buildReaderItems(currentById, orderedIds),
-      visibleChapterId: this.state.visibleChapterId ?? incomingIds[0] ?? null,
+      visibleChapterId,
       initialChapterId: this.state.initialChapterId,
       firstItemIndex: wasEmpty && initial ? INITIAL_ITEM_INDEX : firstItemIndex,
     }, orderedIds);
@@ -402,6 +440,7 @@ export class ReaderFeedController {
     chaptersById: Record<string, ReaderChapter>,
     initialItemIndex: number,
     protectedIds = new Set<string>(),
+    overflowEvictionEdge: "start" | "end" | null = null,
   ): { orderedIds: string[]; firstItemIndex: number } {
     const orderedIds = [...initialIds];
     let firstItemIndex = initialItemIndex;
@@ -419,15 +458,22 @@ export class ReaderFeedController {
         orderedIds.length,
         currentVisibleIndex + this.retention.retainAheadVisible + 1,
       );
-      const candidates = orderedIds
+      let candidates = orderedIds
         .map((id, index) => ({ id, index }))
         .filter(({ id, index }) =>
           id !== this.state.visibleChapterId &&
           !protectedIds.has(id) &&
           !this.protectedChapters.has(id) &&
           (index === 0 || index === orderedIds.length - 1) &&
-          (orderedIds.length > this.retention.maxRetainedChapters || index < keepStart || index >= keepEnd),
+          (orderedIds.length > this.retention.maxRetainedChapters
+            || countUniquePages(orderedIds, chaptersById) > this.retention.maxRetainedPages
+            || index < keepStart
+            || index >= keepEnd),
         );
+      if (candidates.length === 0 && protectedIds.size > 0 && overflowEvictionEdge) {
+        const index = overflowEvictionEdge === "start" ? 0 : orderedIds.length - 1;
+        candidates = [{ id: orderedIds[index], index }];
+      }
       if (candidates.length === 0) break;
       const candidate = candidates.reduce((furthest, current) =>
         Math.abs(current.index - currentVisibleIndex) > Math.abs(furthest.index - currentVisibleIndex)
@@ -447,6 +493,7 @@ export class ReaderFeedController {
     const pages = chapter?.pages ?? [];
     this.onEvict?.(pages);
     for (const page of pages) {
+      evictCachedPageImage(page.id);
       const cleanups = this.pageCleanups.get(page.id);
       cleanups?.forEach((cleanup) => cleanup());
       this.pageCleanups.delete(page.id);
@@ -481,6 +528,9 @@ export class ReaderFeedController {
   }
 
   private resetForRequest(): void {
+    for (const chapter of Object.values(this.state.chaptersById)) {
+      for (const page of chapter.pages) evictCachedPageImage(page.id);
+    }
     this.generation += 1;
     this.controller.abort();
     this.controller = new AbortController();

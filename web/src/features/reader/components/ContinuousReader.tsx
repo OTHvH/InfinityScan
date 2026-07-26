@@ -1,6 +1,6 @@
 "use client";
 
-import { memo, useCallback, useEffect, useRef } from "react";
+import { memo, useCallback, useEffect, useRef, useState } from "react";
 import { Virtuoso, type ListRange } from "react-virtuoso";
 import { ChapterSeparator } from "./ChapterSeparator";
 import { ReaderErrorFooter } from "./ReaderErrorFooter";
@@ -50,6 +50,7 @@ function ContinuousReaderView(props: ContinuousReaderProps) {
     onLoadPrevious,
     onRetry,
   } = props;
+  const [initialTopMostItemIndex] = useState(props.initialTopMostItemIndex);
   const nextRequestRef = useRef<Promise<unknown> | null>(null);
   const triggerNext = useCallback((reason: Extract<ReaderRequestReason, "endReached" | "footerObserver">) => {
     if (!hasMoreNext || loadingNext || nextRequestRef.current) return;
@@ -70,12 +71,11 @@ function ContinuousReaderView(props: ContinuousReaderProps) {
   const triggerRetry = useCallback(() => {
     void onRetry()?.catch(() => undefined);
   }, [onRetry]);
-
   return (
     <Virtuoso
       data={props.items}
       firstItemIndex={props.firstItemIndex}
-      initialTopMostItemIndex={props.initialTopMostItemIndex}
+      initialTopMostItemIndex={initialTopMostItemIndex}
       increaseViewportBy={{ top: 700, bottom: 1200 }}
       computeItemKey={(_, item) => item.key}
       scrollSeekConfiguration={{

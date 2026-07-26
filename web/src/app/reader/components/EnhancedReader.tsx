@@ -63,7 +63,9 @@ export default function EnhancedReader({ params }: ReaderProps) {
   const [progressStatus, setProgressStatus] = useState<ProgressStatus>("saved");
   const resumeStarted = useRef(false);
   const nextRequestReason = useRef<Extract<ReaderRequestReason, "modeTransition"> | null>(null);
-  const [urlSynchronizer] = useState(() => new ReaderUrlSynchronizer(router, seriesSlug, requestedChapterId));
+  const [urlSynchronizer] = useState(() => new ReaderUrlSynchronizer({
+    replace: (href) => History.prototype.replaceState.call(window.history, window.history.state, "", href),
+  }, seriesSlug, requestedChapterId));
   const [progressController] = useState(() => new ReaderProgressController({
     seriesSlug,
     authenticated: !!useAuthStore.getState().user,

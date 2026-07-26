@@ -6,6 +6,7 @@
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
+    "postinstall": "node scripts/patch-brace-expansion.mjs",
     "lint": "eslint",
     "test": "vitest run",
     "test:watch": "vitest",
@@ -17,7 +18,7 @@
   },
   "dependencies": {
     "@tanstack/react-query": "^5.90.21",
-    "next": "16.2.11",
+    "next": "16.2.12",
     "react": "19.2.4",
     "react-dom": "19.2.4",
     "react-virtuoso": "^4.18.3",
@@ -36,8 +37,9 @@
     "@types/react-dom": "^19",
     "@vitejs/plugin-react": "^6.0.3",
     "babel-plugin-react-compiler": "1.0.0",
+    "brace-expansion": "5.0.8",
     "eslint": "^9",
-    "eslint-config-next": "16.2.11",
+    "eslint-config-next": "16.2.12",
     "jsdom": "^29.1.1",
     "tailwindcss": "^4",
     "typescript": "^5",
@@ -47,6 +49,9 @@
     "next": {
       "postcss": "8.5.22",
       "sharp": "0.35.3"
+    },
+    "minimatch": {
+      "brace-expansion": "5.0.8"
     }
   }
 }

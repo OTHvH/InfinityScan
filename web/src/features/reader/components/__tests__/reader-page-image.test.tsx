@@ -1,6 +1,7 @@
 import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ReaderPage } from "../ReaderPage";
+import { clearReaderPageImageCache } from "../../media-cache";
 import type { ReaderItem } from "../../types";
 
 function page(overrides: Partial<Extract<ReaderItem, { kind: "page" }>> = {}): Extract<ReaderItem, { kind: "page" }> {
@@ -58,6 +59,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  clearReaderPageImageCache();
   vi.useRealTimers();
   vi.unstubAllGlobals();
   vi.restoreAllMocks();
@@ -84,7 +86,7 @@ describe("ReaderPage resilient image loading", () => {
     await waitFor(() => expect(screen.getByRole("img")).toHaveAttribute("src", "blob:reader-page-1"));
     expect(fetchMock).toHaveBeenCalledWith(
       "http://localhost:3000/media/pages/page-id",
-      expect.objectContaining({ credentials: "include", signal: expect.any(AbortSignal) }),
+      expect.objectContaining({ credentials: "omit", signal: expect.any(AbortSignal) }),
     );
     expect(screen.getByRole("img").getAttribute("src")).not.toContain("objects.");
     expect(consoleSpy).not.toHaveBeenCalled();
@@ -101,6 +103,18 @@ describe("ReaderPage resilient image loading", () => {
     expect(decodeMock).toHaveBeenCalledOnce();
     expect(image).toHaveClass("loaded");
     expect(image.parentElement?.querySelector(".reader-page-skeleton")).not.toBeInTheDocument();
+  });
+
+  it("reuses a cached blob URL when virtualization remounts the page", async () => {
+    fetchMock.mockResolvedValue(mediaResponse());
+    const first = render(<ReaderPage item={page()} zoom={100} fitWidth />);
+    await waitFor(() => expect(screen.getByRole("img")).toHaveAttribute("src", "blob:reader-page-1"));
+    first.unmount();
+
+    render(<ReaderPage item={page()} zoom={100} fitWidth />);
+    await waitFor(() => expect(screen.getByRole("img")).toHaveAttribute("src", "blob:reader-page-1"));
+    expect(fetchMock).toHaveBeenCalledOnce();
+    expect(URL.revokeObjectURL).not.toHaveBeenCalledWith("blob:reader-page-1");
   });
 
   it("automatically retries a temporary failure and then succeeds", async () => {

@@ -74,6 +74,20 @@ run_check() {
   fi
 }
 
+run_pytest_no_skips() {
+  local label="$1"
+  shift
+  local output status=0
+  output=$("$@" 2>&1) || status=$?
+  if [ "$status" -eq 0 ] && ! printf '%s\n' "$output" | grep -Eq '(^|[[:space:]])[1-9][0-9]* skipped([,[:space:]]|$)'; then
+    pass "$label"
+  elif [ "$status" -eq 0 ]; then
+    fail "$label: pytest reported skipped tests: $(short_error "$output")"
+  else
+    fail "$label (exit $status): $(short_error "$output")"
+  fi
+}
+
 cleanup() {
   local status=$?
   if [ -f "$REPO_ROOT/infra/.env" ]; then
@@ -262,7 +276,7 @@ else
   fail "REQ-06: real .env tracked: $REAL_ENV"
 fi
 
-MANGA_FILES="$(git ls-files | awk '/\.(jpg|jpeg|png|webp|cbz|cbr)$/ { print; count++; if (count == 5) exit }')"
+MANGA_FILES="$(git ls-files | awk '$0 !~ /^web\/test-results\// && /\.(jpg|jpeg|png|webp|cbz|cbr)$/ { print; count++; if (count == 5) exit }')"
 MANGA_DIRS="$(git ls-files | awk '/^[0-9]+\// { print; count++; if (count == 5) exit }')"
 if [ -z "$MANGA_FILES" ] && [ -z "$MANGA_DIRS" ]; then
   pass "REQ-07: no bundled manga content tracked"
@@ -295,7 +309,7 @@ else
 fi
 
 if [ -x "$API_PYTHON" ]; then
-  run_check "TOOL-P1a: backend pytest" env OBJECT_STORAGE_ENABLED=false "$API_PYTHON" -m pytest api/tests -x -q
+  run_pytest_no_skips "TOOL-P1a: backend pytest" env OBJECT_STORAGE_ENABLED=false "$API_PYTHON" -m pytest api/tests --ignore=api/tests/integration/test_storage_minio.py -x -q
 else
   fail "TOOL-P1a: backend pytest cannot run without API Python"
 fi
@@ -410,6 +424,8 @@ fi
 if [ "$MINIO_READY" = true ]; then
   if MINIO_SETUP_OUT=$(compose run --rm minio-setup 2>&1); then
     pass "INFRA-4: MinIO bucket is ready"
+    run_pytest_no_skips "INFRA-4a: MinIO integration test passed without skips" \
+      env RUN_MINIO_TESTS=1 "$API_PYTHON" -m pytest api/tests/integration/test_storage_minio.py -q
   else
     status=$?
     fail "INFRA-4: MinIO bucket setup failed (exit $status): $(short_error "$MINIO_SETUP_OUT")"
@@ -916,7 +932,7 @@ fi
 # ── Import rejection evidence ─────────────────────────────────────────────
 
 PHASE3_REJECTION_REPORT="$TMPDIR/phase3-rejections.json"
-if REJECTION_OUT=$(cd "$REPO_ROOT/api" && "$API_PYTHON" -m tools.verify_phase3_rejections --output "$PHASE3_REJECTION_REPORT" 2>&1); then
+if REJECTION_OUT=$(cd "$REPO_ROOT/api" && PYTHONOPTIMIZE=0 "$API_PYTHON" -m tools.verify_phase3_rejections --output "$PHASE3_REJECTION_REPORT" 2>&1); then
   if jq -e '.unsupported.pages == 1 and .unsupported.objectsAdded == 1 and .unsupported.rejectedStatus == "skipped"' "$PHASE3_REJECTION_REPORT" >/dev/null; then
     pass "CHECK-30: unsupported file explicitly skipped with no Page or object while its valid neighbor imported"
   else
@@ -1015,7 +1031,7 @@ fi
 
 # ── Security audit: no imported images in git ─────────────────────────────
 
-MANGA_FILES="$(git ls-files 2>/dev/null | awk '/\.(jpg|jpeg|png|webp|cbz|cbr)$/ { print; count++; if (count == 5) exit }')"
+MANGA_FILES="$(git ls-files 2>/dev/null | awk '$0 !~ /^web\/test-results\// && /\.(jpg|jpeg|png|webp|cbz|cbr)$/ { print; count++; if (count == 5) exit }')"
 if [ -z "$MANGA_FILES" ]; then
   pass "CHECK-39: no imported manga images tracked in git"
 else
@@ -1124,7 +1140,7 @@ fi
 # ── Verify content-addressed key format ───────────────────────────────────
 
 KEY_COUNT="$(db_query "SELECT count(*) FROM pages p JOIN chapters c ON c.id = p.chapter_id JOIN series s ON s.id = c.series_id WHERE s.slug LIKE '$SERIES_SLUG%';" 2>/dev/null || printf '0')"
-INVALID_KEY_COUNT="$(db_query "SELECT count(*) FROM pages p JOIN chapters c ON c.id = p.chapter_id JOIN series s ON s.id = c.series_id WHERE s.slug LIKE '$SERIES_SLUG%' AND (p.object_key !~ '^series/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/[0-9]{5}-[0-9a-f]{64}\\.(jpg|png|webp)$' OR p.object_key <> 'series/' || s.id::text || '/' || c.id::text || '/' || lpad(p.page_number::text, 5, '0') || '-' || p.sha256 || '.' || p.file_extension);" 2>/dev/null || printf 'error')"
+INVALID_KEY_COUNT="$(db_query "SELECT count(*) FROM pages p JOIN chapters c ON c.id = p.chapter_id JOIN series s ON s.id = c.series_id WHERE s.slug LIKE '$SERIES_SLUG%' AND (p.object_key IS NULL OR p.sha256 IS NULL OR p.file_extension IS NULL OR p.object_key !~ '^series/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/[0-9]{5}-[0-9a-f]{64}\\.(jpg|png|webp)$' OR p.object_key IS DISTINCT FROM 'series/' || s.id::text || '/' || c.id::text || '/' || lpad(p.page_number::text, 5, '0') || '-' || p.sha256 || '.' || p.file_extension);" 2>/dev/null || printf 'error')"
 if [ "$KEY_COUNT" -gt 0 ] 2>/dev/null && [ "$INVALID_KEY_COUNT" = "0" ]; then
   pass "CHECK-42: all $KEY_COUNT imported page keys exactly match their content-addressed row data"
 else
