@@ -1,0 +1,44 @@
+name: Full Release Verification
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [phase-5-integrity-security-testing]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  phase1:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - run: scripts/verify-phase1.sh
+  phase2:
+    needs: phase1
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - run: scripts/verify-phase2.sh
+  phase3:
+    needs: phase2
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - run: scripts/verify-phase3.sh
+  phase4:
+    needs: phase3
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - run: scripts/verify-phase4.sh
+  phase5:
+    needs: phase4
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - run: scripts/verify-phase5.sh

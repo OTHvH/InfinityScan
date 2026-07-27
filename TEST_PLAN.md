@@ -250,3 +250,29 @@ cd web && npm run build && npm run test:e2e
 ```bash
 scripts/verify-phase4.sh
 ```
+
+---
+
+## 8. Disaster Recovery and CI Ownership
+
+Task 9 owns the disposable database/object-storage restore drill:
+
+```bash
+scripts/test-disaster-recovery.sh
+```
+
+Task 10 owns layered GitHub Actions checks. Fast CI runs backend/frontend
+quality and dependency checks; integration CI runs the disposable DR drill and
+phase-specific E2E ownership; security CI runs secret, CodeQL, dependency, and
+container scans. No workflow invokes a wildcard Playwright command.
+
+Task 11 owns the final Phase 5 release gate:
+
+```bash
+scripts/verify-phase5.sh
+```
+
+The Phase 5 gate executes Phase 1 through Phase 4 prerequisites sequentially,
+then verifies integrity, recovery, sessions, audit events, backups, workflow
+policy, containers, and cleanup. Required PostgreSQL checks use only explicit
+disposable `TASK11_*` targets.
