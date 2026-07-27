@@ -45,6 +45,7 @@ from providers.base import ProviderError, ProviderSecurityError, ProviderTimeout
 from providers.copymanga import CopyMangaAdapter
 from providers.local import LocalContentAdapter
 from models import (
+    AuditEventOutcome,
     Bookmark,
     Chapter,
     ChapterImportStatus,
@@ -141,10 +142,16 @@ app.state.limiter = limiter
 
 @app.exception_handler(RateLimitExceeded)
 async def _rate_limit_handler(request: Request, exc: RateLimitExceeded) -> JSONResponse:
-    return JSONResponse(
+    from middleware import _record_security_event
+    _record_security_event(request, "rate_limit.denied", "rate_limit_exceeded")
+    response = JSONResponse(
         status_code=429,
         content={"detail": f"Rate limit exceeded: {exc.detail}"},
     )
+    if request.url.path.startswith("/auth/"):
+        response.headers["Cache-Control"] = "no-store"
+        response.headers["Pragma"] = "no-cache"
+    return response
 
 
 app.add_middleware(SlowAPIMiddleware)
@@ -156,14 +163,16 @@ app.add_middleware(
     allow_methods=_cfg.cors_allow_methods,
     allow_headers=_cfg.cors_allow_headers,
     allow_credentials=True,
+    expose_headers=["X-Request-ID"],
 )
 
 # Trusted hosts
 app.add_middleware(TrustedHostMiddleware, allowed_hosts=_cfg.trusted_hosts)
 
 # Custom security middleware
-from middleware import OriginValidationMiddleware, RequestBodyLimitMiddleware, NoCacheAuthMiddleware
+from middleware import OriginValidationMiddleware, RequestBodyLimitMiddleware, NoCacheAuthMiddleware, RequestIDMiddleware
 
+app.add_middleware(RequestIDMiddleware)
 app.add_middleware(NoCacheAuthMiddleware)
 app.add_middleware(RequestBodyLimitMiddleware)
 app.add_middleware(OriginValidationMiddleware)
@@ -849,3 +858,39 @@ def admin_integrity_summary(
     storage = create_object_storage()
     summary = run_checks(db, storage)
     return summary.to_dict()
+
+
+@app.get("/admin/audit-events", summary="List audit events (admin only)")
+def admin_list_audit_events(
+    limit: int = Query(50, ge=1, le=200),
+    cursor: str | None = Query(None),
+    event_type: str | None = Query(None),
+    outcome: AuditEventOutcome | None = Query(None),
+    _admin: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    from audit_events import AuditValidationError, list_events
+
+    try:
+        events, next_cursor = list_events(
+            db, limit=limit, cursor=cursor, event_type=event_type, outcome=outcome
+        )
+    except AuditValidationError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return {
+        "items": [
+            {
+                "id": str(event.id),
+                "created_at": event.created_at.isoformat() if event.created_at else None,
+                "request_id": event.request_id,
+                "actor_user_id": str(event.actor_user_id) if event.actor_user_id else None,
+                "event_type": event.event_type,
+                "outcome": event.outcome.value,
+                "subject_type": event.subject_type,
+                "subject_id": event.subject_id,
+                "metadata": event.event_metadata,
+            }
+            for event in events
+        ],
+        "next_cursor": next_cursor,
+    }

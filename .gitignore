@@ -85,6 +85,12 @@ Desktop.ini
 *.sqlite
 *.sqlite3
 
+# Generated PostgreSQL backup artifacts and manifests
+backups/
+*.dump
+*.dump.age
+*.dump.manifest.json
+
 # ---------------------------------------------------------------------------
 # Local manga / content import directories
 # ---------------------------------------------------------------------------

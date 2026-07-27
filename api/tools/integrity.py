@@ -30,6 +30,7 @@ from sqlalchemy.orm import Session
 
 from database import _get_engine, _get_session_local
 from models import (
+    AuditEventOutcome,
     Bookmark,
     Chapter,
     ChapterImportStatus,
@@ -45,6 +46,7 @@ from models import (
     SourceSeries,
     User,
 )
+from audit_events import record_event_safe
 from settings import get_settings
 from storage import ObjectStorage, create_object_storage
 from storage.base import StorageError
@@ -993,6 +995,16 @@ def repair_safe(
         repaired_count += 1
 
     db.commit()
+    event = record_event_safe(
+        db,
+        event_type="integrity.repaired",
+        outcome=AuditEventOutcome.success,
+        subject_type="integrity_run",
+        subject_id=mode,
+        metadata={"item_count": repaired_count, "status": "completed"},
+    )
+    if event is not None:
+        db.commit()
     storage_report = None
     if storage is not None:
         storage_report = run_storage_integrity(

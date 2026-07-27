@@ -44,13 +44,16 @@ class Settings:
     app_version: str = "0.2.0"
 
     # ── Database ────────────────────────────────────────────────────────
-    database_url: str = field(default_factory=lambda: os.environ.get("DATABASE_URL", ""))
+    database_url: str = field(
+        default_factory=lambda: os.environ.get("DATABASE_URL", ""), repr=False
+    )
 
     # ── JWT / Sessions ──────────────────────────────────────────────────
     secret_key: str = field(
         default_factory=lambda: os.environ.get("JWT_SECRET_KEY")
         or os.environ.get("SECRET_KEY")
-        or secrets.token_hex(32)
+        or secrets.token_hex(32),
+        repr=False,
     )
     jwt_algorithm: str = "HS256"
     jwt_issuer: str = field(default_factory=lambda: os.environ.get("JWT_ISSUER", "infinityscan"))
@@ -72,12 +75,13 @@ class Settings:
     cookie_domain: str | None = field(
         default_factory=lambda: os.environ.get("COOKIE_DOMAIN") or None
     )
-    cookie_path: str = "/"
+    cookie_path: str = field(default_factory=lambda: os.environ.get("COOKIE_PATH", "/"))
 
     # ── CSRF ────────────────────────────────────────────────────────────
     csrf_secret_key: str = field(
         default_factory=lambda: os.environ.get("CSRF_SECRET_KEY")
-        or secrets.token_hex(32)
+        or secrets.token_hex(32),
+        repr=False,
     )
     csrf_header_name: str = "x-csrf-token"
     csrf_token_ttl_seconds: int = int(os.environ.get("CSRF_TOKEN_TTL_SECONDS", "3600"))
@@ -119,7 +123,7 @@ class Settings:
     cors_allow_headers: list[str] = field(
         default_factory=lambda: _csv(
             "CORS_ALLOW_HEADERS",
-            "accept,accept-language,content-type,content-length,authorization,x-csrf-token",
+            "accept,accept-language,content-type,content-length,authorization,x-csrf-token,x-request-id",
         )
     )
 
@@ -143,7 +147,7 @@ class Settings:
         default_factory=lambda: os.environ.get("COPYMANGA_API", "https://api.copymanga.tv").rstrip("/")
     )
     copymanga_token: str = field(
-        default_factory=lambda: os.environ.get("COPYMANGA_TOKEN", "")
+        default_factory=lambda: os.environ.get("COPYMANGA_TOKEN", ""), repr=False
     )
 
     # ── Provider adapter settings ─────────────────────────────────────
@@ -187,10 +191,10 @@ class Settings:
     s3_region: str = field(default_factory=lambda: os.environ.get("S3_REGION", "auto"))
     s3_bucket: str = field(default_factory=lambda: os.environ.get("S3_BUCKET", ""))
     s3_access_key_id: str = field(
-        default_factory=lambda: os.environ.get("S3_ACCESS_KEY_ID", "")
+        default_factory=lambda: os.environ.get("S3_ACCESS_KEY_ID", ""), repr=False
     )
     s3_secret_access_key: str = field(
-        default_factory=lambda: os.environ.get("S3_SECRET_ACCESS_KEY", "")
+        default_factory=lambda: os.environ.get("S3_SECRET_ACCESS_KEY", ""), repr=False
     )
     s3_presign_ttl_seconds: int = field(
         default_factory=lambda: int(os.environ.get("S3_PRESIGN_TTL_SECONDS", "300"))
@@ -218,6 +222,36 @@ class Settings:
     )
     integrity_delete_min_age_seconds: int = field(
         default_factory=lambda: int(os.environ.get("INTEGRITY_DELETE_MIN_AGE_SECONDS", "86400"))
+    )
+    import_pending_stale_seconds: int = field(
+        default_factory=lambda: int(os.environ.get("IMPORT_PENDING_STALE_SECONDS", "300"))
+    )
+    import_scanning_stale_seconds: int = field(
+        default_factory=lambda: int(os.environ.get("IMPORT_SCANNING_STALE_SECONDS", "900"))
+    )
+    import_uploading_stale_seconds: int = field(
+        default_factory=lambda: int(os.environ.get("IMPORT_UPLOADING_STALE_SECONDS", "1800"))
+    )
+    import_verifying_stale_seconds: int = field(
+        default_factory=lambda: int(os.environ.get("IMPORT_VERIFYING_STALE_SECONDS", "900"))
+    )
+    import_lease_seconds: int = field(
+        default_factory=lambda: int(os.environ.get("IMPORT_LEASE_SECONDS", "120"))
+    )
+    import_recovery_batch_size: int = field(
+        default_factory=lambda: int(os.environ.get("IMPORT_RECOVERY_BATCH_SIZE", "25"))
+    )
+    session_retention_days: int = field(
+        default_factory=lambda: int(os.environ.get("SESSION_RETENTION_DAYS", "30"))
+    )
+    session_maintenance_batch_size: int = field(
+        default_factory=lambda: int(os.environ.get("SESSION_MAINTENANCE_BATCH_SIZE", "500"))
+    )
+    audit_retention_days: int = field(
+        default_factory=lambda: int(os.environ.get("AUDIT_RETENTION_DAYS", "365"))
+    )
+    audit_prune_batch_size: int = field(
+        default_factory=lambda: int(os.environ.get("AUDIT_PRUNE_BATCH_SIZE", "500"))
     )
     storage_public_base_url: str | None = field(
         default_factory=lambda: os.environ.get("STORAGE_PUBLIC_BASE_URL") or None
@@ -287,6 +321,8 @@ def _validate_settings(s: Settings) -> None:
         raise ValueError(
             f"COOKIE_SAME_SITE must be 'lax', 'strict', or 'none', got '{s.cookie_same_site}'"
         )
+    if not s.cookie_path.startswith("/"):
+        raise ValueError("COOKIE_PATH must start with '/'")
 
     if s.cookie_same_site == "none" and not s.cookie_secure:
         raise ValueError(
@@ -308,6 +344,29 @@ def _validate_settings(s: Settings) -> None:
         raise ValueError("INTEGRITY_ISSUE_LIMIT must be between 1 and 10000")
     if s.integrity_delete_min_age_seconds < 0:
         raise ValueError("INTEGRITY_DELETE_MIN_AGE_SECONDS must not be negative")
+    stale_thresholds = (
+        s.import_pending_stale_seconds,
+        s.import_scanning_stale_seconds,
+        s.import_uploading_stale_seconds,
+        s.import_verifying_stale_seconds,
+    )
+    if any(value < 1 for value in stale_thresholds):
+        raise ValueError("Import stale thresholds must be positive")
+    if s.import_lease_seconds < 1:
+        raise ValueError("IMPORT_LEASE_SECONDS must be positive")
+    if s.import_recovery_batch_size < 1 or s.import_recovery_batch_size > 1000:
+        raise ValueError("IMPORT_RECOVERY_BATCH_SIZE must be between 1 and 1000")
+    if s.session_retention_days < 0:
+        raise ValueError("SESSION_RETENTION_DAYS must not be negative")
+    if (
+        s.session_maintenance_batch_size < 1
+        or s.session_maintenance_batch_size > 1000
+    ):
+        raise ValueError("SESSION_MAINTENANCE_BATCH_SIZE must be between 1 and 1000")
+    if s.audit_retention_days < 1:
+        raise ValueError("AUDIT_RETENTION_DAYS must be positive")
+    if s.audit_prune_batch_size < 1 or s.audit_prune_batch_size > 1000:
+        raise ValueError("AUDIT_PRUNE_BATCH_SIZE must be between 1 and 1000")
 
     if s.object_storage_enabled:
         required = {

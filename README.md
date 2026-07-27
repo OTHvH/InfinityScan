@@ -152,3 +152,10 @@ code 0, no failures, and no mandatory skips. It then creates disposable
 PostgreSQL and MinIO volumes, verifies the 200-chapter reader fixture and all
 frontend quality gates, measures the long-scroll browser bounds, runs both
 dependency audits, and always removes its containers and volumes.
+
+## PostgreSQL Backups
+
+Production-safe PostgreSQL backup and restore commands are documented in
+[`docs/backup-tooling.md`](docs/backup-tooling.md). They use custom-format
+`pg_dump` archives, manifest checksums, optional age encryption, and refuse
+ambiguous or non-empty restore targets by default.

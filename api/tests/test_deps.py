@@ -245,6 +245,7 @@ class TestGetCurrentSession:
         cfg = get_settings()
         now = datetime.now(timezone.utc)
         payload = {
+            "type": "access",
             "sub": str(user.id),
             "sid": str(uuid.uuid4()),
             "role": user.role.value,
@@ -545,6 +546,7 @@ class TestRequireRole:
         cfg = get_settings()
         now = datetime.now(timezone.utc)
         payload = {
+            "type": "access",
             "sub": str(user.id),
             "sid": str(sid),
             "role": "admin",

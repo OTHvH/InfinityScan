@@ -26,7 +26,9 @@ from sqlalchemy import (
     UniqueConstraint,
     Uuid,
     func,
+    text,
 )
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 
@@ -99,6 +101,12 @@ class ImportJobItemStatus(str, enum.Enum):
     skipped = "skipped"
     failed = "failed"
     quarantined = "quarantined"
+
+
+class AuditEventOutcome(str, enum.Enum):
+    success = "success"
+    failure = "failure"
+    denied = "denied"
 
 
 # ---------------------------------------------------------------------------
@@ -423,6 +431,28 @@ class ImportJob(Base):
             "AND uploaded_count >= 0 AND skipped_count >= 0 AND failed_count >= 0",
             name="ck_import_jobs_nonnegative_counts",
         ).ddl_if(dialect="postgresql"),
+        CheckConstraint(
+            "fencing_token >= 0 AND recovery_attempt_count >= 0",
+            name="ck_import_jobs_recovery_numbers_nonnegative",
+        ).ddl_if(dialect="postgresql"),
+        CheckConstraint(
+            "(lease_owner_id IS NULL) = (lease_expires_at IS NULL)",
+            name="ck_import_jobs_lease_fields_paired",
+        ).ddl_if(dialect="postgresql"),
+        CheckConstraint(
+            "(resume_payload IS NULL OR jsonb_typeof(resume_payload) = 'object') "
+            "AND jsonb_typeof(checkpoint) = 'object'",
+            name="ck_import_jobs_recovery_json_objects",
+        ).ddl_if(dialect="postgresql"),
+        Index(
+            "ix_import_jobs_recovery_candidates",
+            "status",
+            "heartbeat_at",
+            "lease_expires_at",
+            postgresql_where=text(
+                "status IN ('pending', 'scanning', 'uploading', 'verifying')"
+            ),
+        ),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4)
@@ -441,6 +471,15 @@ class ImportJob(Base):
     )
     idempotency_key: Mapped[str] = mapped_column(String(255), nullable=False, unique=True)
     manifest_hash: Mapped[str | None] = mapped_column(String(64))
+    resume_payload: Mapped[dict | None] = mapped_column(
+        JSON().with_variant(JSONB, "postgresql")
+    )
+    checkpoint: Mapped[dict] = mapped_column(
+        JSON().with_variant(JSONB, "postgresql"),
+        nullable=False,
+        default=dict,
+        server_default="{}",
+    )
     series_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
     chapter_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
     page_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
@@ -448,6 +487,14 @@ class ImportJob(Base):
     skipped_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
     failed_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
     error_summary: Mapped[str | None] = mapped_column(Text)
+    heartbeat_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+    lease_owner_id: Mapped[uuid.UUID | None] = mapped_column(Uuid(as_uuid=True))
+    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+    fencing_token: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0, server_default="0")
+    recovery_attempt_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False, index=True)
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
@@ -463,14 +510,32 @@ class ImportJobItem(Base):
     """Per-file state for an import job."""
 
     __tablename__ = "import_job_items"
+    __table_args__ = (
+        UniqueConstraint("job_id", "item_key", name="uq_import_job_items_job_item_key"),
+        CheckConstraint(
+            "attempt_count >= 0",
+            name="ck_import_job_items_attempt_count_nonnegative",
+        ).ddl_if(dialect="postgresql"),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4)
     job_id: Mapped[uuid.UUID] = mapped_column(
         Uuid(as_uuid=True), ForeignKey("import_jobs.id", ondelete="CASCADE"), nullable=False, index=True
     )
     source_reference: Mapped[str] = mapped_column(String(2048), nullable=False)
+    item_key: Mapped[str | None] = mapped_column(String(255))
+    item_kind: Mapped[str | None] = mapped_column(String(32))
+    series_id: Mapped[uuid.UUID | None] = mapped_column(Uuid(as_uuid=True), index=True)
+    chapter_id: Mapped[uuid.UUID | None] = mapped_column(Uuid(as_uuid=True), index=True)
+    page_number: Mapped[int | None] = mapped_column(Integer)
     object_key: Mapped[str] = mapped_column(String(1024), nullable=False)
     sha256: Mapped[str | None] = mapped_column(String(64))
+    byte_size: Mapped[int | None] = mapped_column(BigInteger)
+    mime_type: Mapped[str | None] = mapped_column(String(127))
+    file_extension: Mapped[str | None] = mapped_column(String(16))
+    storage_etag: Mapped[str | None] = mapped_column(String(255))
+    attempt_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    verified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     status: Mapped[ImportJobItemStatus] = mapped_column(
         Enum(ImportJobItemStatus, name="import_job_item_status_enum"),
         nullable=False,
@@ -543,6 +608,40 @@ class RefreshSession(Base):
     user_agent: Mapped[str | None] = mapped_column(String(255))
 
     user: Mapped[User] = relationship("User", back_populates="refresh_sessions")
+
+
+class AuditEvent(Base):
+    """Append-only operational and security event evidence."""
+
+    __tablename__ = "audit_events"
+    __table_args__ = (
+        CheckConstraint("btrim(event_type) <> ''", name="ck_audit_events_event_type_nonempty").ddl_if(dialect="postgresql"),
+        CheckConstraint("jsonb_typeof(metadata) = 'object'", name="ck_audit_events_metadata_object").ddl_if(dialect="postgresql"),
+        CheckConstraint(
+            "(subject_type IS NULL) = (subject_id IS NULL)",
+            name="ck_audit_events_subject_fields_paired",
+        ).ddl_if(dialect="postgresql"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    request_id: Mapped[str | None] = mapped_column(String(128))
+    actor_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL")
+    )
+    event_type: Mapped[str] = mapped_column(String(100), nullable=False)
+    outcome: Mapped[AuditEventOutcome] = mapped_column(
+        Enum(AuditEventOutcome, name="audit_event_outcome_enum"), nullable=False
+    )
+    subject_type: Mapped[str | None] = mapped_column(String(64))
+    subject_id: Mapped[str | None] = mapped_column(String(255))
+    event_metadata: Mapped[dict] = mapped_column(
+        "metadata", JSON().with_variant(JSONB, "postgresql"), nullable=False, default=dict, server_default="{}"
+    )
+
+    actor: Mapped[User | None] = relationship("User")
 
 
 class Bookmark(Base):

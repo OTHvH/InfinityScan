@@ -1,0 +1,55 @@
+{
+  "format": 1,
+  "algorithm": "sha256",
+  "versions_dir": "alembic/versions",
+  "migrations": [
+    {
+      "filename": "alembic/versions/0001_initial_schema.py",
+      "revision": "0001",
+      "down_revision": null,
+      "sha256": "0f73de6696e206097fff6602527a34fa182985ddb07d1e98e65f49b23dcef979"
+    },
+    {
+      "filename": "alembic/versions/0002_refresh_tokens.py",
+      "revision": "0002",
+      "down_revision": "0001",
+      "sha256": "43dce56f36741866ccf3611f8420a2da67e8958c2fa6352dd732a168c4078bd3"
+    },
+    {
+      "filename": "alembic/versions/0003_refresh_sessions.py",
+      "revision": "0003",
+      "down_revision": "0002",
+      "sha256": "f4755d1c30fdb0dbc0ad39217f4e6140ce3ae63f7f53c5f0608ac43e763773e4"
+    },
+    {
+      "filename": "alembic/versions/0004_drop_refresh_tokens.py",
+      "revision": "0004",
+      "down_revision": "0003",
+      "sha256": "a2227c3adf4ef7aef038db32c9dd4eef71149272b6ebc2b26cd3aa2eb7735d48"
+    },
+    {
+      "filename": "alembic/versions/0005_phase3_storage_schema.py",
+      "revision": "0005",
+      "down_revision": "0004",
+      "sha256": "ca43ad12a51cfda6f4d4f2b3fccd5be84543b60e8cdba6e7f09b175717f5df21"
+    },
+    {
+      "filename": "alembic/versions/0006_phase5_integrity_constraints.py",
+      "revision": "0006",
+      "down_revision": "0005",
+      "sha256": "f3992ac97465f3d7b4788a5e528db4e8eb06b11acb2234145ed5746cc2e9cfa5"
+    },
+    {
+      "filename": "alembic/versions/0007_import_recovery.py",
+      "revision": "0007",
+      "down_revision": "0006",
+      "sha256": "ddd7447828c4570d6a3dd3bb7610f0c258f431a0fc0335507d03b4ff4fc7761d"
+    },
+    {
+      "filename": "alembic/versions/0008_audit_events.py",
+      "revision": "0008",
+      "down_revision": "0007",
+      "sha256": "dae62a0327ef4acecfd0c081b01f488de584cf3880105ecf5b2874a0a3662f76"
+    }
+  ]
+}

@@ -17,7 +17,6 @@ import hmac
 import secrets
 import time
 import uuid
-from datetime import datetime, timedelta, timezone
 
 import jwt
 from starlette.responses import Response
@@ -87,15 +86,65 @@ def decode_access_token(token: str) -> dict | None:
     """Decode and validate a JWT. Returns the payload dict or None."""
     cfg = get_settings()
     try:
-        return jwt.decode(
+        payload = jwt.decode(
             token,
             cfg.secret_key,
             algorithms=[cfg.jwt_algorithm],
             issuer=cfg.jwt_issuer,
             audience=cfg.jwt_audience,
+            options={
+                "require": [
+                    "type",
+                    "sub",
+                    "sid",
+                    "role",
+                    "iat",
+                    "nbf",
+                    "exp",
+                    "jti",
+                    "iss",
+                    "aud",
+                ]
+            },
         )
     except jwt.PyJWTError:
         return None
+    if payload.get("type") != "access":
+        return None
+    return payload
+
+
+def decode_refresh_binding_token(token: str) -> dict | None:
+    """Validate an access token for refresh binding, allowing only expired ``exp``."""
+    cfg = get_settings()
+    try:
+        payload = jwt.decode(
+            token,
+            cfg.secret_key,
+            algorithms=[cfg.jwt_algorithm],
+            issuer=cfg.jwt_issuer,
+            audience=cfg.jwt_audience,
+            options={
+                "verify_exp": False,
+                "require": [
+                    "type",
+                    "sub",
+                    "sid",
+                    "role",
+                    "iat",
+                    "nbf",
+                    "exp",
+                    "jti",
+                    "iss",
+                    "aud",
+                ],
+            },
+        )
+    except jwt.PyJWTError:
+        return None
+    if payload.get("type") != "access":
+        return None
+    return payload
 
 
 # ── Refresh tokens ──────────────────────────────────────────────────────────
@@ -149,7 +198,8 @@ def generate_csrf_token(session_id: uuid.UUID | None = None) -> str:
     cfg = get_settings()
     sid = session_id or _PREAUTH_SESSION_ID
     sid_hex = sid.hex
-    ts_str = str(int(time.time()))
+    # Nanosecond precision guarantees a new token on immediate reissuance.
+    ts_str = str(time.time_ns())
     sig = _csrf_hmac(cfg.csrf_secret_key, f"{sid_hex}.{ts_str}")
     payload = f"{sid_hex}.{ts_str}.{sig}"
     return base64.urlsafe_b64encode(payload.encode()).decode().rstrip("=")
@@ -201,8 +251,8 @@ def validate_csrf_token(
         issued_at = int(ts_str)
     except ValueError:
         return False
-    now = int(time.time())
-    if now - issued_at > cfg.csrf_token_ttl_seconds:
+    now = time.time_ns()
+    if issued_at > now or now - issued_at > cfg.csrf_token_ttl_seconds * 1_000_000_000:
         return False
 
     return True
@@ -221,7 +271,7 @@ def set_cookie(
     secure: bool | None = None,
     samesite: str | None = None,
     domain: str | None = None,
-    path: str = "/",
+    path: str | None = None,
 ) -> None:
     cfg = get_settings()
     response.set_cookie(
@@ -232,7 +282,7 @@ def set_cookie(
         secure=secure if secure is not None else cfg.cookie_secure,
         samesite=samesite or cfg.cookie_same_site,
         domain=domain if domain is not None else cfg.cookie_domain,
-        path=path,
+        path=path or cfg.cookie_path,
     )
 
 
@@ -241,11 +291,11 @@ def clear_cookie(
     name: str,
     *,
     domain: str | None = None,
-    path: str = "/",
+    path: str | None = None,
 ) -> None:
     cfg = get_settings()
     response.delete_cookie(
         key=name,
         domain=domain if domain is not None else cfg.cookie_domain,
-        path=path,
+        path=path or cfg.cookie_path,
     )

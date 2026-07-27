@@ -134,11 +134,12 @@ def cmd_resume(args: argparse.Namespace) -> None:
     SessionFactory = sessionmaker(bind=engine, autoflush=False, autocommit=False)
     session = SessionFactory()
     try:
-        service = ImportService(session, dry_run=args.dry_run)
+        service = ImportService.from_settings(session, dry_run=args.dry_run)
         job = service.resume(job_id, prune=args.prune)
         print(f"Job {job.id} status: {job.status.value}")
-    except ValueError as exc:
+    except (ValueError, RuntimeError) as exc:
         log.error("%s", exc)
+        session.rollback()
         sys.exit(1)
     finally:
         session.close()

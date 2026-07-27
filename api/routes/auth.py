@@ -13,10 +13,10 @@ Endpoints:
 import uuid
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Request, Response
-from slowapi import Limiter
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
+from starlette.responses import JSONResponse
 
 from auth import (
     clear_cookie,
@@ -27,8 +27,15 @@ from auth import (
 )
 from auth.schemas import LoginIn, LoginOut, RegisterIn, RegisterOut, UserOut
 from database import get_db
-from deps import get_current_session, get_current_user, require_csrf, require_preauth_csrf
-from models import RefreshSession, User, UserRole
+from deps import (
+    get_current_session,
+    get_current_user,
+    require_csrf,
+    require_preauth_csrf,
+    require_refresh_csrf,
+)
+from models import AuditEventOutcome, RefreshSession, User, UserRole
+from audit_events import record_event_safe
 from session import (
     issue_access_token,
     issue_refresh_session,
@@ -97,6 +104,24 @@ def _clear_auth_cookies(response: Response) -> None:
     clear_cookie(response, cfg.csrf_cookie_name)
 
 
+def _auth_error(detail: str, status_code: int = 401) -> JSONResponse:
+    response = JSONResponse(status_code=status_code, content={"detail": detail})
+    _clear_auth_cookies(response)
+    return response
+
+
+def _audit(request: Request, db: Session, event_type: str, outcome: AuditEventOutcome, **kwargs) -> None:
+    event = record_event_safe(
+        db,
+        event_type=event_type,
+        outcome=outcome,
+        request_id=getattr(request.state, "request_id", None),
+        **kwargs,
+    )
+    if event is not None:
+        db.commit()
+
+
 # ── Register ─────────────────────────────────────────────────────────────────
 
 
@@ -151,6 +176,10 @@ def register(
     )
     access = issue_access_token(user.id, session_id, user.role.value)
     _set_auth_cookies(response, access, raw_refresh, session_id)
+    _audit(
+        request, db, "auth.register", AuditEventOutcome.success,
+        actor_user_id=user.id, subject_type="user", subject_id=str(user.id),
+    )
 
     return RegisterOut(user=_user_to_out(user))
 
@@ -173,13 +202,16 @@ def login(
 ) -> LoginOut:
     user = db.scalar(select(User).where(User.username == body.username))
     if not user:
+        _audit(request, db, "auth.login", AuditEventOutcome.failure, metadata={"reason_code": "unknown_user"})
         raise HTTPException(status_code=401, detail="Incorrect username or password")
 
     success, new_hash = verify_and_update_password(body.password, user.hashed_password)
     if not success:
+        _audit(request, db, "auth.login", AuditEventOutcome.failure, metadata={"reason_code": "invalid_password"})
         raise HTTPException(status_code=401, detail="Incorrect username or password")
 
     if not user.is_active:
+        _audit(request, db, "auth.login", AuditEventOutcome.denied, actor_user_id=user.id, metadata={"reason_code": "inactive_account"})
         raise HTTPException(status_code=403, detail="User account is disabled")
 
     if new_hash is not None:
@@ -193,6 +225,10 @@ def login(
     access = issue_access_token(user.id, session_id, user.role.value)
 
     _set_auth_cookies(response, access, raw_refresh, session_id)
+    _audit(
+        request, db, "auth.login", AuditEventOutcome.success,
+        actor_user_id=user.id, subject_type="user", subject_id=str(user.id),
+    )
     return LoginOut(user=_user_to_out(user))
 
 
@@ -201,42 +237,56 @@ def login(
 
 @router.post(
     "/refresh",
+    response_model=None,
     summary="Rotate refresh token and issue new access token",
 )
 @limiter.limit(_cfg.refresh_rate_limit)
 def refresh(
     request: Request,
     response: Response,
-    _csrf: None = Depends(require_csrf),
+    bound_session: RefreshSession = Depends(require_refresh_csrf),
     db: Session = Depends(get_db),
-) -> dict:
+) -> dict | JSONResponse:
     cfg = get_settings()
     raw_refresh: str | None = request.cookies.get(cfg.refresh_cookie_name)
     if not raw_refresh:
-        raise HTTPException(status_code=401, detail="No refresh token")
+        _audit(request, db, "auth.refresh", AuditEventOutcome.failure, metadata={"reason_code": "missing_token"})
+        return _auth_error("No refresh token")
 
     result = rotate_refresh_token(
-        db, raw_refresh, user_agent=request.headers.get("User-Agent", "")
+        db,
+        raw_refresh,
+        user_agent=request.headers.get("User-Agent", ""),
+        expected_session_id=bound_session.id,
     )
     if result is None:
-        _clear_auth_cookies(response)
-        raise HTTPException(status_code=401, detail="Invalid refresh token")
+        _audit(
+            request, db, "auth.refresh", AuditEventOutcome.failure,
+            actor_user_id=bound_session.user_id, subject_type="refresh_session", subject_id=str(bound_session.id),
+            metadata={"reason_code": "invalid_token"},
+        )
+        return _auth_error("Invalid refresh token")
 
     new_raw, new_session_id = result
 
     # Look up user to get role for the new access token
     session = db.scalar(select(RefreshSession).where(RefreshSession.id == new_session_id))
     if not session:
-        _clear_auth_cookies(response)
-        raise HTTPException(status_code=401, detail="Session not found")
+        _audit(request, db, "auth.refresh", AuditEventOutcome.failure, metadata={"reason_code": "session_not_found"})
+        return _auth_error("Session not found")
 
     user = db.scalar(select(User).where(User.id == session.user_id))
     if not user or not user.is_active:
-        _clear_auth_cookies(response)
-        raise HTTPException(status_code=401, detail="User not found or disabled")
+        revoke_session(db, new_session_id)
+        _audit(request, db, "auth.refresh", AuditEventOutcome.denied, metadata={"reason_code": "inactive_account"})
+        return _auth_error("User not found or disabled")
 
     access = issue_access_token(user.id, new_session_id, user.role.value)
     _set_auth_cookies(response, access, new_raw, new_session_id)
+    _audit(
+        request, db, "auth.refresh", AuditEventOutcome.success,
+        actor_user_id=user.id, subject_type="refresh_session", subject_id=str(new_session_id),
+    )
     return {"detail": "Token refreshed"}
 
 
@@ -269,10 +319,14 @@ def logout(
         rs = db.scalar(
             select(RefreshSession).where(RefreshSession.token_hash == token_hash)
         )
-        if rs:
+        if rs and rs.user_id == session.user_id:
             revoke_session(db, rs.id)
 
     _clear_auth_cookies(response)
+    _audit(
+        request, db, "auth.logout", AuditEventOutcome.success,
+        actor_user_id=session.user_id, subject_type="refresh_session", subject_id=str(session.id),
+    )
     return {"detail": "Logged out"}
 
 
@@ -293,6 +347,11 @@ def logout_all(
 ) -> dict:
     count = revoke_all_user_sessions(db, user.id)
     _clear_auth_cookies(response)
+    _audit(
+        request, db, "auth.logout_all", AuditEventOutcome.success,
+        actor_user_id=user.id, subject_type="user", subject_id=str(user.id),
+        metadata={"session_count": count},
+    )
     return {"detail": "All sessions revoked", "revoked_count": count}
 
 
@@ -348,7 +407,9 @@ def csrf(
                     )
                     if session is None or session.revoked_at is not None:
                         session_id = _PREAUTH_SESSION_ID
-                except (ValueError, Exception):
+                    elif not _session_not_expired(session):
+                        session_id = _PREAUTH_SESSION_ID
+                except (ValueError, TypeError, AttributeError):
                     session_id = _PREAUTH_SESSION_ID
 
     csrf_value = generate_csrf_token(session_id)
@@ -359,4 +420,14 @@ def csrf(
         max_age=cfg.csrf_token_ttl_seconds,
         http_only=False,
     )
+    _audit(request, db, "auth.csrf_issued", AuditEventOutcome.success)
     return {"csrf_token": csrf_value}
+
+
+def _session_not_expired(session: RefreshSession) -> bool:
+    from datetime import datetime, timezone
+
+    expires = session.expires_at
+    if expires.tzinfo is None:
+        expires = expires.replace(tzinfo=timezone.utc)
+    return expires >= datetime.now(timezone.utc)

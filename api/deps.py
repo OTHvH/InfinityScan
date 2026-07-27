@@ -48,13 +48,16 @@ from __future__ import annotations
 import hmac
 import uuid
 from dataclasses import dataclass
-from typing import Annotated
 
 from fastapi import Depends, Header, HTTPException, Request
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from auth import decode_access_token, generate_csrf_token, validate_csrf_token
+from auth import (
+    decode_access_token,
+    decode_refresh_binding_token,
+    validate_csrf_token,
+)
 from database import get_db
 from models import RefreshSession, User
 from settings import get_settings
@@ -109,7 +112,7 @@ def get_current_session(
 
     try:
         session_id = uuid.UUID(session_id_str)
-    except ValueError:
+    except (ValueError, TypeError, AttributeError):
         raise HTTPException(status_code=401, detail="Invalid session ID in token")
 
     session = db.scalar(select(RefreshSession).where(RefreshSession.id == session_id))
@@ -161,7 +164,7 @@ def get_current_user(
 
     try:
         user_id = uuid.UUID(user_id_str)
-    except ValueError:
+    except (ValueError, TypeError, AttributeError):
         raise HTTPException(status_code=401, detail="Invalid token subject")
 
     if user_id != session.user_id:
@@ -207,11 +210,11 @@ def get_optional_user(
     try:
         session_id = uuid.UUID(session_id_str)
         user_id = uuid.UUID(user_id_str)
-    except ValueError:
+    except (ValueError, TypeError, AttributeError):
         return None
 
     session = db.scalar(select(RefreshSession).where(RefreshSession.id == session_id))
-    if session is None or session.revoked_at is not None:
+    if session is None or session.revoked_at is not None or session.user_id != user_id:
         return None
 
     from datetime import datetime, timezone
@@ -265,10 +268,26 @@ def require_role(*allowed_roles: str):
 
 
 def require_admin(
+    request: Request,
     user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
 ) -> User:
     """Shorthand for ``require_role("admin")``."""
     if user.role.value != "admin":
+        from audit_events import record_event_safe
+        from models import AuditEventOutcome
+
+        event = record_event_safe(
+            db,
+            event_type="admin.authorization_denied",
+            outcome=AuditEventOutcome.denied,
+            actor_user_id=user.id,
+            subject_type="authorization",
+            subject_id="admin",
+            metadata={"reason_code": "insufficient_role"},
+        )
+        if event is not None:
+            db.commit()
         raise HTTPException(status_code=403, detail="Admin privileges required")
     return user
 
@@ -304,6 +323,50 @@ def require_csrf(
     # Validate the signed token bound to this session
     if not validate_csrf_token(csrf_cookie, session.id):
         raise HTTPException(status_code=403, detail="CSRF validation failed")
+
+
+def require_refresh_csrf(
+    request: Request,
+    db: Session = Depends(get_db),
+    x_csrf_token: str | None = Header(default=None, alias="X-CSRF-Token"),
+) -> RefreshSession:
+    """Validate refresh binding while allowing only access-token expiration."""
+    cfg = get_settings()
+    access_token = request.cookies.get(cfg.access_cookie_name)
+    if not access_token:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    payload = decode_refresh_binding_token(access_token)
+    if payload is None:
+        raise HTTPException(status_code=401, detail="Invalid token")
+    try:
+        session_id = uuid.UUID(payload["sid"])
+        user_id = uuid.UUID(payload["sub"])
+    except (KeyError, ValueError, TypeError, AttributeError):
+        raise HTTPException(status_code=401, detail="Invalid token payload")
+
+    session = db.scalar(select(RefreshSession).where(RefreshSession.id == session_id))
+    if session is None or session.user_id != user_id:
+        raise HTTPException(status_code=401, detail="Session not found")
+    if session.revoked_at is not None:
+        raise HTTPException(status_code=401, detail="Session revoked")
+
+    from datetime import datetime, timezone
+
+    expires = session.expires_at
+    if expires.tzinfo is None:
+        expires = expires.replace(tzinfo=timezone.utc)
+    if expires < datetime.now(timezone.utc):
+        raise HTTPException(status_code=401, detail="Session expired")
+
+    csrf_cookie = request.cookies.get(cfg.csrf_cookie_name)
+    header_val = x_csrf_token or request.headers.get(cfg.csrf_header_name)
+    if not csrf_cookie or not header_val:
+        raise HTTPException(status_code=403, detail="CSRF validation failed")
+    if not hmac.compare_digest(csrf_cookie, header_val):
+        raise HTTPException(status_code=403, detail="CSRF validation failed")
+    if not validate_csrf_token(csrf_cookie, session.id):
+        raise HTTPException(status_code=403, detail="CSRF validation failed")
+    return session
 
 
 def require_preauth_csrf(
