@@ -621,6 +621,10 @@ class AuditEvent(Base):
             "(subject_type IS NULL) = (subject_id IS NULL)",
             name="ck_audit_events_subject_fields_paired",
         ).ddl_if(dialect="postgresql"),
+        Index("ix_audit_events_created_at_id", "created_at", "id"),
+        Index("ix_audit_events_actor_created_at_id", "actor_user_id", "created_at", "id"),
+        Index("ix_audit_events_event_type_created_at_id", "event_type", "created_at", "id"),
+        Index("ix_audit_events_outcome", "outcome"),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4)

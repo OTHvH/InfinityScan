@@ -122,3 +122,6 @@ pnpm-debug.log*
 *.key
 *.crt
 .vercel
+
+# User-local validation toolchain
+/.tools/

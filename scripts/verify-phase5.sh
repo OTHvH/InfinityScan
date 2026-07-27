@@ -4,10 +4,11 @@
 # Every check is mandatory. Missing tooling or unavailable disposable
 # infrastructure is a failure, never a skip. This script never accepts a
 # production environment and all Docker/database operations use synthetic data.
+# shellcheck disable=SC2016
 set -uo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-cd "$REPO_ROOT"
+cd "$REPO_ROOT" || exit 1
 
 if [ "${APP_ENV:-development}" = "production" ]; then
   printf '%s\n' 'Phase 5 refuses APP_ENV=production.' >&2
@@ -30,6 +31,7 @@ else
 fi
 STACK_STARTED=false
 
+# shellcheck disable=SC2329
 cleanup() {
   local status=$?
   set +e
@@ -87,7 +89,9 @@ finish() {
 }
 
 run_gate() {
-  local phase="$1" script="$2" log="$TMPDIR/phase-${phase}.log" status=0
+  local phase="$1" script="$2" log status
+  status=0
+  log="$TMPDIR/phase-${phase}.log"
   bash "$script" >"$log" 2>&1 || status=$?
   if [ "$status" -eq 0 ] \
     && grep -q '^Failed: 0$' "$log" \
@@ -113,6 +117,7 @@ run_gate 3 scripts/verify-phase3.sh
 run_gate 4 scripts/verify-phase4.sh
 
 # 1. Required tools.
+# shellcheck disable=SC2016
 run_shell_check 'CHECK-01: required tools available' 'for tool in python3 node npm git jq docker curl shellcheck actionlint pg_dump pg_restore age age-keygen; do command -v "$tool" >/dev/null || exit 1; done'
 
 # 2-5. Repository safety and generated-artifact policy.

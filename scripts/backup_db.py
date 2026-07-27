@@ -71,7 +71,9 @@ def _run(command: list[str], *, env: dict[str, str], label: str) -> None:
     except OSError as exc:
         raise BackupError(f"{label} could not be started") from exc
     if result.returncode != 0:
-        raise BackupError(f"{label} failed with exit code {result.returncode}")
+        detail = result.stderr.decode("utf-8", errors="replace").strip().splitlines()[-1:] or [""]
+        safe_detail = re.sub(r"(?i)(password|passwd|secret|token)=\S+", r"\1=<redacted>", detail[0])
+        raise BackupError(f"{label} failed with exit code {result.returncode}: {safe_detail[:240]}")
 
 
 def _hash_file(path: Path) -> tuple[str, int]:

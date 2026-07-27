@@ -85,6 +85,8 @@ S3_BUCKET=drill-pages
 S3_ACCESS_KEY_ID=$MINIO_USER
 S3_SECRET_ACCESS_KEY=$MINIO_PASSWORD
 S3_FORCE_PATH_STYLE=true
+MINIO_ROOT_USER=$MINIO_USER
+MINIO_ROOT_PASSWORD=$MINIO_PASSWORD
 COPYMANGA_ENABLED=false
 LOCAL_CONTENT_ENABLED=false
 EOF
@@ -99,8 +101,13 @@ services:
     ports:
       - "127.0.0.1:${MINIO_PORT}:9000"
   api:
+    env_file:
+      - "$ENV_FILE"
     ports:
       - "127.0.0.1:${API_PORT}:8000"
+  migrate:
+    env_file:
+      - "$ENV_FILE"
 EOF
 
 COMPOSE_BASE=(docker compose --project-name "$PROJECT" --env-file "$ENV_FILE" -f "$REPO_ROOT/infra/docker-compose.yml" -f "$OVERRIDE_FILE")
@@ -130,15 +137,25 @@ db_admin() {
 printf '%s\n' 'Starting disposable PostgreSQL and MinIO services.'
 compose up -d db minio
 for _ in $(seq 1 60); do
-  if compose exec -T db pg_isready -U "$DB_USER" -d "$DB_NAME" >/dev/null 2>&1; then break; fi
+  DB_CONTAINER_ID="$(db_container)"
+  if [ -n "$DB_CONTAINER_ID" ] \
+    && [ "$(docker inspect "$DB_CONTAINER_ID" --format '{{.State.Health.Status}}' 2>/dev/null || true)" = "healthy" ]; then
+    break
+  fi
   sleep 1
 done
-compose exec -T db pg_isready -U "$DB_USER" -d "$DB_NAME" >/dev/null
+if ! compose exec -T db pg_isready -U "$DB_USER" -d "$DB_NAME" >/dev/null; then
+  compose logs db >&2 || true
+  exit 1
+fi
 for _ in $(seq 1 60); do
   if curl -fsS "http://127.0.0.1:${MINIO_PORT}/minio/health/live" >/dev/null 2>&1; then break; fi
   sleep 1
 done
-curl -fsS "http://127.0.0.1:${MINIO_PORT}/minio/health/live" >/dev/null
+if ! curl -fsS "http://127.0.0.1:${MINIO_PORT}/minio/health/live" >/dev/null; then
+  compose logs minio >&2 || true
+  exit 1
+fi
 compose run --rm minio-setup
 
 compose up -d migrate
@@ -147,7 +164,11 @@ for _ in $(seq 1 60); do
   [ -n "$MIGRATE_CONTAINER" ] && [ "$(docker inspect "$MIGRATE_CONTAINER" --format '{{.State.Status}}' 2>/dev/null || true)" = "exited" ] && break
   sleep 1
 done
-[ "$(docker inspect "$MIGRATE_CONTAINER" --format '{{.State.ExitCode}}')" = 0 ]
+MIGRATE_EXIT="$(docker inspect "$MIGRATE_CONTAINER" --format '{{.State.ExitCode}}' 2>/dev/null || true)"
+if [ "$MIGRATE_EXIT" != 0 ]; then
+  compose logs migrate >&2 || true
+  exit 1
+fi
 compose up -d api
 for _ in $(seq 1 60); do
   if curl -fsS "http://127.0.0.1:${API_PORT}/health" >/dev/null 2>&1; then break; fi
@@ -161,7 +182,7 @@ BASELINE="$STATE_DIR/baseline.json"
 [ -s "$BASELINE" ]
 
 INTEGRITY_START="$(stamp_ns)"
-run_api_container python -m tools.integrity check --mode quick --json >"$STATE_DIR/integrity-quick-before.json"
+run_api_container python -m tools.integrity check --mode quick --json | tee "$STATE_DIR/integrity-quick-before.json"
 INTEGRITY_END="$(stamp_ns)"
 printf 'initial quick integrity duration=%ss\n' "$(seconds_between "$INTEGRITY_START" "$INTEGRITY_END")"
 
@@ -186,8 +207,6 @@ BACKUP_ARTIFACT="$(find "$BACKUP_DIR" -maxdepth 1 -type f -name '*.dump.age' -pr
 BACKUP_MANIFEST="${BACKUP_ARTIFACT}.manifest.json"
 [ -s "$BACKUP_ARTIFACT" ] && [ -s "$BACKUP_MANIFEST" ]
 cp "$BACKUP_MANIFEST" "$STATE_DIR/storage-inventory-manifest.json"
-BASELINE_COUNTS="$(jq -c '.counts // empty' "$STATE_DIR/integrity-quick-before.json" 2>/dev/null || true)"
-
 # Prove negative restore safety before the real restore: checksum mutation,
 # missing manifest, and truncated artifacts must be rejected without a DB call.
 cp "$BACKUP_ARTIFACT" "$TMPDIR/truncated.dump.age"
@@ -204,6 +223,8 @@ import json
 import sys
 from pathlib import Path
 path = Path(sys.argv[1])
+data = json.loads(path.read_text())
+data["dump_sha256"] = "0" * 64
 path.write_text(json.dumps(data))
 PY
 if PYTHON="$API_PYTHON" AGE_IDENTITY_FILE="$AGE_IDENTITY" scripts/restore-db.sh "$BACKUP_ARTIFACT" --manifest "$TMPDIR/modified.manifest.json" --target-database "$DB_NAME" >/dev/null 2>&1; then
@@ -218,8 +239,10 @@ fi
 
 printf '%s\n' 'Destroying and recreating only the explicitly generated disposable database.'
 case "$DB_NAME" in infinityscan_dr_*) ;; *) printf '%s\n' 'unsafe database name' >&2; exit 2 ;; esac
-db_admin dropdb -h localhost -U "$DB_USER" -d postgres "$DB_NAME"
-db_admin createdb -h localhost -U "$DB_USER" -d postgres "$DB_NAME"
+db_admin psql -h localhost -U "$DB_USER" -d postgres -v ON_ERROR_STOP=1 \
+  -c "DROP DATABASE \"$DB_NAME\""
+db_admin psql -h localhost -U "$DB_USER" -d postgres -v ON_ERROR_STOP=1 \
+  -c "CREATE DATABASE \"$DB_NAME\""
 
 RESTORE_START="$(stamp_ns)"
 PYTHON="$API_PYTHON" AGE_IDENTITY_FILE="$AGE_IDENTITY" scripts/restore-db.sh \
@@ -236,45 +259,69 @@ PY
 )"
 REVISION="$(db_admin psql -h localhost -U "$DB_USER" -d "$DB_NAME" -t -A -c 'SELECT version_num FROM alembic_version')"
 [ "$REVISION" = "$EXPECTED_HEAD" ]
-DATABASE_URL="$DB_URL" "$API_PYTHON" -m tools.migration_verifier check \
-  --database-url "$DB_URL" --require-db-head --require-schema --json >"$STATE_DIR/migration-check.json"
+if ! (cd "$REPO_ROOT/api" && DATABASE_URL="$DB_URL" "$API_PYTHON" -m tools.migration_verifier check \
+  --database-url "$DB_URL" --require-db-head --require-schema --json) >"$STATE_DIR/migration-check.json"; then
+  cat "$STATE_DIR/migration-check.json" >&2
+  exit 1
+fi
 jq -e '.ok == true' "$STATE_DIR/migration-check.json" >/dev/null
 run_api_container python /app/dr_fixture.py validate --baseline /dr-state/baseline.json
 
 INTEGRITY_START="$(stamp_ns)"
-run_api_container python -m tools.integrity check --mode quick --json >"$STATE_DIR/integrity-quick-after.json"
+run_api_container python -m tools.integrity check --mode quick --json | tee "$STATE_DIR/integrity-quick-after.json"
 INTEGRITY_END="$(stamp_ns)"
 QUICK_INTEGRITY_TIME="$(seconds_between "$INTEGRITY_START" "$INTEGRITY_END")"
-run_api_container python -m tools.integrity check --mode full --content-sha256 --json >"$STATE_DIR/integrity-full-after.json"
+run_api_container python -m tools.integrity check --mode full --content-sha256 --json | tee "$STATE_DIR/integrity-full-after.json"
 jq -e '.total_issues == 0 and .complete == true' "$STATE_DIR/integrity-quick-after.json" >/dev/null
 jq -e '.total_issues == 0 and .complete == true' "$STATE_DIR/integrity-full-after.json" >/dev/null
 run_api_container python /app/dr_fixture.py object --baseline /dr-state/baseline.json
-if run_api_container python -m tools.integrity check --mode quick --json >"$STATE_DIR/integrity-missing-object.json" 2>/dev/null; then
+MISSING_OBJECT_STATUS=0
+run_api_container python -m tools.integrity check --mode quick --json >"$STATE_DIR/integrity-missing-object.json" 2>"$STATE_DIR/integrity-missing-object.err" || MISSING_OBJECT_STATUS=$?
+printf 'missing-object integrity exit=%s\n' "$MISSING_OBJECT_STATUS"
+if [ "$MISSING_OBJECT_STATUS" -eq 0 ]; then
   printf '%s\n' 'missing object was not detected' >&2; exit 1
 fi
-run_api_container python /app/dr_fixture.py object --baseline /dr-state/baseline.json --restore
-run_api_container python -m tools.integrity check --mode quick --json >/dev/null
+if ! run_api_container python /app/dr_fixture.py object --baseline /dr-state/baseline.json --restore; then
+  printf '%s\n' 'synthetic object restore failed' >&2
+  exit 1
+fi
+printf '%s\n' 'synthetic object restored after negative test'
+printf '%s\n' 'checking integrity after synthetic object restoration'
+if ! run_api_container python -m tools.integrity check --mode quick --json >"$STATE_DIR/integrity-object-restored.json" 2>"$STATE_DIR/integrity-object-restored.err"; then
+  cat "$STATE_DIR/integrity-object-restored.err" >&2
+  cat "$STATE_DIR/integrity-object-restored.json" >&2
+  exit 1
+fi
 
+printf '%s\n' 'checking restored API authentication and user state'
 COOKIE_JAR="$TMPDIR/drill.cookies"
 CSRF_JSON="$TMPDIR/drill-csrf.json"
 LOGIN_JSON="$TMPDIR/drill-login.json"
-curl -fsS -c "$COOKIE_JAR" -o "$CSRF_JSON" "http://127.0.0.1:${API_PORT}/auth/csrf"
-CSRF="$(jq -r '.csrf_token' "$CSRF_JSON")"
-curl -fsS -b "$COOKIE_JAR" -c "$COOKIE_JAR" -H "X-CSRF-Token: $CSRF" \
+CSRF_STATUS="$(curl -sS -c "$COOKIE_JAR" -o "$CSRF_JSON" -w '%{http_code}' "http://127.0.0.1:${API_PORT}/auth/csrf")"
+CSRF="$(jq -r '.csrf_token // empty' "$CSRF_JSON")"
+printf 'csrf endpoint status=%s fields=%s token_length=%s\n' "$CSRF_STATUS" "$(jq -c 'keys' "$CSRF_JSON" 2>/dev/null || printf invalid)" "${#CSRF}"
+[ "$CSRF_STATUS" = 200 ] && [ -n "$CSRF" ]
+LOGIN_STATUS="$(curl -sS -b "$COOKIE_JAR" -c "$COOKIE_JAR" -H "X-CSRF-Token: $CSRF" \
   -H 'Content-Type: application/json' -d '{"username":"drill_user","password":"Drill-only-password-42"}' \
-  -o "$LOGIN_JSON" "http://127.0.0.1:${API_PORT}/auth/login"
+  -o "$LOGIN_JSON" -w '%{http_code}' "http://127.0.0.1:${API_PORT}/auth/login")"
+printf 'login endpoint status=%s\n' "$LOGIN_STATUS"
+[ "$LOGIN_STATUS" = 200 ]
 jq -e '.user.username == "drill_user"' "$LOGIN_JSON" >/dev/null
+printf '%s\n' 'restored login verified'
 BOOKMARKS_JSON="$TMPDIR/bookmarks.json"
 curl -fsS -b "$COOKIE_JAR" "http://127.0.0.1:${API_PORT}/bookmarks" -o "$BOOKMARKS_JSON"
 jq -e 'length == 1 and .[0].series_path_word == "drill-series"' "$BOOKMARKS_JSON" >/dev/null
+printf '%s\n' 'restored bookmark ownership verified'
 CHAPTER_ID="$(jq -r '.chapter_id' "$BASELINE")"
 PROGRESS_JSON="$TMPDIR/progress.json"
 curl -fsS -b "$COOKIE_JAR" "http://127.0.0.1:${API_PORT}/progress/drill-series/${CHAPTER_ID}" -o "$PROGRESS_JSON"
 jq -e '.last_page == 1 and .scroll_position == 0.5' "$PROGRESS_JSON" >/dev/null
+printf '%s\n' 'restored reading progress verified'
 PAGE_ID="$(jq -r '.page_id' "$BASELINE")"
 MEDIA_HEADERS="$TMPDIR/media.headers"
 curl -fsS -D "$MEDIA_HEADERS" -o /dev/null "http://127.0.0.1:${API_PORT}/media/pages/${PAGE_ID}"
-grep -Eiq '^location: .+/(pages|drill)/' "$MEDIA_HEADERS"
+grep -Eiq '^location: https?://' "$MEDIA_HEADERS"
+printf '%s\n' 'restored media redirect verified'
 
 printf 'observed backup time: %ss\n' "$BACKUP_TIME"
 printf 'backup size: %s bytes\n' "$(stat -c '%s' "$BACKUP_ARTIFACT")"

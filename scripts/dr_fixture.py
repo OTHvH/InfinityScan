@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import hashlib
 import json
 import os
 import uuid
@@ -37,7 +38,7 @@ from models import (
     User,
     UserRole,
 )
-from storage import create_object_storage
+from storage import create_object_storage, page_object_key
 from audit_events import record_event
 
 
@@ -108,7 +109,8 @@ def seed(output: Path) -> None:
         verified_at=now,
         published_at=now,
     )
-    page_key = f"pages/drill/{chapter.id}/001.png"
+    page_digest = hashlib.sha256(PNG_BYTES).hexdigest()
+    page_key = page_object_key(series.id, chapter.id, 1, page_digest, "png")
     upload = storage.upload_bytes(page_key, PNG_BYTES, "image/png")
     page = Page(
         id=uuid.uuid4(),
@@ -143,7 +145,7 @@ def seed(output: Path) -> None:
         finished_at=now,
         updated_at=now,
     )
-    db = Session(engine)
+    db = Session(engine, expire_on_commit=False)
     try:
         db.add_all([user, admin, source, series, chapter, page, job])
         db.flush()
