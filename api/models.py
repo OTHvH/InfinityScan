@@ -9,11 +9,13 @@ from decimal import Decimal
 
 from sqlalchemy import (
     Boolean,
+    CheckConstraint,
     DateTime,
     Enum,
     ForeignKey,
     JSON,
     Integer,
+    Index,
     BigInteger,
     Numeric,
     SmallInteger,
@@ -169,10 +171,16 @@ class User(Base):
     """User accounts for authentication."""
 
     __tablename__ = "users"
+    __table_args__ = (
+        UniqueConstraint("username", name="uq_users_username"),
+        UniqueConstraint("email", name="uq_users_email"),
+        Index("ix_users_username", "username", unique=True),
+        Index("ix_users_email", "email", unique=True),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    username: Mapped[str] = mapped_column(String(50), nullable=False, unique=True, index=True)
-    email: Mapped[str | None] = mapped_column(String(255), unique=True, index=True)
+    username: Mapped[str] = mapped_column(String(50), nullable=False)
+    email: Mapped[str | None] = mapped_column(String(255))
     hashed_password: Mapped[str] = mapped_column(String(255), nullable=False)
     role: Mapped[UserRole] = mapped_column(
         Enum(UserRole, name="user_role_enum"), nullable=False, default=UserRole.user
@@ -201,9 +209,13 @@ class Series(Base):
     """A manga / manhua / manhwa series."""
 
     __tablename__ = "series"
+    __table_args__ = (
+        UniqueConstraint("slug", name="uq_series_slug"),
+        Index("ix_series_slug", "slug"),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    slug: Mapped[str] = mapped_column(String(255), nullable=False, unique=True, index=True)
+    slug: Mapped[str] = mapped_column(String(255), nullable=False)
     title: Mapped[str] = mapped_column(String(512), nullable=False)
     alternative_titles: Mapped[str | None] = mapped_column(Text)
     synopsis: Mapped[str | None] = mapped_column(Text)
@@ -246,7 +258,14 @@ class Chapter(Base):
     """A chapter belonging to a series."""
 
     __tablename__ = "chapters"
-    __table_args__ = (UniqueConstraint("series_id", "number", "language", name="uq_chapter_series_number_lang"),)
+    __table_args__ = (
+        UniqueConstraint("series_id", "number", "language", name="uq_chapter_series_number_lang"),
+        CheckConstraint(
+            "page_count >= 0",
+            name="ck_chapters_page_count_nonnegative",
+        ).ddl_if(dialect="postgresql"),
+        Index("ix_chapters_reader_order", "series_id", "import_status", "number", "id"),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4)
     series_id: Mapped[uuid.UUID] = mapped_column(
@@ -285,7 +304,38 @@ class Page(Base):
     """A single page image within a chapter."""
 
     __tablename__ = "pages"
-    __table_args__ = (UniqueConstraint("chapter_id", "page_number", name="uq_page_chapter_number"),)
+    __table_args__ = (
+        UniqueConstraint("chapter_id", "page_number", name="uq_page_chapter_number"),
+        CheckConstraint(
+            "page_number >= 1",
+            name="ck_pages_page_number_positive",
+        ).ddl_if(dialect="postgresql"),
+        CheckConstraint(
+            "file_size IS NULL OR file_size > 0",
+            name="ck_pages_file_size_positive",
+        ).ddl_if(dialect="postgresql"),
+        CheckConstraint(
+            "width IS NULL OR width > 0",
+            name="ck_pages_width_positive",
+        ).ddl_if(dialect="postgresql"),
+        CheckConstraint(
+            "height IS NULL OR height > 0",
+            name="ck_pages_height_positive",
+        ).ddl_if(dialect="postgresql"),
+        CheckConstraint(
+            "sha256 IS NULL OR sha256 ~ '^[0-9a-f]{64}$'",
+            name="ck_pages_sha256_format",
+        ).ddl_if(dialect="postgresql"),
+        CheckConstraint(
+            "integrity_status <> 'verified' OR ("
+            "btrim(object_key) <> '' AND sha256 IS NOT NULL "
+            "AND width IS NOT NULL AND height IS NOT NULL AND file_size IS NOT NULL "
+            "AND mime_type IS NOT NULL AND btrim(mime_type) <> '' "
+            "AND file_extension IS NOT NULL AND btrim(file_extension) <> '' "
+            "AND verified_at IS NOT NULL)",
+            name="ck_pages_verified_requirements",
+        ).ddl_if(dialect="postgresql"),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4)
     chapter_id: Mapped[uuid.UUID] = mapped_column(
@@ -341,6 +391,10 @@ class SourceSeries(Base):
     __tablename__ = "source_series"
     __table_args__ = (
         UniqueConstraint("source_id", "external_series_id", name="uq_source_series_external_id"),
+        CheckConstraint(
+            "btrim(external_series_id) <> ''",
+            name="ck_source_series_external_id_nonempty",
+        ).ddl_if(dialect="postgresql"),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4)
@@ -363,6 +417,13 @@ class ImportJob(Base):
     """Tracks one import or synchronization run."""
 
     __tablename__ = "import_jobs"
+    __table_args__ = (
+        CheckConstraint(
+            "series_count >= 0 AND chapter_count >= 0 AND page_count >= 0 "
+            "AND uploaded_count >= 0 AND skipped_count >= 0 AND failed_count >= 0",
+            name="ck_import_jobs_nonnegative_counts",
+        ).ddl_if(dialect="postgresql"),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4)
     source_id: Mapped[uuid.UUID | None] = mapped_column(
@@ -438,13 +499,39 @@ class RefreshSession(Base):
     """
 
     __tablename__ = "refresh_sessions"
+    __table_args__ = (
+        UniqueConstraint("token_hash", name="uq_refresh_sessions_token_hash"),
+        CheckConstraint(
+            "token_hash ~ '^[0-9a-f]{64}$'",
+            name="ck_refresh_sessions_token_hash_format",
+        ).ddl_if(dialect="postgresql"),
+        CheckConstraint(
+            "expires_at > created_at",
+            name="ck_refresh_sessions_expires_after_created",
+        ).ddl_if(dialect="postgresql"),
+        CheckConstraint(
+            "last_used_at IS NULL OR last_used_at >= created_at",
+            name="ck_refresh_sessions_last_used_after_created",
+        ).ddl_if(dialect="postgresql"),
+        CheckConstraint(
+            "revoked_at IS NULL OR revoked_at >= created_at",
+            name="ck_refresh_sessions_revoked_after_created",
+        ).ddl_if(dialect="postgresql"),
+        CheckConstraint(
+            "replaced_by_session_id IS NULL OR replaced_by_session_id <> id",
+            name="ck_refresh_sessions_replacement_not_self",
+        ).ddl_if(dialect="postgresql"),
+        Index("ix_refresh_sessions_token_hash", "token_hash", unique=True),
+        Index("ix_refresh_sessions_expires_at", "expires_at"),
+        Index("ix_refresh_sessions_replaced_by_session_id", "replaced_by_session_id"),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4)
     user_id: Mapped[uuid.UUID] = mapped_column(
         Uuid(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
     )
     family_id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), nullable=False, index=True)
-    token_hash: Mapped[str] = mapped_column(String(64), nullable=False, unique=True, index=True)
+    token_hash: Mapped[str] = mapped_column(String(64), nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     last_used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
@@ -487,7 +574,17 @@ class ReadingProgress(Base):
     """
 
     __tablename__ = "reading_progress"
-    __table_args__ = (UniqueConstraint("user_id", "chapter_id", name="uq_progress_user_chapter"),)
+    __table_args__ = (
+        UniqueConstraint("user_id", "chapter_id", name="uq_progress_user_chapter"),
+        CheckConstraint(
+            "last_page IS NULL OR last_page >= 0",
+            name="ck_reading_progress_last_page_nonnegative",
+        ).ddl_if(dialect="postgresql"),
+        CheckConstraint(
+            "scroll_position IS NULL OR (scroll_position >= 0 AND scroll_position <= 1)",
+            name="ck_reading_progress_scroll_position_range",
+        ).ddl_if(dialect="postgresql"),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4)
     user_id: Mapped[uuid.UUID] = mapped_column(

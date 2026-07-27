@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import uuid
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
@@ -17,24 +18,35 @@ from models import (
     Page,
     PageIntegrityStatus,
     ReadingMode,
+    ReadingProgress,
     Series,
     SeriesStatus,
+    Source,
+    SourceSeries,
+    User,
 )
 from sqlalchemy import func, select, text
-from storage.base import ObjectMetadata, ObjectVerification
+from storage import page_object_key
+from storage.base import ObjectMetadata, ObjectPage, ObjectVerification, StorageError
 from tools.integrity import (
     IntegritySummary,
     check_abandoned_import_jobs,
     check_duplicate_page_positions,
+    check_duplicate_logical_content_references,
+    check_broken_source_mappings,
     check_importing_chapters_exposed,
+    check_invalid_import_job_states,
     check_invalid_image_dimensions,
     check_missing_storage_objects,
     check_orphaned_chapters,
     check_orphaned_pages,
     check_page_count_mismatch,
+    check_progress_beyond_chapter_page_count,
+    check_ready_chapters_without_usable_pages,
     check_sha256_mismatch,
     check_stale_replaced_objects,
     check_storage_size_mismatch,
+    check_verified_pages_missing_metadata,
     get_import_job,
     list_import_jobs,
     repair_safe,
@@ -79,8 +91,20 @@ def _create_page(db, chapter: Chapter, page_number: int = 1, **kwargs) -> Page:
         "width": 800,
         "height": 1200,
         "file_size": 50000,
+        "mime_type": "image/jpeg",
+        "file_extension": "jpg",
     }
     defaults.update(kwargs)
+    if "object_key" not in kwargs:
+        defaults["object_key"] = page_object_key(
+            chapter.series_id,
+            chapter.id,
+            page_number,
+            defaults["sha256"],
+            defaults["file_extension"],
+        )
+    if defaults["integrity_status"] == PageIntegrityStatus.verified:
+        defaults.setdefault("verified_at", datetime.now(timezone.utc))
     p = Page(chapter_id=chapter.id, **defaults)
     db.add(p)
     db.flush()
@@ -125,7 +149,7 @@ class FakeStorage:
             key=key,
             byte_size=len(self.objects[key]),
             mime_type="image/jpeg",
-            sha256="a" * 64,
+            sha256=hashlib.sha256(self.objects[key]).hexdigest(),
             etag=self.etags.get(key),
         )
 
@@ -144,7 +168,13 @@ class FakeStorage:
     def generate_presigned_get(self, key, expires_in=None):
         return f"https://fake/{key}"
 
-    def verify_object(self, key, expected_sha256=None, expected_size=None) -> ObjectVerification:
+    def verify_object(
+        self,
+        key,
+        expected_sha256=None,
+        expected_size=None,
+        metadata=None,
+    ) -> ObjectVerification:
         if key not in self.objects:
             return ObjectVerification(
                 key=key, exists=False, verified=False,
@@ -170,6 +200,27 @@ class FakeStorage:
 
     def list_objects(self, prefix: str = "", max_keys: int = 1000) -> list[str]:
         return [k for k in self.objects if k.startswith(prefix)][:max_keys]
+
+    def list_objects_page(
+        self,
+        *,
+        prefix: str,
+        continuation_token: str | None = None,
+        max_keys: int = 1000,
+    ) -> ObjectPage:
+        keys = sorted(key for key in self.objects if key.startswith(prefix))
+        offset = int(continuation_token or 0)
+        selected = keys[offset:offset + max_keys]
+        next_offset = offset + len(selected)
+        return ObjectPage(
+            objects=tuple(self.head_object(key) for key in selected),
+            next_token=str(next_offset) if next_offset < len(keys) else None,
+        )
+
+
+class UnavailableStorage(FakeStorage):
+    def head_object(self, key: str) -> ObjectMetadata | None:
+        raise StorageError("storage unavailable")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -327,6 +378,83 @@ class TestPageCountMismatch:
         assert issues[0].details["actual"] == 0
 
 
+class TestCrossTableIntegrity:
+    def test_ready_chapter_without_usable_pages_detected(self, db):
+        series = _create_series(db)
+        _create_chapter(db, series, status=ChapterImportStatus.ready)
+        issues = check_ready_chapters_without_usable_pages(db)
+        assert len(issues) == 1
+        assert issues[0].category == "ready_chapter_without_usable_pages"
+
+    def test_verified_page_missing_metadata_detected(self, db):
+        series = _create_series(db)
+        chapter = _create_chapter(db, series)
+        _create_page(
+            db,
+            chapter,
+            integrity_status=PageIntegrityStatus.verified,
+            mime_type=None,
+        )
+        issues = check_verified_pages_missing_metadata(db)
+        assert len(issues) == 1
+        assert issues[0].details["invalid_fields"] == ["mime_type"]
+
+    def test_duplicate_logical_content_reference_detected(self, db):
+        series = _create_series(db)
+        chapter = _create_chapter(db, series)
+        first = _create_page(db, chapter, page_number=1)
+        _create_page(db, chapter, page_number=2, object_key=first.object_key)
+        issues = check_duplicate_logical_content_references(db)
+        assert len(issues) == 1
+        assert len(issues[0].details["page_ids"]) == 2
+
+    def test_broken_source_mapping_detected(self, db):
+        series = _create_series(db)
+        source = Source(key="test", display_name="Test", adapter_type="local")
+        db.add(source)
+        db.flush()
+        mapping = SourceSeries(
+            source_id=source.id,
+            series_id=series.id,
+            external_series_id="",
+        )
+        db.add(mapping)
+        db.flush()
+        issues = check_broken_source_mappings(db)
+        assert len(issues) == 1
+        assert issues[0].details["invalid_fields"] == ["external_series_id"]
+
+    def test_invalid_import_job_and_item_states_detected(self, db):
+        job = _create_import_job(db, status=ImportJobStatus.succeeded)
+        item = ImportJobItem(
+            job_id=job.id,
+            source_reference="page.jpg",
+            object_key="",
+            status=ImportJobItemStatus.succeeded,
+        )
+        db.add(item)
+        db.flush()
+        issues = check_invalid_import_job_states(db)
+        assert {issue.category for issue in issues} == {
+            "invalid_import_job_state",
+            "invalid_import_job_item_state",
+        }
+
+    def test_progress_beyond_chapter_page_count_detected(self, db):
+        series = _create_series(db)
+        chapter = _create_chapter(db, series)
+        chapter.page_count = 2
+        user = User(username="reader", hashed_password="hash")
+        db.add(user)
+        db.flush()
+        progress = ReadingProgress(user_id=user.id, chapter_id=chapter.id, last_page=3)
+        db.add(progress)
+        db.flush()
+        issues = check_progress_beyond_chapter_page_count(db)
+        assert len(issues) == 1
+        assert issues[0].details["last_page"] == 3
+
+
 class TestMissingStorageObjects:
     def test_no_missing(self, db):
         storage = FakeStorage()
@@ -351,6 +479,15 @@ class TestMissingStorageObjects:
     def test_no_storage_returns_empty(self, db):
         issues = check_missing_storage_objects(db, None)
         assert issues == []
+
+    def test_storage_failure_is_not_reported_as_missing(self, db):
+        series = _create_series(db)
+        chapter = _create_chapter(db, series)
+        _create_page(db, chapter)
+        issues = check_missing_storage_objects(db, UnavailableStorage())
+        assert len(issues) == 1
+        assert issues[0].category == "storage_unavailable"
+        assert issues[0].repairable is False
 
     def test_pages_with_no_key_skipped(self, db):
         s = _create_series(db)
@@ -461,8 +598,8 @@ class TestImportingChaptersExposed:
         issues = check_importing_chapters_exposed(db)
         assert len(issues) == 1
         assert issues[0].category == "importing_chapter_exposed"
-        assert issues[0].severity == "critical"
-        assert issues[0].repairable is True
+        assert issues[0].severity == "warning"
+        assert issues[0].repairable is False
 
     def test_importing_with_pending_pages_no_issue(self, db):
         s = _create_series(db)
@@ -540,7 +677,13 @@ class TestRunChecks:
         ch.page_count = 1
         data = b"\x00" * 100
         actual_hash = hashlib.sha256(data).hexdigest()
-        p = _create_page(db, ch, file_size=100, sha256=actual_hash)
+        p = _create_page(
+            db,
+            ch,
+            file_size=100,
+            sha256=actual_hash,
+            integrity_status=PageIntegrityStatus.verified,
+        )
         storage.objects[p.object_key] = data
         summary = run_checks(db, storage)
         assert summary.total_issues == 0
@@ -596,7 +739,7 @@ class TestRepairSafe:
         pages = db.scalars(select(Page).where(Page.chapter_id == ch.id)).all()
         assert all(p.integrity_status == PageIntegrityStatus.missing for p in pages)
 
-    def test_repair_marks_abandoned_jobs(self, db):
+    def test_repair_leaves_stale_job_for_recovery_tooling(self, db):
         old_time = datetime.now(timezone.utc) - timedelta(hours=48)
         job = _create_import_job(
             db,
@@ -606,17 +749,40 @@ class TestRepairSafe:
         db.flush()
         repair_safe(db, None)
         job_refresh = db.get(ImportJob, job.id)
-        assert job_refresh.status == ImportJobStatus.failed
-        assert job_refresh.finished_at is not None
+        assert job_refresh.status == ImportJobStatus.uploading
+        assert job_refresh.finished_at is None
 
-    def test_repair_quarantines_exposed_chapters(self, db):
+    def test_repair_does_not_quarantine_active_import(self, db):
         s = _create_series(db)
         ch = _create_chapter(db, s, status=ChapterImportStatus.importing)
         _create_page(db, ch, integrity_status=PageIntegrityStatus.verified)
         db.flush()
         repair_safe(db, None)
         ch_refresh = db.get(Chapter, ch.id)
-        assert ch_refresh.import_status == ChapterImportStatus.quarantined
+        assert ch_refresh.import_status == ChapterImportStatus.importing
+
+    def test_repair_does_not_mark_pages_missing_during_storage_outage(self, db):
+        series = _create_series(db)
+        chapter = _create_chapter(db, series)
+        page = _create_page(db, chapter, integrity_status=PageIntegrityStatus.verified)
+        db.flush()
+        repair_safe(db, UnavailableStorage())
+        db.refresh(page)
+        assert page.integrity_status == PageIntegrityStatus.verified
+        assert page.verified_at is not None
+
+    def test_repair_preserves_terminal_partial_job(self, db):
+        old_time = datetime.now(timezone.utc) - timedelta(hours=48)
+        job = _create_import_job(
+            db,
+            status=ImportJobStatus.partial,
+            started_at=old_time,
+        )
+        job.finished_at = old_time + timedelta(hours=1)
+        db.flush()
+        repair_safe(db, None)
+        db.refresh(job)
+        assert job.status == ImportJobStatus.partial
 
     def test_repair_does_not_delete_objects(self, db):
         storage = FakeStorage()

@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import json
 import uuid
+from datetime import datetime, timezone
 from decimal import Decimal
 
 from sqlalchemy import event
 
 from models import Chapter, ChapterImportStatus, ContentType, Page, PageIntegrityStatus, Series
 from reader.cursor import ReaderDirection, encode_cursor
+from storage.keys import page_object_key
 
 
 SERIES_ID = uuid.UUID("00000000-0000-0000-0000-000000000001")
@@ -43,10 +45,15 @@ def _chapter(
             id=_id(chapter_id.int % 1000 * 10 + page_number),
             chapter=chapter,
             page_number=page_number,
-            object_key=f"private/{chapter_id}/{page_number}.jpg",
+            object_key=page_object_key(series.id, chapter_id, page_number, "a" * 64, "jpg"),
             integrity_status=page_status,
             width=width,
             height=height,
+            file_size=1,
+            sha256="a" * 64,
+            mime_type="image/jpeg",
+            file_extension="jpg",
+            verified_at=datetime.now(timezone.utc) if page_status == PageIntegrityStatus.verified else None,
         )
         for page_number, page_status, width, height in (page_values or [])
     ]
@@ -63,7 +70,7 @@ def _reader_fixture(db):
     chapters = {
         "1": _chapter(series, _id(101), "1", page_values=[(2, PageIntegrityStatus.verified, 800, 1200), (1, PageIntegrityStatus.verified, 1200, 1800)]),
         "1.5": _chapter(series, _id(102), "1.5", page_values=[(1, PageIntegrityStatus.verified, 1000, 1500), (2, PageIntegrityStatus.pending, 1000, 1500)]),
-        "1.75": _chapter(series, _id(103), "1.75", page_values=[(1, PageIntegrityStatus.verified, None, None)]),
+        "1.75": _chapter(series, _id(103), "1.75", page_values=[(1, PageIntegrityStatus.verified, 1000, 1500)]),
         "10": _chapter(series, _id(104), "10", page_values=[(1, PageIntegrityStatus.verified, 1200, 1800)]),
         "12a": _chapter(series, _id(105), "12", page_values=[(1, PageIntegrityStatus.verified, 1200, 1800)]),
         "12b": _chapter(series, _id(106), "12", language="ja", page_values=[(1, PageIntegrityStatus.verified, 1200, 1800)]),

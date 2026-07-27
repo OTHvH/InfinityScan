@@ -24,6 +24,7 @@ from settings import Settings
 
 from .base import (
     ObjectMetadata,
+    ObjectPage,
     ObjectVerification,
     StorageConfigurationError,
     StorageError,
@@ -32,7 +33,7 @@ from .base import (
 
 
 OBJECT_CACHE_CONTROL = "public, max-age=31536000, immutable"
-_MISSING_CODES = {"404", "NoSuchKey", "NoSuchBucket", "NotFound"}
+_MISSING_CODES = {"404", "NoSuchKey", "NotFound"}
 _RETRYABLE_STATUS_CODES = {408, 429}
 
 
@@ -47,6 +48,7 @@ class S3StorageConfig:
     force_path_style: bool = False
     connect_timeout: float = 5.0
     read_timeout: float = 30.0
+    max_retries: int = 4
 
     @classmethod
     def from_settings(cls, settings: Settings) -> "S3StorageConfig":
@@ -62,6 +64,7 @@ class S3StorageConfig:
             force_path_style=settings.s3_force_path_style,
             connect_timeout=settings.s3_connect_timeout,
             read_timeout=settings.s3_read_timeout,
+            max_retries=settings.s3_max_retries,
         )
 
     def validate(self) -> None:
@@ -80,6 +83,8 @@ class S3StorageConfig:
             raise StorageConfigurationError("Presigned URL lifetime must be between 1 and 3600 seconds")
         if self.connect_timeout <= 0 or self.read_timeout <= 0:
             raise StorageConfigurationError("S3 timeouts must be positive")
+        if self.max_retries < 0 or self.max_retries > 10:
+            raise StorageConfigurationError("S3 max retries must be between 0 and 10")
 
 
 class S3CompatibleStorage:
@@ -92,18 +97,19 @@ class S3CompatibleStorage:
         client: Any | None = None,
         sleep: Callable[[float], None] = time.sleep,
         random_value: Callable[[], float] = random.random,
-        max_retries: int = 4,
+        max_retries: int | None = None,
         retry_base_delay: float = 0.25,
         retry_max_delay: float = 4.0,
     ) -> None:
         config.validate()
-        if max_retries < 0:
+        configured_retries = config.max_retries if max_retries is None else max_retries
+        if configured_retries < 0:
             raise ValueError("max_retries must not be negative")
         self.config = config
         self.bucket = config.bucket
         self._sleep = sleep
         self._random = random_value
-        self._max_retries = max_retries
+        self._max_retries = configured_retries
         self._retry_base_delay = retry_base_delay
         self._retry_max_delay = retry_max_delay
         if client is None:
@@ -149,6 +155,8 @@ class S3CompatibleStorage:
     @classmethod
     def _is_missing(cls, exc: ClientError) -> bool:
         code = str(exc.response.get("Error", {}).get("Code", ""))
+        if code == "NoSuchBucket":
+            return False
         return code in _MISSING_CODES or cls._error_status(exc) == 404
 
     @classmethod
@@ -315,10 +323,11 @@ class S3CompatibleStorage:
         key: str,
         expected_sha256: str | None = None,
         expected_size: int | None = None,
+        metadata: ObjectMetadata | None = None,
     ) -> ObjectVerification:
         self._validate_key(key)
-        metadata = self.head_object(key)
-        if metadata is None:
+        object_metadata = metadata if metadata is not None else self.head_object(key)
+        if object_metadata is None:
             return ObjectVerification(
                 key=key,
                 exists=False,
@@ -330,24 +339,22 @@ class S3CompatibleStorage:
                 reason="missing",
             )
 
-        response = self._call(
-            "get_object",
-            key,
-            lambda: self._client.get_object(Bucket=self.bucket, Key=key),
-        )
-        body = response["Body"]
-        digest = hashlib.sha256()
-        byte_size = 0
-        try:
-            for chunk in iter(lambda: body.read(1024 * 1024), b""):
-                digest.update(chunk)
-                byte_size += len(chunk)
-        finally:
-            body.close()
+        def download_and_hash() -> tuple[str, int]:
+            response = self._client.get_object(Bucket=self.bucket, Key=key)
+            body = response["Body"]
+            digest = hashlib.sha256()
+            byte_size = 0
+            try:
+                for chunk in iter(lambda: body.read(1024 * 1024), b""):
+                    digest.update(chunk)
+                    byte_size += len(chunk)
+            finally:
+                body.close()
+            return digest.hexdigest(), byte_size
 
-        actual_sha256 = digest.hexdigest()
-        required_sha256 = expected_sha256 or metadata.sha256
-        required_size = expected_size if expected_size is not None else metadata.byte_size
+        actual_sha256, byte_size = self._call("get_object", key, download_and_hash)
+        required_sha256 = expected_sha256 or object_metadata.sha256
+        required_size = expected_size if expected_size is not None else object_metadata.byte_size
         verified = (
             required_sha256 is not None
             and actual_sha256 == required_sha256
@@ -364,6 +371,44 @@ class S3CompatibleStorage:
             actual_size=byte_size,
             reason=reason,
         )
+
+    def list_objects_page(
+        self,
+        *,
+        prefix: str,
+        continuation_token: str | None = None,
+        max_keys: int = 1000,
+    ) -> ObjectPage:
+        if max_keys < 1 or max_keys > 1000:
+            raise ValueError("max_keys must be between 1 and 1000")
+        kwargs: dict[str, Any] = {
+            "Bucket": self.bucket,
+            "Prefix": prefix,
+            "MaxKeys": max_keys,
+        }
+        if continuation_token:
+            kwargs["ContinuationToken"] = continuation_token
+        response = self._call(
+            "list_objects_v2",
+            None,
+            lambda: self._client.list_objects_v2(**kwargs),
+        )
+        objects = tuple(
+            ObjectMetadata(
+                key=str(entry["Key"]),
+                byte_size=int(entry.get("Size", 0)),
+                mime_type=None,
+                sha256=None,
+                etag=str(entry.get("ETag", "")).strip('"') or None,
+                last_modified=entry.get("LastModified"),
+            )
+            for entry in response.get("Contents", ())
+        )
+        truncated = bool(response.get("IsTruncated"))
+        next_token = response.get("NextContinuationToken") if truncated else None
+        if truncated and (next_token is None or not str(next_token)):
+            raise StorageError("S3 list_objects_v2 returned an invalid continuation token")
+        return ObjectPage(objects=objects, next_token=str(next_token) if next_token is not None else None)
 
     def health_check(self) -> bool:
         try:

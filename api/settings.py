@@ -16,7 +16,6 @@ from __future__ import annotations
 import os
 import secrets
 from dataclasses import dataclass, field
-from typing import ClassVar
 
 
 def _bool(name: str, default: bool = False) -> bool:
@@ -205,6 +204,21 @@ class Settings:
     s3_read_timeout: float = field(
         default_factory=lambda: _float("S3_READ_TIMEOUT", 30.0)
     )
+    s3_max_retries: int = field(
+        default_factory=lambda: int(os.environ.get("S3_MAX_RETRIES", "4"))
+    )
+    integrity_max_concurrency: int = field(
+        default_factory=lambda: int(os.environ.get("INTEGRITY_MAX_CONCURRENCY", "8"))
+    )
+    integrity_inventory_page_size: int = field(
+        default_factory=lambda: int(os.environ.get("INTEGRITY_INVENTORY_PAGE_SIZE", "1000"))
+    )
+    integrity_issue_limit: int = field(
+        default_factory=lambda: int(os.environ.get("INTEGRITY_ISSUE_LIMIT", "1000"))
+    )
+    integrity_delete_min_age_seconds: int = field(
+        default_factory=lambda: int(os.environ.get("INTEGRITY_DELETE_MIN_AGE_SECONDS", "86400"))
+    )
     storage_public_base_url: str | None = field(
         default_factory=lambda: os.environ.get("STORAGE_PUBLIC_BASE_URL") or None
     )
@@ -284,6 +298,16 @@ def _validate_settings(s: Settings) -> None:
         raise ValueError("S3_PRESIGN_TTL_SECONDS must be between 1 and 3600 seconds")
     if s.s3_connect_timeout <= 0 or s.s3_read_timeout <= 0:
         raise ValueError("S3_CONNECT_TIMEOUT and S3_READ_TIMEOUT must be positive")
+    if s.s3_max_retries < 0 or s.s3_max_retries > 10:
+        raise ValueError("S3_MAX_RETRIES must be between 0 and 10")
+    if s.integrity_max_concurrency < 1 or s.integrity_max_concurrency > 32:
+        raise ValueError("INTEGRITY_MAX_CONCURRENCY must be between 1 and 32")
+    if s.integrity_inventory_page_size < 1 or s.integrity_inventory_page_size > 1000:
+        raise ValueError("INTEGRITY_INVENTORY_PAGE_SIZE must be between 1 and 1000")
+    if s.integrity_issue_limit < 1 or s.integrity_issue_limit > 10000:
+        raise ValueError("INTEGRITY_ISSUE_LIMIT must be between 1 and 10000")
+    if s.integrity_delete_min_age_seconds < 0:
+        raise ValueError("INTEGRITY_DELETE_MIN_AGE_SECONDS must not be negative")
 
     if s.object_storage_enabled:
         required = {

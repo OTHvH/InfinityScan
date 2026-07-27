@@ -27,6 +27,12 @@ class ObjectMetadata:
 
 
 @dataclass(frozen=True)
+class ObjectPage:
+    objects: tuple[ObjectMetadata, ...]
+    next_token: str | None
+
+
+@dataclass(frozen=True)
 class UploadResult:
     key: str
     byte_size: int
@@ -72,8 +78,18 @@ class ObjectStorage(Protocol):
         key: str,
         expected_sha256: str | None = None,
         expected_size: int | None = None,
+        metadata: ObjectMetadata | None = None,
     ) -> ObjectVerification:
-        """Download and verify object bytes against expected metadata."""
+        """Stream and verify object bytes against expected metadata."""
+
+    def list_objects_page(
+        self,
+        *,
+        prefix: str,
+        continuation_token: str | None = None,
+        max_keys: int = 1000,
+    ) -> ObjectPage:
+        """Return one bounded object-inventory page and an opaque next token."""
 
     def health_check(self) -> bool:
         """Check that the configured bucket is reachable."""

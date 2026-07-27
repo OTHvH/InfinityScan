@@ -15,7 +15,7 @@ from unittest.mock import patch
 
 import pytest
 
-from settings import Settings, get_settings, reset_settings, _validate_settings
+from settings import get_settings, reset_settings
 
 
 @pytest.fixture(autouse=True)
@@ -349,6 +349,25 @@ class TestObjectStorageSettings:
             assert settings.object_storage_enabled is False
             assert settings.s3_region == "auto"
             assert settings.s3_presign_ttl_seconds == 300
+            assert settings.s3_max_retries == 4
+            assert settings.integrity_max_concurrency == 8
+            assert settings.integrity_inventory_page_size == 1000
+
+    @pytest.mark.parametrize(
+        ("name", "value", "message"),
+        [
+            ("S3_MAX_RETRIES", "11", "S3_MAX_RETRIES"),
+            ("INTEGRITY_MAX_CONCURRENCY", "0", "INTEGRITY_MAX_CONCURRENCY"),
+            ("INTEGRITY_INVENTORY_PAGE_SIZE", "1001", "INTEGRITY_INVENTORY_PAGE_SIZE"),
+            ("INTEGRITY_ISSUE_LIMIT", "0", "INTEGRITY_ISSUE_LIMIT"),
+            ("INTEGRITY_DELETE_MIN_AGE_SECONDS", "-1", "INTEGRITY_DELETE_MIN_AGE_SECONDS"),
+        ],
+    )
+    def test_integrity_storage_bounds_are_validated(self, name, value, message):
+        with patch.dict(os.environ, {name: value}):
+            reset_settings()
+            with pytest.raises(ValueError, match=message):
+                get_settings()
 
     def test_enabled_development_storage_reads_configuration(self):
         with patch.dict(

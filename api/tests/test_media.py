@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import uuid
+from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
 
@@ -78,6 +79,7 @@ def _create_content(db, *, chapter_status=ChapterImportStatus.ready, page_status
         width=100,
         height=100,
         file_size=10,
+        verified_at=datetime.now(timezone.utc) if page_status == PageIntegrityStatus.verified else None,
     )
     db.add(series)
     db.commit()

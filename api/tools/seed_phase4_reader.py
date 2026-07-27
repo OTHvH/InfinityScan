@@ -6,6 +6,7 @@ import argparse
 import hashlib
 import json
 import uuid
+from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
 
@@ -22,6 +23,7 @@ from models import (
 )
 from settings import get_settings
 from storage import create_object_storage
+from storage.keys import page_object_key
 
 SERIES_ID = uuid.UUID("60000000-0000-0000-0000-000000000001")
 OTHER_SERIES_ID = uuid.UUID("60000000-0000-0000-0000-000000000002")
@@ -37,6 +39,7 @@ def fixture_id(value: int) -> uuid.UUID:
 def seed(database_url: str) -> dict[str, object]:
     engine = create_engine(database_url, pool_pre_ping=True)
     digest = hashlib.sha256(b"phase4-reader-page").hexdigest()
+    verified_at = datetime.now(timezone.utc)
     with Session(engine, expire_on_commit=False) as db:
         db.execute(delete(Series).where(Series.slug.in_([SLUG, "phase4-other-reader"])))
         series = Series(
@@ -74,7 +77,7 @@ def seed(database_url: str) -> dict[str, object]:
                     id=fixture_id(1_000_000 + index * 20 + page_number),
                     chapter=chapter,
                     page_number=page_number,
-                    object_key=f"phase4/{chapter.id}/{page_number}.png",
+                    object_key=page_object_key(series.id, chapter.id, page_number, digest, "png"),
                     width=16,
                     height=24,
                     file_size=18,
@@ -82,6 +85,7 @@ def seed(database_url: str) -> dict[str, object]:
                     mime_type="image/png",
                     file_extension="png",
                     integrity_status=PageIntegrityStatus.verified,
+                    verified_at=verified_at,
                 )
                 for page_number in range(1, VERIFIED_PAGES_PER_CHAPTER + 1)
             ]
@@ -111,11 +115,21 @@ def seed(database_url: str) -> dict[str, object]:
                     Page(
                         id=fixture_id(9_200_001),
                         page_number=1,
-                        object_key="phase4/importing.png",
+                        object_key=page_object_key(
+                            series.id,
+                            fixture_id(9_100_001),
+                            1,
+                            digest,
+                            "png",
+                        ),
                         width=16,
                         height=24,
+                        file_size=18,
                         sha256=digest,
+                        mime_type="image/png",
+                        file_extension="png",
                         integrity_status=PageIntegrityStatus.verified,
+                        verified_at=verified_at,
                     )
                 ],
             ),
@@ -131,11 +145,21 @@ def seed(database_url: str) -> dict[str, object]:
                     Page(
                         id=fixture_id(9_200_002),
                         page_number=1,
-                        object_key="phase4/failed.png",
+                        object_key=page_object_key(
+                            series.id,
+                            fixture_id(9_100_002),
+                            1,
+                            digest,
+                            "png",
+                        ),
                         width=16,
                         height=24,
+                        file_size=18,
                         sha256=digest,
+                        mime_type="image/png",
+                        file_extension="png",
                         integrity_status=PageIntegrityStatus.verified,
+                        verified_at=verified_at,
                     )
                 ],
             ),
@@ -152,11 +176,21 @@ def seed(database_url: str) -> dict[str, object]:
                 Page(
                     id=fixture_id(9_400_001),
                     page_number=1,
-                    object_key="phase4/other.png",
+                    object_key=page_object_key(
+                        other_series.id,
+                        fixture_id(9_300_001),
+                        1,
+                        digest,
+                        "png",
+                    ),
                     width=16,
                     height=24,
+                    file_size=18,
                     sha256=digest,
+                    mime_type="image/png",
+                    file_extension="png",
                     integrity_status=PageIntegrityStatus.verified,
+                    verified_at=verified_at,
                 )
             ],
         )

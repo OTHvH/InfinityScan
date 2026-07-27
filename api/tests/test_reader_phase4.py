@@ -7,6 +7,7 @@ import hashlib
 import json
 import uuid
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
 
@@ -14,6 +15,7 @@ import pytest
 from sqlalchemy import event
 
 from models import Chapter, ChapterImportStatus, ContentType, Page, PageIntegrityStatus, Series
+from storage.keys import page_object_key
 
 
 SERIES_ID = uuid.UUID("40000000-0000-0000-0000-000000000001")
@@ -44,6 +46,7 @@ def phase4_reader_fixture(db, tmp_path: Path) -> Phase4ReaderFixture:
     image_path = tmp_path / "phase4-page.png"
     image_path.write_bytes(TINY_PNG)
     digest = hashlib.sha256(TINY_PNG).hexdigest()
+    verified_at = datetime.now(timezone.utc)
     series = Series(
         id=SERIES_ID,
         slug="phase4-reader",
@@ -80,7 +83,7 @@ def phase4_reader_fixture(db, tmp_path: Path) -> Phase4ReaderFixture:
                 id=_id(1_000_000 + index * 20 + page_number),
                 chapter=chapter,
                 page_number=page_number,
-                object_key=f"phase4/{chapter.id}/{page_number}.png",
+                object_key=page_object_key(series.id, chapter.id, page_number, digest, "png"),
                 width=PAGE_WIDTH,
                 height=PAGE_HEIGHT,
                 file_size=len(TINY_PNG),
@@ -88,6 +91,7 @@ def phase4_reader_fixture(db, tmp_path: Path) -> Phase4ReaderFixture:
                 mime_type="image/png",
                 file_extension="png",
                 integrity_status=PageIntegrityStatus.verified,
+                verified_at=verified_at,
             )
             for page_number in range(1, VERIFIED_PAGES_PER_CHAPTER + 1)
         ]
@@ -113,18 +117,36 @@ def phase4_reader_fixture(db, tmp_path: Path) -> Phase4ReaderFixture:
         Chapter(
             id=_id(9_100_001), series=series, number=Decimal("0.5"), title="Importing",
             language="en", page_count=1, import_status=ChapterImportStatus.importing,
-            pages=[Page(id=_id(9_200_001), page_number=1, object_key="phase4/importing.png", width=PAGE_WIDTH, height=PAGE_HEIGHT, integrity_status=PageIntegrityStatus.verified)],
+            pages=[Page(
+                id=_id(9_200_001), page_number=1,
+                object_key=page_object_key(series.id, _id(9_100_001), 1, digest, "png"),
+                width=PAGE_WIDTH, height=PAGE_HEIGHT, file_size=len(TINY_PNG), sha256=digest,
+                mime_type="image/png", file_extension="png",
+                integrity_status=PageIntegrityStatus.verified, verified_at=verified_at,
+            )],
         ),
         Chapter(
             id=_id(9_100_002), series=series, number=Decimal("999"), title="Failed",
             language="en", page_count=1, import_status=ChapterImportStatus.failed,
-            pages=[Page(id=_id(9_200_002), page_number=1, object_key="phase4/failed.png", width=PAGE_WIDTH, height=PAGE_HEIGHT, integrity_status=PageIntegrityStatus.verified)],
+            pages=[Page(
+                id=_id(9_200_002), page_number=1,
+                object_key=page_object_key(series.id, _id(9_100_002), 1, digest, "png"),
+                width=PAGE_WIDTH, height=PAGE_HEIGHT, file_size=len(TINY_PNG), sha256=digest,
+                mime_type="image/png", file_extension="png",
+                integrity_status=PageIntegrityStatus.verified, verified_at=verified_at,
+            )],
         ),
     ]
     other_chapter = Chapter(
         id=_id(9_300_001), series=other_series, number=Decimal("1"), title="Other",
         language="en", page_count=1, import_status=ChapterImportStatus.ready,
-        pages=[Page(id=_id(9_400_001), page_number=1, object_key="phase4/other.png", width=PAGE_WIDTH, height=PAGE_HEIGHT, integrity_status=PageIntegrityStatus.verified)],
+        pages=[Page(
+            id=_id(9_400_001), page_number=1,
+            object_key=page_object_key(other_series.id, _id(9_300_001), 1, digest, "png"),
+            width=PAGE_WIDTH, height=PAGE_HEIGHT, file_size=len(TINY_PNG), sha256=digest,
+            mime_type="image/png", file_extension="png",
+            integrity_status=PageIntegrityStatus.verified, verified_at=verified_at,
+        )],
     )
     # Reverse insertion ensures assertions exercise explicit database ordering.
     db.add_all([series, other_series, *reversed(chapters), *hidden, other_chapter])

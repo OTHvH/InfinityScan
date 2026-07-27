@@ -6,6 +6,7 @@ from settings import Settings, get_settings
 
 from .base import (
     ObjectMetadata,
+    ObjectPage,
     ObjectStorage,
     ObjectVerification,
     StorageConfigurationError,
@@ -26,6 +27,7 @@ def create_object_storage(settings: Settings | None = None) -> ObjectStorage | N
 
 __all__ = [
     "ObjectMetadata",
+    "ObjectPage",
     "ObjectStorage",
     "ObjectVerification",
     "S3CompatibleStorage",

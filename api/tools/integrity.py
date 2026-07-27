@@ -1,8 +1,9 @@
 """Database and storage integrity verification.
 
 Usage:
-    python -m tools.integrity check [--json]
-    python -m tools.integrity repair-safe [--json]
+    python -m tools.integrity check [--mode quick|full] [--content-sha256] [--json]
+    python -m tools.integrity repair-safe [--mode quick|full] [--json]
+    python -m tools.integrity delete-unreferenced (--dry-run | --execute) [--json]
 
 Checks detect orphaned rows, missing storage objects, hash mismatches,
 abandoned jobs, and other consistency violations.  repair-safe corrects
@@ -14,6 +15,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import re
 import sys
 import uuid
 from dataclasses import asdict, dataclass, field
@@ -28,17 +30,29 @@ from sqlalchemy.orm import Session
 
 from database import _get_engine, _get_session_local
 from models import (
+    Bookmark,
     Chapter,
     ChapterImportStatus,
     ImportJob,
     ImportJobItem,
+    ImportJobItemStatus,
     ImportJobStatus,
     Page,
     PageIntegrityStatus,
+    ReadingProgress,
     Series,
+    Source,
+    SourceSeries,
+    User,
 )
+from settings import get_settings
 from storage import ObjectStorage, create_object_storage
 from storage.base import StorageError
+from tools.storage_integrity import (
+    StorageIntegrityReport,
+    delete_unreferenced_objects,
+    run_storage_integrity,
+)
 
 LOG_FORMAT = "%(asctime)s  %(levelname)-8s  %(message)s"
 log = logging.getLogger("tools.integrity")
@@ -46,6 +60,7 @@ log = logging.getLogger("tools.integrity")
 SEVERITY_ERROR = "error"
 SEVERITY_WARNING = "warning"
 SEVERITY_CRITICAL = "critical"
+SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 
 
 @dataclass(frozen=True)
@@ -71,10 +86,27 @@ class IntegritySummary:
     repairable: int
     issues: list[IntegrityIssue]
     checked_at: str = ""
+    mode: str = "quick"
+    complete: bool = True
+    objects_checked: int = 0
+    objects_verified: int = 0
+    missing: int = 0
+    metadata_mismatch: int = 0
+    hash_mismatch: int = 0
+    orphaned: int = 0
+    invalid_keys: int = 0
+    duplicate_references: int = 0
+    stale_objects: int = 0
+    storage_errors: int = 0
+    bytes_hashed: int = 0
+    repairs_applied: int = 0
+    elapsed_time: float = 0.0
 
     def to_dict(self) -> dict[str, Any]:
         d = asdict(self)
         d["issues"] = [i.to_dict() for i in self.issues]
+        d["integrity_errors"] = d["errors"]
+        d["errors"] = d["storage_errors"]
         return d
 
 
@@ -200,6 +232,297 @@ def check_page_count_mismatch(db: Session) -> list[IntegrityIssue]:
     ]
 
 
+def _verified_page_metadata_errors(page: Page) -> list[str]:
+    errors: list[str] = []
+    if not page.object_key or not page.object_key.strip():
+        errors.append("object_key")
+    if not page.sha256 or not SHA256_PATTERN.fullmatch(page.sha256):
+        errors.append("sha256")
+    if page.width is None or page.width <= 0:
+        errors.append("width")
+    if page.height is None or page.height <= 0:
+        errors.append("height")
+    if page.file_size is None or page.file_size <= 0:
+        errors.append("file_size")
+    if not page.mime_type or not page.mime_type.strip():
+        errors.append("mime_type")
+    if not page.file_extension or not page.file_extension.strip():
+        errors.append("file_extension")
+    if page.verified_at is None:
+        errors.append("verified_at")
+    return errors
+
+
+def check_ready_chapters_without_usable_pages(db: Session) -> list[IntegrityIssue]:
+    """Ready chapters must contain at least one usable verified page."""
+    chapters = db.scalars(
+        select(Chapter).where(Chapter.import_status == ChapterImportStatus.ready)
+    ).all()
+    issues: list[IntegrityIssue] = []
+    for chapter in chapters:
+        pages = db.scalars(select(Page).where(Page.chapter_id == chapter.id)).all()
+        usable_count = sum(
+            1
+            for page in pages
+            if page.integrity_status == PageIntegrityStatus.verified
+            and not _verified_page_metadata_errors(page)
+        )
+        if usable_count == 0:
+            issues.append(
+                IntegrityIssue(
+                    category="ready_chapter_without_usable_pages",
+                    severity=SEVERITY_CRITICAL,
+                    entity_type="chapter",
+                    entity_id=str(chapter.id),
+                    description="Ready chapter has no usable verified pages",
+                    repairable=False,
+                    details={
+                        "series_id": str(chapter.series_id),
+                        "page_count": chapter.page_count,
+                        "page_rows": len(pages),
+                    },
+                )
+            )
+    return issues
+
+
+def check_verified_pages_missing_metadata(db: Session) -> list[IntegrityIssue]:
+    """Verified pages missing metadata required by imports and media delivery."""
+    pages = db.scalars(
+        select(Page).where(Page.integrity_status == PageIntegrityStatus.verified)
+    ).all()
+    issues: list[IntegrityIssue] = []
+    for page in pages:
+        invalid_fields = _verified_page_metadata_errors(page)
+        if invalid_fields:
+            issues.append(
+                IntegrityIssue(
+                    category="verified_page_missing_metadata",
+                    severity=SEVERITY_CRITICAL,
+                    entity_type="page",
+                    entity_id=str(page.id),
+                    description="Verified page has missing or invalid required metadata",
+                    repairable=False,
+                    details={
+                        "chapter_id": str(page.chapter_id),
+                        "invalid_fields": invalid_fields,
+                    },
+                )
+            )
+    return issues
+
+
+def check_duplicate_logical_content_references(db: Session) -> list[IntegrityIssue]:
+    """The same non-empty page object key must not identify multiple page rows."""
+    duplicates = db.execute(
+        select(Page.object_key, func.count(Page.id).label("count"))
+        .where(Page.object_key != "")
+        .group_by(Page.object_key)
+        .having(func.count(Page.id) > 1)
+    ).all()
+    issues: list[IntegrityIssue] = []
+    for duplicate in duplicates:
+        page_ids = [
+            str(page_id)
+            for page_id in db.scalars(
+                select(Page.id).where(Page.object_key == duplicate.object_key)
+            ).all()
+        ]
+        issues.append(
+            IntegrityIssue(
+                category="duplicate_logical_content_reference",
+                severity=SEVERITY_ERROR,
+                entity_type="page",
+                entity_id=page_ids[0],
+                description="Multiple page rows reference the same object key",
+                repairable=False,
+                details={"object_key": duplicate.object_key, "page_ids": page_ids},
+            )
+        )
+    return issues
+
+
+def check_broken_source_mappings(db: Session) -> list[IntegrityIssue]:
+    """Source mappings with missing parents or unusable external identities."""
+    rows = db.execute(
+        select(
+            SourceSeries.id,
+            SourceSeries.source_id,
+            SourceSeries.series_id,
+            SourceSeries.external_series_id,
+            Source.id.label("existing_source_id"),
+            Series.id.label("existing_series_id"),
+        )
+        .outerjoin(Source, SourceSeries.source_id == Source.id)
+        .outerjoin(Series, SourceSeries.series_id == Series.id)
+    ).all()
+    issues: list[IntegrityIssue] = []
+    for row in rows:
+        invalid_fields: list[str] = []
+        if row.existing_source_id is None:
+            invalid_fields.append("source_id")
+        if row.existing_series_id is None:
+            invalid_fields.append("series_id")
+        if not row.external_series_id or not row.external_series_id.strip():
+            invalid_fields.append("external_series_id")
+        if invalid_fields:
+            issues.append(
+                IntegrityIssue(
+                    category="broken_source_mapping",
+                    severity=SEVERITY_ERROR,
+                    entity_type="source_series",
+                    entity_id=str(row.id),
+                    description="Source mapping has missing or invalid relationships",
+                    repairable=False,
+                    details={"invalid_fields": invalid_fields},
+                )
+            )
+    return issues
+
+
+def check_invalid_import_job_states(db: Session) -> list[IntegrityIssue]:
+    """Import jobs and items whose counters, timestamps, or state data disagree."""
+    terminal = {
+        ImportJobStatus.succeeded,
+        ImportJobStatus.partial,
+        ImportJobStatus.failed,
+        ImportJobStatus.cancelled,
+    }
+    issues: list[IntegrityIssue] = []
+    for job in db.scalars(select(ImportJob)).all():
+        invalid_fields: list[str] = []
+        counters = (
+            job.series_count,
+            job.chapter_count,
+            job.page_count,
+            job.uploaded_count,
+            job.skipped_count,
+            job.failed_count,
+        )
+        if any(value < 0 for value in counters):
+            invalid_fields.append("counters")
+        if job.status in terminal and job.finished_at is None:
+            invalid_fields.append("finished_at")
+        if job.status not in terminal and job.finished_at is not None:
+            invalid_fields.append("status")
+        if job.started_at and job.created_at and job.started_at < job.created_at:
+            invalid_fields.append("started_at")
+        reference_time = job.started_at or job.created_at
+        if job.finished_at and reference_time and job.finished_at < reference_time:
+            invalid_fields.append("finished_at_order")
+        if job.manifest_hash and not SHA256_PATTERN.fullmatch(job.manifest_hash):
+            invalid_fields.append("manifest_hash")
+        if invalid_fields:
+            issues.append(
+                IntegrityIssue(
+                    category="invalid_import_job_state",
+                    severity=SEVERITY_ERROR,
+                    entity_type="import_job",
+                    entity_id=str(job.id),
+                    description="Import job has inconsistent state or accounting data",
+                    repairable=False,
+                    details={"status": job.status.value, "invalid_fields": invalid_fields},
+                )
+            )
+
+    for item in db.scalars(select(ImportJobItem)).all():
+        invalid_fields = []
+        if item.status == ImportJobItemStatus.succeeded:
+            if not item.object_key or not item.object_key.strip():
+                invalid_fields.append("object_key")
+            if not item.sha256 or not SHA256_PATTERN.fullmatch(item.sha256):
+                invalid_fields.append("sha256")
+        if item.status == ImportJobItemStatus.failed and not item.error:
+            invalid_fields.append("error")
+        if invalid_fields:
+            issues.append(
+                IntegrityIssue(
+                    category="invalid_import_job_item_state",
+                    severity=SEVERITY_ERROR,
+                    entity_type="import_job_item",
+                    entity_id=str(item.id),
+                    description="Import job item has incomplete terminal state data",
+                    repairable=False,
+                    details={"status": item.status.value, "invalid_fields": invalid_fields},
+                )
+            )
+    return issues
+
+
+def check_progress_beyond_chapter_page_count(db: Session) -> list[IntegrityIssue]:
+    """Reading progress must not point beyond its chapter's declared page count."""
+    rows = db.execute(
+        select(
+            ReadingProgress.id,
+            ReadingProgress.user_id,
+            ReadingProgress.chapter_id,
+            ReadingProgress.last_page,
+            Chapter.page_count,
+        )
+        .join(Chapter, ReadingProgress.chapter_id == Chapter.id)
+        .where(
+            ReadingProgress.last_page.isnot(None),
+            ReadingProgress.last_page > Chapter.page_count,
+        )
+    ).all()
+    return [
+        IntegrityIssue(
+            category="progress_beyond_chapter_page_count",
+            severity=SEVERITY_WARNING,
+            entity_type="reading_progress",
+            entity_id=str(row.id),
+            description="Reading progress points beyond the chapter page count",
+            repairable=False,
+            details={
+                "user_id": str(row.user_id),
+                "chapter_id": str(row.chapter_id),
+                "last_page": row.last_page,
+                "page_count": row.page_count,
+            },
+        )
+        for row in rows
+    ]
+
+
+def check_orphaned_relationships(db: Session) -> list[IntegrityIssue]:
+    """Relationship rows whose parents are missing despite declared foreign keys."""
+    issues: list[IntegrityIssue] = []
+    bookmark_rows = db.execute(
+        select(Bookmark.id, User.id.label("user_exists"), Series.id.label("series_exists"))
+        .outerjoin(User, Bookmark.user_id == User.id)
+        .outerjoin(Series, Bookmark.series_id == Series.id)
+        .where((User.id.is_(None)) | (Series.id.is_(None)))
+    ).all()
+    progress_rows = db.execute(
+        select(ReadingProgress.id, User.id.label("user_exists"), Chapter.id.label("chapter_exists"))
+        .outerjoin(User, ReadingProgress.user_id == User.id)
+        .outerjoin(Chapter, ReadingProgress.chapter_id == Chapter.id)
+        .where((User.id.is_(None)) | (Chapter.id.is_(None)))
+    ).all()
+    item_rows = db.execute(
+        select(ImportJobItem.id)
+        .outerjoin(ImportJob, ImportJobItem.job_id == ImportJob.id)
+        .where(ImportJob.id.is_(None))
+    ).all()
+    for entity_type, rows in (
+        ("bookmark", bookmark_rows),
+        ("reading_progress", progress_rows),
+        ("import_job_item", item_rows),
+    ):
+        issues.extend(
+            IntegrityIssue(
+                category="orphaned_relationship",
+                severity=SEVERITY_ERROR,
+                entity_type=entity_type,
+                entity_id=str(row.id),
+                description=f"{entity_type} references a missing parent row",
+                repairable=False,
+            )
+            for row in rows
+        )
+    return issues
+
+
 def check_missing_storage_objects(
     db: Session, storage: ObjectStorage | None
 ) -> list[IntegrityIssue]:
@@ -219,7 +542,18 @@ def check_missing_storage_objects(
         try:
             meta = storage.head_object(row.object_key)
         except StorageError:
-            meta = None
+            issues.append(
+                IntegrityIssue(
+                    category="storage_unavailable",
+                    severity=SEVERITY_ERROR,
+                    entity_type="page",
+                    entity_id=str(row.id),
+                    description="Storage object existence could not be verified",
+                    repairable=False,
+                    details={"chapter_id": str(row.chapter_id)},
+                )
+            )
+            continue
         if meta is None:
             issues.append(
                 IntegrityIssue(
@@ -352,7 +686,7 @@ def check_invalid_image_dimensions(db: Session) -> list[IntegrityIssue]:
 
 
 def check_importing_chapters_exposed(db: Session) -> list[IntegrityIssue]:
-    """Chapters still in 'importing' status that have verified pages (data leak risk)."""
+    """Importing chapters with verified pages require review but are not published."""
     rows = db.execute(
         select(Chapter.id, Chapter.import_status, Chapter.series_id)
         .where(Chapter.import_status == ChapterImportStatus.importing)
@@ -369,13 +703,11 @@ def check_importing_chapters_exposed(db: Session) -> list[IntegrityIssue]:
             issues.append(
                 IntegrityIssue(
                     category="importing_chapter_exposed",
-                    severity=SEVERITY_CRITICAL,
+                    severity=SEVERITY_WARNING,
                     entity_type="chapter",
                     entity_id=str(ch.id),
-                    description=(
-                        f"Chapter with status 'importing' has {verified_count} verified pages"
-                    ),
-                    repairable=True,
+                    description=f"Importing chapter has {verified_count} intermediate verified pages",
+                    repairable=False,
                     details={
                         "series_id": str(ch.series_id),
                         "verified_page_count": verified_count,
@@ -389,6 +721,7 @@ def check_abandoned_import_jobs(db: Session) -> list[IntegrityIssue]:
     """Import jobs stuck in non-terminal status with no recent activity."""
     terminal = {
         ImportJobStatus.succeeded,
+        ImportJobStatus.partial,
         ImportJobStatus.failed,
         ImportJobStatus.cancelled,
     }
@@ -522,54 +855,114 @@ ALL_CHECKS = [
     check_orphaned_chapters,
     check_duplicate_page_positions,
     check_page_count_mismatch,
-    check_missing_storage_objects,
-    check_storage_size_mismatch,
-    check_sha256_mismatch,
+    check_ready_chapters_without_usable_pages,
+    check_verified_pages_missing_metadata,
+    check_broken_source_mappings,
+    check_invalid_import_job_states,
+    check_progress_beyond_chapter_page_count,
+    check_orphaned_relationships,
     check_invalid_image_dimensions,
-    check_importing_chapters_exposed,
     check_abandoned_import_jobs,
-    check_unreferenced_storage_objects,
-    check_stale_replaced_objects,
 ]
 
 
+def _build_summary(
+    issues: list[IntegrityIssue],
+    storage_report: StorageIntegrityReport | None = None,
+) -> IntegritySummary:
+    report = storage_report or StorageIntegrityReport(
+        mode="quick",
+        content_sha256=False,
+        issue_limit=1,
+    )
+    return IntegritySummary(
+        total_issues=len(issues),
+        errors=sum(1 for issue in issues if issue.severity == SEVERITY_ERROR),
+        warnings=sum(1 for issue in issues if issue.severity == SEVERITY_WARNING),
+        criticals=sum(1 for issue in issues if issue.severity == SEVERITY_CRITICAL),
+        repairable=sum(1 for issue in issues if issue.repairable),
+        issues=issues,
+        checked_at=datetime.now(timezone.utc).isoformat(),
+        mode=report.mode,
+        complete=report.complete,
+        objects_checked=report.objects_checked,
+        objects_verified=report.objects_verified,
+        missing=report.missing,
+        metadata_mismatch=report.metadata_mismatch,
+        hash_mismatch=report.hash_mismatch,
+        orphaned=report.orphaned,
+        invalid_keys=report.invalid_keys,
+        duplicate_references=report.duplicate_references,
+        stale_objects=report.stale_objects,
+        storage_errors=report.errors,
+        bytes_hashed=report.bytes_hashed,
+        repairs_applied=report.repairs_applied,
+        elapsed_time=report.elapsed_time,
+    )
+
+
+def _storage_issues(report: StorageIntegrityReport) -> list[IntegrityIssue]:
+    return [
+        IntegrityIssue(
+            category=issue.category,
+            severity=issue.severity,
+            entity_type="storage_object",
+            entity_id=issue.entity_id,
+            description=issue.description,
+            repairable=issue.repairable,
+            details=issue.details,
+        )
+        for issue in report.issues
+    ]
+
+
 def run_checks(
-    db: Session, storage: ObjectStorage | None = None
+    db: Session,
+    storage: ObjectStorage | None = None,
+    *,
+    mode: str = "quick",
+    content_sha256: bool = False,
+    max_concurrency: int = 8,
+    inventory_page_size: int = 1000,
+    issue_limit: int = 1000,
 ) -> IntegritySummary:
     """Run all integrity checks and return a summary."""
     issues: list[IntegrityIssue] = []
     for check_fn in ALL_CHECKS:
-        if check_fn in (check_missing_storage_objects, check_storage_size_mismatch, check_sha256_mismatch, check_unreferenced_storage_objects, check_stale_replaced_objects):
-            issues.extend(check_fn(db, storage))
-        else:
-            issues.extend(check_fn(db))
-    errors = sum(1 for i in issues if i.severity == SEVERITY_ERROR)
-    warnings = sum(1 for i in issues if i.severity == SEVERITY_WARNING)
-    criticals = sum(1 for i in issues if i.severity == SEVERITY_CRITICAL)
-    return IntegritySummary(
-        total_issues=len(issues),
-        errors=errors,
-        warnings=warnings,
-        criticals=criticals,
-        repairable=sum(1 for i in issues if i.repairable),
-        issues=issues,
-        checked_at=datetime.now(timezone.utc).isoformat(),
-    )
+        issues.extend(check_fn(db))
+    storage_report = None
+    if storage is not None:
+        storage_report = run_storage_integrity(
+            db,
+            storage,
+            mode=mode,
+            content_sha256=content_sha256,
+            max_concurrency=max_concurrency,
+            inventory_page_size=inventory_page_size,
+            issue_limit=issue_limit,
+        )
+        issues.extend(_storage_issues(storage_report))
+    return _build_summary(issues, storage_report)
 
 
 # ─── Safe repair operations ──────────────────────────────────────────────────
 
 
 def repair_safe(
-    db: Session, storage: ObjectStorage | None = None
+    db: Session,
+    storage: ObjectStorage | None = None,
+    *,
+    mode: str = "quick",
+    content_sha256: bool = False,
+    max_concurrency: int = 8,
+    inventory_page_size: int = 1000,
+    issue_limit: int = 1000,
 ) -> IntegritySummary:
     """Run checks, apply non-destructive repairs, then re-check.
 
     Repairs performed:
       - Recalculate page_count on chapters with mismatch
-      - Mark missing/mismatch integrity status on pages
-      - Mark abandoned import jobs as failed
-      - Quarantine chapters with importing status but verified pages
+      - Mark conclusive missing/mismatch integrity status on pages
 
     Never deletes objects, metadata, or hashes.
     Never publishes partial chapters.
@@ -598,112 +991,36 @@ def repair_safe(
                 {"cnt": row.actual_count, "id": str(row.id)},
             )
         repaired_count += 1
-        issues.append(
-            IntegrityIssue(
-                category="page_count_mismatch",
-                severity=SEVERITY_WARNING,
-                entity_type="chapter",
-                entity_id=str(row.id),
-                description=f"Recalculated page_count: {row.page_count} -> {row.actual_count}",
-                repairable=True,
-                details={"old": row.page_count, "new": row.actual_count},
-            )
-        )
-
-    # 2. Mark missing storage objects
-    if storage is not None:
-        pages = db.scalars(
-            select(Page).where(
-                Page.object_key.isnot(None),
-                Page.object_key != "",
-                Page.integrity_status != PageIntegrityStatus.missing,
-            )
-        ).all()
-        for page in pages:
-            try:
-                meta = storage.head_object(page.object_key)
-            except StorageError:
-                meta = None
-            if meta is None:
-                page.integrity_status = PageIntegrityStatus.missing
-                page.verified_at = None
-                repaired_count += 1
-                issues.append(
-                    IntegrityIssue(
-                        category="missing_storage_object",
-                        severity=SEVERITY_CRITICAL,
-                        entity_type="page",
-                        entity_id=str(page.id),
-                        description=f"Marked missing: {page.object_key}",
-                        repairable=True,
-                        details={"object_key": page.object_key},
-                    )
-                )
-
-    # 3. Mark abandoned import jobs as failed
-    terminal = {
-        ImportJobStatus.succeeded,
-        ImportJobStatus.failed,
-        ImportJobStatus.cancelled,
-    }
-    active_statuses = [s for s in ImportJobStatus if s not in terminal]
-    active_jobs = db.scalars(
-        select(ImportJob).where(ImportJob.status.in_(active_statuses))
-    ).all()
-    now = datetime.now(timezone.utc)
-    for job in active_jobs:
-        ref_time = job.started_at or job.created_at
-        if ref_time is None:
-            continue
-        age_hours = (now - ref_time.replace(tzinfo=timezone.utc)).total_seconds() / 3600
-        if age_hours > 24:
-            job.status = ImportJobStatus.failed
-            job.finished_at = now
-            job.error_summary = job.error_summary or "Marked failed by integrity repair (abandoned >24h)"
-            repaired_count += 1
-            issues.append(
-                IntegrityIssue(
-                    category="abandoned_import_job",
-                    severity=SEVERITY_WARNING,
-                    entity_type="import_job",
-                    entity_id=str(job.id),
-                    description=f"Marked failed (was '{job.status.value}' for {age_hours:.0f}h)",
-                    repairable=True,
-                    details={"job_id": str(job.id), "age_hours": round(age_hours, 1)},
-                )
-            )
-
-    # 4. Quarantine importing chapters with verified pages
-    importing_chapters = db.scalars(
-        select(Chapter).where(Chapter.import_status == ChapterImportStatus.importing)
-    ).all()
-    for ch in importing_chapters:
-        verified_count = db.scalar(
-            select(func.count(Page.id)).where(
-                Page.chapter_id == ch.id,
-                Page.integrity_status == PageIntegrityStatus.verified,
-            )
-        ) or 0
-        if verified_count > 0:
-            ch.import_status = ChapterImportStatus.quarantined
-            repaired_count += 1
-            issues.append(
-                IntegrityIssue(
-                    category="importing_chapter_exposed",
-                    severity=SEVERITY_CRITICAL,
-                    entity_type="chapter",
-                    entity_id=str(ch.id),
-                    description=f"Quarantined (had {verified_count} verified pages)",
-                    repairable=True,
-                    details={"series_id": str(ch.series_id), "verified_page_count": verified_count},
-                )
-            )
 
     db.commit()
+    storage_report = None
+    if storage is not None:
+        storage_report = run_storage_integrity(
+            db,
+            storage,
+            mode=mode,
+            content_sha256=content_sha256,
+            max_concurrency=max_concurrency,
+            inventory_page_size=inventory_page_size,
+            issue_limit=issue_limit,
+            repair=True,
+        )
+        issues.extend(_storage_issues(storage_report))
     db.expire_all()
-
-    # Re-check to see remaining issues
-    return run_checks(db, storage)
+    relational_issues: list[IntegrityIssue] = []
+    for check_fn in ALL_CHECKS:
+        relational_issues.extend(check_fn(db))
+    issues.extend(relational_issues)
+    if storage_report is not None:
+        storage_report.repairs_applied += repaired_count
+    else:
+        storage_report = StorageIntegrityReport(
+            mode="quick",
+            content_sha256=False,
+            issue_limit=issue_limit,
+            repairs_applied=repaired_count,
+        )
+    return _build_summary(issues, storage_report)
 
 
 # ─── Admin API helpers ────────────────────────────────────────────────────────
@@ -811,7 +1128,16 @@ def cmd_check(args: argparse.Namespace) -> None:
     db = _build_session()
     storage = create_object_storage()
     try:
-        summary = run_checks(db, storage)
+        cfg = get_settings()
+        summary = run_checks(
+            db,
+            storage,
+            mode=args.mode,
+            content_sha256=args.content_sha256,
+            max_concurrency=args.concurrency or cfg.integrity_max_concurrency,
+            inventory_page_size=cfg.integrity_inventory_page_size,
+            issue_limit=cfg.integrity_issue_limit,
+        )
     finally:
         db.close()
 
@@ -829,6 +1155,15 @@ def cmd_check(args: argparse.Namespace) -> None:
             print(f"  Errors:        {summary.errors}")
             print(f"  Warnings:      {summary.warnings}")
             print(f"  Repairable:    {summary.repairable}")
+            print(f"  Mode:          {summary.mode}")
+            print(f"  Objects:       {summary.objects_checked} checked, {summary.objects_verified} verified")
+            print(f"  Missing:       {summary.missing}")
+            print(f"  Metadata:      {summary.metadata_mismatch} mismatch")
+            print(f"  Hash:          {summary.hash_mismatch} mismatch")
+            print(f"  Orphaned:      {summary.orphaned}")
+            print(f"  Invalid keys:  {summary.invalid_keys}")
+            print(f"  Storage errors:{summary.storage_errors}")
+            print(f"  Elapsed:       {summary.elapsed_time:.3f}s")
             print(f"{'='*60}\n")
             for issue in summary.issues:
                 tag = {"error": "ERR", "warning": "WRN", "critical": "CRI"}.get(issue.severity, "???")
@@ -836,6 +1171,8 @@ def cmd_check(args: argparse.Namespace) -> None:
                 print(f"  [{tag}] {issue.category}: {issue.description}{repair}")
             print()
 
+    if not summary.complete:
+        sys.exit(2)
     sys.exit(1 if summary.criticals > 0 or summary.errors > 0 else 0)
 
 
@@ -844,7 +1181,16 @@ def cmd_repair_safe(args: argparse.Namespace) -> None:
     db = _build_session()
     storage = create_object_storage()
     try:
-        summary = repair_safe(db, storage)
+        cfg = get_settings()
+        summary = repair_safe(
+            db,
+            storage,
+            mode=args.mode,
+            content_sha256=args.content_sha256,
+            max_concurrency=args.concurrency or cfg.integrity_max_concurrency,
+            inventory_page_size=cfg.integrity_inventory_page_size,
+            issue_limit=cfg.integrity_issue_limit,
+        )
     finally:
         db.close()
 
@@ -867,7 +1213,38 @@ def cmd_repair_safe(args: argparse.Namespace) -> None:
             print("  All issues resolved.")
         print()
 
+    if not summary.complete:
+        sys.exit(2)
     sys.exit(1 if summary.criticals > 0 or summary.errors > 0 else 0)
+
+
+def cmd_delete_unreferenced(args: argparse.Namespace) -> None:
+    """Run the explicit, separately safeguarded orphan deletion operation."""
+    cfg = get_settings()
+    storage = create_object_storage()
+    if storage is None:
+        print("Object storage is not configured", file=sys.stderr)
+        sys.exit(2)
+    if args.execute and args.confirm_bucket != cfg.s3_bucket:
+        print("--confirm-bucket must exactly match the configured bucket", file=sys.stderr)
+        sys.exit(2)
+    db = _build_session()
+    try:
+        report = delete_unreferenced_objects(
+            db,
+            storage,
+            execute=args.execute,
+            inventory_page_size=cfg.integrity_inventory_page_size,
+            minimum_age_seconds=cfg.integrity_delete_min_age_seconds,
+        )
+    finally:
+        db.close()
+    if args.json:
+        print(json.dumps(report.to_dict(), indent=2))
+    else:
+        action = "Deletion" if args.execute else "Dry-run"
+        print(f"{action} complete: {report.candidates} candidates, {report.deleted} deleted")
+    sys.exit(0 if report.complete else 2)
 
 
 def main() -> None:
@@ -880,11 +1257,31 @@ def main() -> None:
 
     check_p = sub.add_parser("check", help="Run all integrity checks")
     check_p.add_argument("--json", action="store_true", help="Output JSON")
+    check_p.add_argument("--mode", choices=("quick", "full"), default="quick")
+    check_p.add_argument("--content-sha256", action="store_true", help="Stream and hash object bytes in full mode")
+    check_p.add_argument("--concurrency", type=int, help="Maximum concurrent object requests")
 
     repair_p = sub.add_parser("repair-safe", help="Apply safe repairs and re-check")
     repair_p.add_argument("--json", action="store_true", help="Output JSON")
+    repair_p.add_argument("--mode", choices=("quick", "full"), default="quick")
+    repair_p.add_argument("--content-sha256", action="store_true", help="Stream and hash object bytes in full mode")
+    repair_p.add_argument("--concurrency", type=int, help="Maximum concurrent object requests")
+
+    delete_p = sub.add_parser(
+        "delete-unreferenced",
+        help="Explicitly dry-run or delete old unreferenced managed objects",
+    )
+    delete_mode = delete_p.add_mutually_exclusive_group(required=True)
+    delete_mode.add_argument("--dry-run", action="store_true")
+    delete_mode.add_argument("--execute", action="store_true")
+    delete_p.add_argument("--confirm-bucket")
+    delete_p.add_argument("--json", action="store_true", help="Output JSON")
 
     args = parser.parse_args()
+    if getattr(args, "content_sha256", False) and args.mode != "full":
+        parser.error("--content-sha256 requires --mode full")
+    if getattr(args, "concurrency", None) is not None and not 1 <= args.concurrency <= 32:
+        parser.error("--concurrency must be between 1 and 32")
 
     level = logging.DEBUG if args.verbose else logging.INFO
     logging.basicConfig(format=LOG_FORMAT, level=level, stream=sys.stderr)
@@ -893,6 +1290,8 @@ def main() -> None:
         cmd_check(args)
     elif args.command == "repair-safe":
         cmd_repair_safe(args)
+    elif args.command == "delete-unreferenced":
+        cmd_delete_unreferenced(args)
     else:
         parser.print_help()
         sys.exit(2)
