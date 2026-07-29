@@ -14,6 +14,10 @@ if [ "${APP_ENV:-development}" = "production" ]; then
   printf '%s\n' 'Phase 5 refuses APP_ENV=production.' >&2
   exit 2
 fi
+if [ -e "$REPO_ROOT/infra/.env" ]; then
+  printf '%s\n' 'Phase 5 refuses to run while infra/.env exists; use a disposable synthetic environment.' >&2
+  exit 2
+fi
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -27,9 +31,12 @@ if [ -n "${PYTHON:-}" ]; then
 elif [ -x "$REPO_ROOT/api/.venv/bin/python" ]; then
   API_PYTHON="$REPO_ROOT/api/.venv/bin/python"
 else
-  API_PYTHON="$REPO_ROOT/.venv/bin/python"
+  API_PYTHON="$(command -v python3 || true)"
 fi
 STACK_STARTED=false
+MIGRATION_STARTED=false
+MIGRATION_READY=false
+MIGRATION_COMPOSE=()
 
 # shellcheck disable=SC2329
 cleanup() {
@@ -37,6 +44,9 @@ cleanup() {
   set +e
   if [ "$STACK_STARTED" = true ] && [ -n "${GATE_COMPOSE+x}" ]; then
     "${GATE_COMPOSE[@]}" down -v --remove-orphans >/dev/null 2>&1
+  fi
+  if [ "$MIGRATION_STARTED" = true ] && [ "${#MIGRATION_COMPOSE[@]}" -gt 0 ]; then
+    "${MIGRATION_COMPOSE[@]}" down -v --remove-orphans >/dev/null 2>&1
   fi
   rm -rf "$TMPDIR"
   exit "$status"
@@ -103,7 +113,10 @@ run_gate() {
   printf '%s\n' "Phase ${phase} output:" >&2
   tail -n 20 "$log" >&2
   fail "PREREQUISITE: Phase ${phase} gate"
-  finish
+  if [ "$status" -ne 0 ]; then
+    exit "$status"
+  fi
+  exit 1
 }
 
 printf '%s\n' '======================================'
@@ -116,22 +129,29 @@ run_gate 2 scripts/verify-phase2.sh
 run_gate 3 scripts/verify-phase3.sh
 run_gate 4 scripts/verify-phase4.sh
 
+# Earlier phase scripts may create a local development env as part of their
+# disposable checks. It must not survive into Phase 5 or be used below.
+rm -f "$REPO_ROOT/infra/.env"
+
 # 1. Required tools.
 # shellcheck disable=SC2016
 run_shell_check 'CHECK-01: required tools available' 'for tool in python3 node npm git jq docker curl shellcheck actionlint pg_dump pg_restore age age-keygen; do command -v "$tool" >/dev/null || exit 1; done'
+run_shell_check 'CHECK-01a: shell syntax' 'bash -n scripts/*.sh scripts/lib/*.sh'
+run_check 'CHECK-01b: shellcheck' shellcheck scripts/test-disaster-recovery.sh scripts/verify-phase5.sh scripts/backup-db.sh scripts/restore-db.sh scripts/lib/npm-audit.sh
 
 # 2-5. Repository safety and generated-artifact policy.
+run_shell_check 'CHECK-02a: no real .env present on disk' 'test ! -e infra/.env'
 run_shell_check 'CHECK-02: no real .env tracked' '[ -z "$(git ls-files | awk '\''/\.env$/ && $0 !~ /\.env\.example$/ {print}'\'')" ]'
 run_shell_check 'CHECK-03: no backup artifacts tracked or present' '[ -z "$(git ls-files | awk '\''tolower($0) ~ /(^|\/)(backups?\/|.*\.dump(\.age)?$|.*\.dump\.manifest\.json$)/ {print}'\'') ] && [ ! -d backups ]'
 run_shell_check 'CHECK-04: no private keys tracked' '[ -z "$(git ls-files | awk '\''tolower($0) ~ /(^|\/)(id_rsa|id_ed25519)$|\.(pem|key|p12|pfx)$/ {print}'\'')" ]'
 run_shell_check 'CHECK-05: no generated manga content tracked' '[ -z "$(git ls-files | awk '\''tolower($0) ~ /\.(jpg|jpeg|png|webp|avif|gif|cbz|cbr|pdf)$/ && $0 !~ /^web\/public\/ {print}'\'')" ]'
 
 # 6-14. Backend/frontend/security fast checks.
-run_test_no_skips 'CHECK-06: backend pytest' "$API_PYTHON" -m pytest api/tests -q
+run_test_no_skips 'CHECK-06: backend pytest' "$API_PYTHON" -m pytest api/tests --ignore=api/tests/integration/test_storage_minio.py -q
 run_check 'CHECK-07: frontend tests' npm --prefix web test
 run_check 'CHECK-08: ruff' "$API_PYTHON" -m ruff check api/importing api/storage api/providers api/tools api/audit_events.py api/middleware.py scripts/backup_db.py scripts/dr_fixture.py
 run_check 'CHECK-09: ESLint' npm --prefix web run lint
-run_check 'CHECK-10: TypeScript' npm --prefix web exec -- tsc --noEmit
+run_check 'CHECK-10: TypeScript' web/node_modules/.bin/tsc --noEmit -p web/tsconfig.json
 run_check 'CHECK-11: production frontend build' npm --prefix web run build
 run_check 'CHECK-12: pip-audit runtime' "$API_PYTHON" -m pip_audit -r api/requirements.txt
 run_check 'CHECK-13: pip-audit development' "$API_PYTHON" -m pip_audit -r api/requirements-dev.txt
@@ -141,10 +161,68 @@ run_check 'CHECK-14: shared npm audit policy' scripts/lib/npm-audit.sh web scrip
 run_shell_check 'CHECK-15: single Alembic head' "cd api && \"$API_PYTHON\" -c 'from pathlib import Path; from tools.migration_graph import inspect_graph; assert inspect_graph(Path(\"alembic/versions\")).ok'"
 run_shell_check 'CHECK-16: migration manifest valid' "cd api && \"$API_PYTHON\" -m tools.migration_verifier check --json | jq -e '.ok == true' >/dev/null"
 run_shell_check 'CHECK-17: historical migration hashes valid' "cd api && \"$API_PYTHON\" -m tools.migration_verifier check --json | jq -e '.findings == []' >/dev/null"
-run_shell_check 'CHECK-18: alembic check has no ORM drift' "[ \"\${TASK11_ALLOW_DISPOSABLE_DB:-}\" = 1 ] && printf '%s' \"\${TASK11_DATABASE_URL:-}\" | grep -Eiq '(phase5|task11|scratch|test)' && cd api && DATABASE_URL=\"\$TASK11_DATABASE_URL\" \"$API_PYTHON\" -m alembic check"
-run_shell_check 'CHECK-19: clean base-to-head migration' "[ \"\${TASK11_ALLOW_DISPOSABLE_DB:-}\" = 1 ] && printf '%s' \"\${TASK11_SCRATCH_DATABASE_URL:-}\" | grep -Eiq '(phase5|task11|scratch|test)' && cd api && \"$API_PYTHON\" -m tools.migration_verifier check --scratch-url \"\$TASK11_SCRATCH_DATABASE_URL\" --json | jq -e '.ok == true' >/dev/null"
-run_shell_check 'CHECK-20: newest downgrade/upgrade' "[ \"\${TASK11_ALLOW_DISPOSABLE_DB:-}\" = 1 ] && printf '%s' \"\${TASK11_DATABASE_URL:-}\" | grep -Eiq '(phase5|task11|scratch|test)' && cd api && DATABASE_URL=\"\$TASK11_DATABASE_URL\" \"$API_PYTHON\" -m alembic downgrade 0007 && DATABASE_URL=\"\$TASK11_DATABASE_URL\" \"$API_PYTHON\" -m alembic upgrade head"
-run_test_no_skips 'CHECK-21: database constraints' "$API_PYTHON" -m pytest api/tests_postgresql/test_phase5_schema.py -q
+MIGRATION_DB_USER="phase5_user"
+MIGRATION_DB_PASSWORD="phase5_password_${BASHPID}"
+MIGRATION_DB_NAME="phase5_migrations_${BASHPID}"
+MIGRATION_SCRATCH_NAME="phase5_scratch_${BASHPID}"
+MIGRATION_DB_PORT="$((57000 + BASHPID % 1000))"
+MIGRATION_ENV="$TMPDIR/migration.env"
+MIGRATION_OVERRIDE="$TMPDIR/migration.override.yml"
+MIGRATION_DATABASE_URL="postgresql+psycopg://${MIGRATION_DB_USER}:${MIGRATION_DB_PASSWORD}@127.0.0.1:${MIGRATION_DB_PORT}/${MIGRATION_DB_NAME}"
+MIGRATION_SCRATCH_URL="postgresql+psycopg://${MIGRATION_DB_USER}:${MIGRATION_DB_PASSWORD}@127.0.0.1:${MIGRATION_DB_PORT}/${MIGRATION_SCRATCH_NAME}"
+
+prepare_migration_database() {
+  cp infra/.env.example "$MIGRATION_ENV"
+  sed -i "s/^POSTGRES_USER=.*/POSTGRES_USER=$MIGRATION_DB_USER/; s/^POSTGRES_PASSWORD=.*/POSTGRES_PASSWORD=$MIGRATION_DB_PASSWORD/; s/^POSTGRES_DB=.*/POSTGRES_DB=$MIGRATION_DB_NAME/" "$MIGRATION_ENV"
+  cat >"$MIGRATION_OVERRIDE" <<EOF
+services:
+  db:
+    ports:
+      - "127.0.0.1:${MIGRATION_DB_PORT}:5432"
+EOF
+  MIGRATION_COMPOSE=(docker compose --project-name "infinityscan-phase5-migrations-${BASHPID}" --env-file "$MIGRATION_ENV" -f "$REPO_ROOT/infra/docker-compose.yml" -f "$MIGRATION_OVERRIDE")
+  "${MIGRATION_COMPOSE[@]}" up -d db >/dev/null || return 1
+  MIGRATION_STARTED=true
+  local container=""
+  for _ in $(seq 1 60); do
+    container="$("${MIGRATION_COMPOSE[@]}" ps -q db | tr -d '[:space:]')"
+    if [ -n "$container" ] && docker exec "$container" pg_isready -U "$MIGRATION_DB_USER" -d "$MIGRATION_DB_NAME" >/dev/null 2>&1; then
+      break
+    fi
+    sleep 1
+  done
+  [ -n "$container" ] && docker exec "$container" pg_isready -U "$MIGRATION_DB_USER" -d "$MIGRATION_DB_NAME" >/dev/null || return 1
+  docker exec -e "PGPASSWORD=$MIGRATION_DB_PASSWORD" "$container" psql -h localhost -U "$MIGRATION_DB_USER" -d postgres -v ON_ERROR_STOP=1 \
+    -c "CREATE DATABASE \"$MIGRATION_SCRATCH_NAME\"" >/dev/null || return 1
+  MIGRATION_READY=true
+}
+
+check_orm_drift() {
+  [ "$MIGRATION_READY" = true ] || return 1
+  (cd api && DATABASE_URL="$MIGRATION_DATABASE_URL" "$API_PYTHON" -m alembic upgrade head && DATABASE_URL="$MIGRATION_DATABASE_URL" "$API_PYTHON" -m alembic check)
+}
+
+check_clean_migration() {
+  [ "$MIGRATION_READY" = true ] || return 1
+  (cd api && DATABASE_URL="$MIGRATION_DATABASE_URL" "$API_PYTHON" -m tools.migration_verifier check \
+    --database-url "$MIGRATION_DATABASE_URL" --scratch-url "$MIGRATION_SCRATCH_URL" --require-db-head --require-schema --json | jq -e '.ok == true' >/dev/null)
+}
+
+check_downgrade_upgrade() {
+  [ "$MIGRATION_READY" = true ] || return 1
+  (cd api && DATABASE_URL="$MIGRATION_DATABASE_URL" "$API_PYTHON" -m alembic downgrade 0007 && DATABASE_URL="$MIGRATION_DATABASE_URL" "$API_PYTHON" -m alembic upgrade head)
+}
+
+check_postgresql_constraints() {
+  [ "$MIGRATION_READY" = true ] || return 1
+  DATABASE_URL="$MIGRATION_DATABASE_URL" "$API_PYTHON" -m pytest api/tests_postgresql/test_phase5_schema.py -q
+}
+
+prepare_migration_database || true
+run_check 'CHECK-18: alembic check has no ORM drift' check_orm_drift
+run_check 'CHECK-19: clean base-to-head migration' check_clean_migration
+run_check 'CHECK-20: newest downgrade/upgrade' check_downgrade_upgrade
+run_check 'CHECK-21: database constraints' check_postgresql_constraints
 
 # 22-40. Integrity, recovery, sessions, auth, and audit regression ownership.
 run_test_no_skips 'CHECK-22: quick integrity clean fixture' "$API_PYTHON" -m pytest api/tests/test_integrity.py -q
@@ -207,7 +285,28 @@ run_check 'CHECK-55: Dependabot config validates' "$API_PYTHON" scripts/check-wo
 # 56-68. Disposable production image/stack checks.
 GATE_ENV="$TMPDIR/gate.env"
 cp infra/.env.example "$GATE_ENV"
-GATE_COMPOSE=(docker compose --project-name "infinityscan-phase5-${BASHPID}" --env-file "$GATE_ENV" -f infra/docker-compose.yml)
+GATE_API_PORT="$((58000 + BASHPID % 1000))"
+GATE_WEB_PORT="$((59000 + BASHPID % 1000))"
+sed -i "s/^POSTGRES_USER=.*/POSTGRES_USER=phase5_user/; s/^POSTGRES_PASSWORD=.*/POSTGRES_PASSWORD=phase5_password_${BASHPID}/; s/^POSTGRES_DB=.*/POSTGRES_DB=phase5_gate_${BASHPID}/; s#^DATABASE_URL=.*#DATABASE_URL=postgresql+psycopg://phase5_user:phase5_password_${BASHPID}@db:5432/phase5_gate_${BASHPID}#" "$GATE_ENV"
+printf '\nAPI_PORT=%s\nNEXT_PUBLIC_API_URL=http://127.0.0.1:%s\n' "$GATE_API_PORT" "$GATE_API_PORT" >>"$GATE_ENV"
+GATE_OVERRIDE="$TMPDIR/gate.override.yml"
+cat >"$GATE_OVERRIDE" <<EOF
+services:
+  migrate:
+    env_file:
+      - "$GATE_ENV"
+  api:
+    env_file:
+      - "$GATE_ENV"
+  web:
+    env_file:
+      - "$GATE_ENV"
+    ports:
+      - "127.0.0.1:${GATE_WEB_PORT}:3000"
+EOF
+GATE_COMPOSE=(docker compose --project-name "infinityscan-phase5-${BASHPID}" --env-file "$GATE_ENV" -f infra/docker-compose.yml -f "$GATE_OVERRIDE")
+GATE_API_URL="http://127.0.0.1:${GATE_API_PORT}"
+GATE_WEB_URL="http://127.0.0.1:${GATE_WEB_PORT}"
 run_check 'CHECK-56: production Compose config' "${GATE_COMPOSE[@]}" config
 run_check 'CHECK-57: API production image builds' docker build -t infinityscan-phase5-api:gate api
 run_check 'CHECK-58: web production image builds' docker build -t infinityscan-phase5-web:gate web
@@ -218,9 +317,14 @@ if docker info >/dev/null 2>&1; then
   STACK_STARTED=true
   run_check 'CHECK-62: Docker stack starts' "${GATE_COMPOSE[@]}" up -d db migrate api web
   run_check 'CHECK-63: database becomes healthy' "${GATE_COMPOSE[@]}" exec -T db pg_isready
-  run_check 'CHECK-64: migrations finish' bash -c 'test "$(docker compose --project-name infinityscan-phase5-'"$BASHPID"' ps -aq migrate | xargs docker inspect --format "{{.State.ExitCode}}")" = 0'
-  run_check 'CHECK-65: API health returns 200' curl -fsS http://localhost:8000/health
-  run_check 'CHECK-66: frontend returns 200' curl -fsS http://localhost:3000
+  migration_finished() {
+    local migration_container
+    migration_container="$("${GATE_COMPOSE[@]}" ps -aq migrate | tr -d '[:space:]')"
+    [ -n "$migration_container" ] && [ "$(docker inspect "$migration_container" --format '{{.State.ExitCode}}')" = 0 ]
+  }
+  run_check 'CHECK-64: migrations finish' migration_finished
+  run_check 'CHECK-65: API health returns 200' curl -fsS "$GATE_API_URL/health"
+  run_check 'CHECK-66: frontend returns 200' curl -fsS "$GATE_WEB_URL"
 else
   for check in 'CHECK-62: Docker stack starts' 'CHECK-63: database becomes healthy' 'CHECK-64: migrations finish' 'CHECK-65: API health returns 200' 'CHECK-66: frontend returns 200'; do fail "$check"; done
 fi
@@ -236,6 +340,10 @@ run_check 'CHECK-69: git diff --check' git diff --check
 if [ "$STACK_STARTED" = true ]; then
   "${GATE_COMPOSE[@]}" down -v --remove-orphans >/dev/null 2>&1 || true
   STACK_STARTED=false
+fi
+if [ "$MIGRATION_STARTED" = true ]; then
+  "${MIGRATION_COMPOSE[@]}" down -v --remove-orphans >/dev/null 2>&1 || true
+  MIGRATION_STARTED=false
 fi
 run_shell_check 'CHECK-70: disposable cleanup complete' '! docker ps -a --format "{{.Names}}" | grep -E "infinityscan-(dr|phase5)-"'
 

@@ -56,16 +56,16 @@ def test_manifest_graph_and_single_head_are_valid():
     assert verify_manifest(manifest, versions) == ()
     graph = inspect_graph(versions)
     assert graph.ok
-    assert graph.heads == ("0007",)
+    assert graph.heads == ("0008",)
     scripts = ScriptDirectory.from_config(_config())
-    assert scripts.get_heads() == ["0007"]
+    assert scripts.get_heads() == ["0008"]
 
 
 def test_fresh_base_head_and_alembic_current(engine):
     config = _config()
     command.upgrade(config, "head")
     with engine.connect() as connection:
-        assert connection.scalar(text("SELECT version_num FROM alembic_version")) == "0007"
+        assert connection.scalar(text("SELECT version_num FROM alembic_version")) == "0008"
         assert connection.scalar(text("SELECT to_regclass('public.refresh_tokens')")) is None
     command.current(config, verbose=False)
 
@@ -82,7 +82,7 @@ def test_full_downgrade_to_base_and_reupgrade(engine):
         ) == 0
     command.upgrade(config, "head")
     with engine.connect() as connection:
-        assert connection.scalar(text("SELECT version_num FROM alembic_version")) == "0007"
+        assert connection.scalar(text("SELECT version_num FROM alembic_version")) == "0008"
 
 
 def test_live_schema_matches_canonical_orm_snapshot(engine):

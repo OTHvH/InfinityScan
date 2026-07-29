@@ -262,9 +262,11 @@ scripts/test-disaster-recovery.sh
 ```
 
 Task 10 owns layered GitHub Actions checks. Fast CI runs backend/frontend
-quality and dependency checks; integration CI runs the disposable DR drill and
-phase-specific E2E ownership; security CI runs secret, CodeQL, dependency, and
-container scans. No workflow invokes a wildcard Playwright command.
+quality, dependency, migration, and workflow-policy checks; integration CI runs
+the disposable DR drill, Phase 5 integrity/recovery tests, and phase-specific
+E2E ownership; security CI runs secret, CodeQL, dependency, and API/web
+container scans with SBOM generation. No workflow invokes a wildcard
+Playwright command.
 
 Task 11 owns the final Phase 5 release gate:
 

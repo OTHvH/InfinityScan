@@ -9,7 +9,7 @@ import hashlib
 import json
 import os
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 
@@ -26,11 +26,14 @@ from models import (
     ChapterImportStatus,
     ContentType,
     ImportJob,
+    ImportJobItem,
+    ImportJobItemStatus,
     ImportJobStatus,
     Page,
     PageIntegrityStatus,
     ReadingMode,
     ReadingProgress,
+    RefreshSession,
     Series,
     SeriesStatus,
     Source,
@@ -145,9 +148,37 @@ def seed(output: Path) -> None:
         finished_at=now,
         updated_at=now,
     )
+    job_item = ImportJobItem(
+        job=job,
+        source_reference="drill-series/chapter-1/page-1.png",
+        item_key="page:drill-series:1:1",
+        item_kind="page",
+        series_id=series.id,
+        chapter_id=chapter.id,
+        page_number=1,
+        object_key=page_key,
+        sha256=upload.sha256,
+        byte_size=upload.byte_size,
+        mime_type=upload.mime_type,
+        file_extension="png",
+        storage_etag=upload.etag,
+        attempt_count=1,
+        verified_at=now,
+        status=ImportJobItemStatus.succeeded,
+        created_at=now,
+        updated_at=now,
+    )
+    refresh_session = RefreshSession(
+        user=user,
+        family_id=uuid.uuid4(),
+        token_hash=hashlib.sha256(b"drill-refresh-token").hexdigest(),
+        created_at=now,
+        expires_at=now + timedelta(days=365),
+        user_agent="InfinityScan DR drill",
+    )
     db = Session(engine, expire_on_commit=False)
     try:
-        db.add_all([user, admin, source, series, chapter, page, job])
+        db.add_all([user, admin, source, series, chapter, page, job, job_item, refresh_session])
         db.flush()
         db.add(SourceSeries(source=source, series=series, external_series_id="drill-external-series"))
         db.add(Bookmark(user=user, series=series))
@@ -171,6 +202,21 @@ def seed(output: Path) -> None:
             metadata={"status": "succeeded", "item_count": 1, "page_count": 1},
         )
         db.commit()
+        count_models = {
+            "users": User,
+            "refresh_sessions": RefreshSession,
+            "series": Series,
+            "chapters": Chapter,
+            "pages": Page,
+            "bookmarks": Bookmark,
+            "reading_progress": ReadingProgress,
+            "sources": Source,
+            "source_series": SourceSeries,
+            "import_jobs": ImportJob,
+            "import_job_items": ImportJobItem,
+            "audit_events": AuditEvent,
+        }
+        counts = {name: _count(db, model) for name, model in count_models.items()}
     finally:
         db.close()
     output.write_text(
@@ -182,9 +228,13 @@ def seed(output: Path) -> None:
                 "chapter_id": str(chapter.id),
                 "page_id": str(page.id),
                 "job_id": str(job.id),
+                "refresh_session_id": str(refresh_session.id),
+                "import_job_item_id": str(job_item.id),
                 "object_key": page_key,
                 "object_sha256": upload.sha256,
                 "object_size": upload.byte_size,
+                "orphan_key": "series/drill-orphan/object.png",
+                "counts": counts,
             },
             indent=2,
         )
@@ -199,28 +249,34 @@ def validate(baseline_path: Path) -> None:
     try:
         expected_counts = {
             "users": 2,
+            "refresh_sessions": 1,
             "series": 1,
             "chapters": 1,
             "pages": 1,
             "bookmarks": 1,
             "reading_progress": 1,
+            "sources": 1,
             "source_series": 1,
             "import_jobs": 1,
+            "import_job_items": 1,
             "audit_events": 1,
         }
         models = {
             "users": User,
+            "refresh_sessions": RefreshSession,
             "series": Series,
             "chapters": Chapter,
             "pages": Page,
             "bookmarks": Bookmark,
             "reading_progress": ReadingProgress,
+            "sources": Source,
             "source_series": SourceSeries,
             "import_jobs": ImportJob,
+            "import_job_items": ImportJobItem,
             "audit_events": AuditEvent,
         }
         actual_counts = {name: _count(db, model) for name, model in models.items()}
-        if actual_counts != expected_counts:
+        if actual_counts != expected_counts or baseline.get("counts") != expected_counts:
             raise RuntimeError(f"restored row counts differ: {actual_counts}")
         user = db.get(User, uuid.UUID(baseline["user_id"]))
         if user is None or not verify_password(USER_PASSWORD, user.hashed_password):
@@ -233,6 +289,12 @@ def validate(baseline_path: Path) -> None:
             raise RuntimeError("restored bookmark ownership is invalid")
         if db.scalar(select(ReadingProgress).where(ReadingProgress.user_id == user.id, ReadingProgress.chapter_id == chapter.id)) is None:
             raise RuntimeError("restored reading progress is missing")
+        session = db.get(RefreshSession, uuid.UUID(baseline["refresh_session_id"]))
+        if session is None or session.user_id != user.id or len(session.token_hash) != 64:
+            raise RuntimeError("restored refresh session is invalid")
+        item = db.get(ImportJobItem, uuid.UUID(baseline["import_job_item_id"]))
+        if item is None or item.job_id != uuid.UUID(baseline["job_id"]) or item.chapter_id != chapter.id:
+            raise RuntimeError("restored import job/page relationship is invalid")
         if db.scalar(select(AuditEvent).where(AuditEvent.event_type == "import.completed")) is None:
             raise RuntimeError("restored audit event is missing")
     finally:
@@ -240,12 +302,51 @@ def validate(baseline_path: Path) -> None:
     print(json.dumps({"counts": actual_counts, "password_hash": "verified", "relationships": "verified"}))
 
 
-def mutate_object(baseline_path: Path, *, restore: bool) -> None:
+def inventory(output: Path) -> None:
+    storage = create_object_storage()
+    if storage is None or not storage.health_check():
+        raise RuntimeError("object storage is unavailable")
+    objects = []
+    token = None
+    while True:
+        page = storage.list_objects_page(prefix="series/", continuation_token=token, max_keys=1000)
+        objects.extend(
+            {
+                "key": item.key,
+                "byte_size": item.byte_size,
+                "mime_type": item.mime_type,
+                "sha256": item.sha256,
+                "etag": item.etag,
+            }
+            for item in page.objects
+        )
+        if not page.next_token:
+            break
+        token = page.next_token
+    output.write_text(
+        json.dumps({"object_count": len(objects), "objects": objects}, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+
+def mutate_object(
+    baseline_path: Path,
+    *,
+    restore: bool,
+    orphan: bool,
+    cleanup_orphan: bool,
+) -> None:
     baseline = json.loads(baseline_path.read_text(encoding="utf-8"))
     storage = create_object_storage()
     if storage is None:
         raise RuntimeError("object storage is unavailable")
-    if restore:
+    if orphan or cleanup_orphan:
+        orphan_key = baseline["orphan_key"]
+        if orphan:
+            storage.upload_bytes(orphan_key, PNG_BYTES, "image/png")
+        elif not storage.delete_object(orphan_key):
+            raise RuntimeError("synthetic orphan object could not be deleted")
+    elif restore:
         upload = storage.upload_bytes(baseline["object_key"], PNG_BYTES, "image/png")
         if upload.sha256 != baseline["object_sha256"]:
             raise RuntimeError("restored object checksum differs")
@@ -263,13 +364,24 @@ def main() -> int:
     object_parser = sub.add_parser("object")
     object_parser.add_argument("--baseline", type=Path, required=True)
     object_parser.add_argument("--restore", action="store_true")
+    object_parser.add_argument("--orphan", action="store_true")
+    object_parser.add_argument("--cleanup-orphan", action="store_true")
+    inventory_parser = sub.add_parser("inventory")
+    inventory_parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     if args.command == "seed":
         seed(args.output)
     elif args.command == "validate":
         validate(args.baseline)
+    elif args.command == "inventory":
+        inventory(args.output)
     else:
-        mutate_object(args.baseline, restore=args.restore)
+        mutate_object(
+            args.baseline,
+            restore=args.restore,
+            orphan=args.orphan,
+            cleanup_orphan=args.cleanup_orphan,
+        )
     return 0
 
 

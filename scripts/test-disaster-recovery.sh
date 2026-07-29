@@ -180,6 +180,10 @@ printf '%s\n' 'Seeding synthetic relational data and actual tiny PNG objects.'
 run_api_container python /app/dr_fixture.py seed --output /dr-state/baseline.json
 BASELINE="$STATE_DIR/baseline.json"
 [ -s "$BASELINE" ]
+run_api_container python /app/dr_fixture.py inventory --output /dr-state/storage-inventory.json
+STORAGE_INVENTORY="$STATE_DIR/storage-inventory.json"
+[ -s "$STORAGE_INVENTORY" ]
+jq -e '.object_count == 1 and (.objects | length) == 1' "$STORAGE_INVENTORY" >/dev/null
 
 INTEGRITY_START="$(stamp_ns)"
 run_api_container python -m tools.integrity check --mode quick --json | tee "$STATE_DIR/integrity-quick-before.json"
@@ -206,7 +210,20 @@ BACKUP_TIME="$(seconds_between "$BACKUP_START" "$BACKUP_END")"
 BACKUP_ARTIFACT="$(find "$BACKUP_DIR" -maxdepth 1 -type f -name '*.dump.age' -print -quit)"
 BACKUP_MANIFEST="${BACKUP_ARTIFACT}.manifest.json"
 [ -s "$BACKUP_ARTIFACT" ] && [ -s "$BACKUP_MANIFEST" ]
-cp "$BACKUP_MANIFEST" "$STATE_DIR/storage-inventory-manifest.json"
+cp "$STORAGE_INVENTORY" "$STATE_DIR/storage-inventory-manifest.json"
+"$API_PYTHON" - "$BACKUP_MANIFEST" <<'PY'
+import json
+import re
+import sys
+from pathlib import Path
+
+manifest = json.loads(Path(sys.argv[1]).read_text())
+for key, value in manifest.items():
+    if re.search(r"database[_-]?url|dsn|password|secret|credential|private[_-]?key|identity|token|presign", str(key), re.I):
+        raise SystemExit(f"forbidden metadata key: {key}")
+    if re.search(r"postgres(?:ql)?(?:\+[a-z0-9_]+)?://[^\s]+:[^\s]+@|-----BEGIN [^-]*PRIVATE KEY-----|AKIA[0-9A-Z]{16}", json.dumps(value), re.I):
+        raise SystemExit("secret-bearing metadata value")
+PY
 # Prove negative restore safety before the real restore: checksum mutation,
 # missing manifest, and truncated artifacts must be rejected without a DB call.
 cp "$BACKUP_ARTIFACT" "$TMPDIR/truncated.dump.age"
@@ -259,6 +276,16 @@ PY
 )"
 REVISION="$(db_admin psql -h localhost -U "$DB_USER" -d "$DB_NAME" -t -A -c 'SELECT version_num FROM alembic_version')"
 [ "$REVISION" = "$EXPECTED_HEAD" ]
+# A deliberately invalid revision must fail schema/head validation.
+db_admin psql -h localhost -U "$DB_USER" -d "$DB_NAME" -v ON_ERROR_STOP=1 \
+  -c "UPDATE alembic_version SET version_num = '0000'"
+if (cd "$REPO_ROOT/api" && DATABASE_URL="$DB_URL" "$API_PYTHON" -m tools.migration_verifier check \
+  --database-url "$DB_URL" --require-db-head --json) >/dev/null 2>&1; then
+  printf '%s\n' 'invalid restored schema revision was accepted' >&2
+  exit 1
+fi
+db_admin psql -h localhost -U "$DB_USER" -d "$DB_NAME" -v ON_ERROR_STOP=1 \
+  -c "UPDATE alembic_version SET version_num = '$EXPECTED_HEAD'"
 if ! (cd "$REPO_ROOT/api" && DATABASE_URL="$DB_URL" "$API_PYTHON" -m tools.migration_verifier check \
   --database-url "$DB_URL" --require-db-head --require-schema --json) >"$STATE_DIR/migration-check.json"; then
   cat "$STATE_DIR/migration-check.json" >&2
@@ -266,6 +293,8 @@ if ! (cd "$REPO_ROOT/api" && DATABASE_URL="$DB_URL" "$API_PYTHON" -m tools.migra
 fi
 jq -e '.ok == true' "$STATE_DIR/migration-check.json" >/dev/null
 run_api_container python /app/dr_fixture.py validate --baseline /dr-state/baseline.json
+run_api_container python /app/dr_fixture.py inventory --output /dr-state/storage-inventory-after.json
+cmp -s "$STORAGE_INVENTORY" "$STATE_DIR/storage-inventory-after.json"
 
 INTEGRITY_START="$(stamp_ns)"
 run_api_container python -m tools.integrity check --mode quick --json | tee "$STATE_DIR/integrity-quick-after.json"
@@ -274,6 +303,15 @@ QUICK_INTEGRITY_TIME="$(seconds_between "$INTEGRITY_START" "$INTEGRITY_END")"
 run_api_container python -m tools.integrity check --mode full --content-sha256 --json | tee "$STATE_DIR/integrity-full-after.json"
 jq -e '.total_issues == 0 and .complete == true' "$STATE_DIR/integrity-quick-after.json" >/dev/null
 jq -e '.total_issues == 0 and .complete == true' "$STATE_DIR/integrity-full-after.json" >/dev/null
+run_api_container python /app/dr_fixture.py object --baseline /dr-state/baseline.json --orphan
+ORPHAN_STATUS=0
+run_api_container python -m tools.integrity check --mode full --content-sha256 --json >"$STATE_DIR/integrity-orphan-object.json" 2>"$STATE_DIR/integrity-orphan-object.err" || ORPHAN_STATUS=$?
+if [ "$ORPHAN_STATUS" -eq 0 ]; then
+  printf '%s\n' 'orphan object was not detected' >&2
+  exit 1
+fi
+run_api_container python /app/dr_fixture.py object --baseline /dr-state/baseline.json --cleanup-orphan
+run_api_container python -m tools.integrity check --mode full --content-sha256 --json >"$STATE_DIR/integrity-clean-after-orphan.json"
 run_api_container python /app/dr_fixture.py object --baseline /dr-state/baseline.json
 MISSING_OBJECT_STATUS=0
 run_api_container python -m tools.integrity check --mode quick --json >"$STATE_DIR/integrity-missing-object.json" 2>"$STATE_DIR/integrity-missing-object.err" || MISSING_OBJECT_STATUS=$?
@@ -320,7 +358,18 @@ printf '%s\n' 'restored reading progress verified'
 PAGE_ID="$(jq -r '.page_id' "$BASELINE")"
 MEDIA_HEADERS="$TMPDIR/media.headers"
 curl -fsS -D "$MEDIA_HEADERS" -o /dev/null "http://127.0.0.1:${API_PORT}/media/pages/${PAGE_ID}"
-grep -Eiq '^location: https?://' "$MEDIA_HEADERS"
+MEDIA_LOCATION="$(awk 'tolower($1) == "location:" {sub(/^[^:]+:[[:space:]]*/, ""); print; exit}' "$MEDIA_HEADERS" | tr -d '\r')"
+printf '%s' "$MEDIA_LOCATION" | grep -Eiq '^https?://'
+MEDIA_FETCH_URL="${MEDIA_LOCATION/http:\/\/minio:9000/http:\/\/127.0.0.1:${MINIO_PORT}}"
+MEDIA_FILE="$TMPDIR/restored-page.png"
+curl -fsSL "$MEDIA_FETCH_URL" -o "$MEDIA_FILE"
+"$API_PYTHON" - "$MEDIA_FILE" <<'PY'
+import sys
+from pathlib import Path
+
+if Path(sys.argv[1]).read_bytes()[:8] != b"\x89PNG\r\n\x1a\n":
+    raise SystemExit("media redirect did not return the seeded PNG")
+PY
 printf '%s\n' 'restored media redirect verified'
 
 printf 'observed backup time: %ss\n' "$BACKUP_TIME"

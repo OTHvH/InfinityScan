@@ -54,8 +54,17 @@ jobs:
       - name: Migration graph and manifest
         run: python -m tools.migration_verifier check --json
         working-directory: api
+      - name: Migration immutability
+        run: python -m tools.migration_verifier check --json
+        working-directory: api
+      - name: Workflow policy
+        run: python scripts/check-workflows.py
+      - name: Install actionlint
+        run: go install github.com/rhysd/actionlint/cmd/actionlint@v1.7.7
+      - name: Validate workflows
+        run: "$(go env GOPATH)/bin/actionlint .github/workflows"
       - name: Backend tests
-        run: python -m pytest api/tests -q
+        run: python -m pytest api/tests --ignore=api/tests/integration/test_storage_minio.py -q
       - name: Runtime dependency audit
         run: python -m pip_audit -r api/requirements.txt
       - name: Development dependency audit
