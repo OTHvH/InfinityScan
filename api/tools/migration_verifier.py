@@ -63,6 +63,7 @@ def _alembic_config(api_dir: Path, database_url: str | None = None) -> Config:
     config.set_main_option("script_location", str(api_dir / "alembic"))
     if database_url:
         config.set_main_option("sqlalchemy.url", database_url.replace("%", "%%"))
+        config.attributes["database_url"] = database_url
     return config
 
 

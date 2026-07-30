@@ -8,6 +8,11 @@ const MAX_RETAINED_PAGES = 250;
 const MAX_RENDERED_PAGE_ELEMENTS = 64;
 const MAX_RENDERED_SEPARATORS = 8;
 const HEAP_GROWTH_LIMIT_BYTES = 64 * 1024 * 1024;
+const observedBounds = {
+  retainedChapters: 0,
+  retainedPages: 0,
+  renderedPages: 0,
+};
 const TINY_PNG = Buffer.from(
   "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
   "base64",
@@ -150,6 +155,9 @@ async function assertReaderGates(page: Page): Promise<void> {
   const separatorIds = await page.locator(".chapter-separator[data-chapter-id]").evaluateAll((elements) =>
     elements.map((element) => element.getAttribute("data-chapter-id") ?? ""),
   );
+  observedBounds.retainedChapters = Math.max(observedBounds.retainedChapters, Number(state.retainedChapters));
+  observedBounds.retainedPages = Math.max(observedBounds.retainedPages, Number(state.retainedPages));
+  observedBounds.renderedPages = Math.max(observedBounds.renderedPages, pageIds.length);
   expect(pageIds.length).toBeLessThanOrEqual(MAX_RENDERED_PAGE_ELEMENTS);
   expect(separatorIds.length).toBeLessThanOrEqual(MAX_RENDERED_SEPARATORS);
   expect(new Set(pageIds).size).toBe(pageIds.length);
@@ -603,6 +611,9 @@ test("Phase 4 long scroll remains bounded and resumable", async ({ page, context
       duplicateTriggerRequests,
       requestsAfterCursorExhaustion: requestsAfterExhaustion - requestsAtExhaustion,
       runawayRepeatedRequests: runawayRepeatedRequests.length,
+      retainedChapterMaximum: observedBounds.retainedChapters,
+      retainedPageMaximum: observedBounds.retainedPages,
+      renderedPageMaximum: observedBounds.renderedPages,
     },
   }));
   expect([...chunkRequestCounts.values()].reduce((sum, count) => sum + count, 0)).toBeLessThan(180);

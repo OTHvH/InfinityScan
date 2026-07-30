@@ -30,6 +30,7 @@ def _config() -> Config:
     config = Config(str(API_DIR / "alembic.ini"))
     config.set_main_option("script_location", str(API_DIR / "alembic"))
     config.set_main_option("sqlalchemy.url", DATABASE_URL)
+    config.attributes["database_url"] = DATABASE_URL
     return config
 
 
@@ -113,6 +114,7 @@ def test_two_fresh_database_snapshots_are_equal_when_configured(engine):
         second_config = Config(str(API_DIR / "alembic.ini"))
         second_config.set_main_option("script_location", str(API_DIR / "alembic"))
         second_config.set_main_option("sqlalchemy.url", second_url)
+        second_config.attributes["database_url"] = second_url
         command.upgrade(second_config, "head")
         assert compare_schema(snapshot_engine(engine), snapshot_engine(second))["equal"] is True
     finally:

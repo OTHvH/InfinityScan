@@ -14,6 +14,10 @@ if [ "${APP_ENV:-development}" = "production" ]; then
   printf '%s\n' 'Refusing disaster-recovery drill with APP_ENV=production.' >&2
   exit 2
 fi
+if [ -e "$REPO_ROOT/infra/.env" ]; then
+  printf '%s\n' 'Refusing DR drill while infra/.env exists; use only its generated synthetic environment.' >&2
+  exit 2
+fi
 
 for tool in docker jq curl pg_dump pg_restore age age-keygen; do
   if ! command -v "$tool" >/dev/null 2>&1; then
@@ -31,6 +35,8 @@ if [ -n "${PYTHON:-}" ]; then
   API_PYTHON="$PYTHON"
 elif [ -x "$REPO_ROOT/api/.venv/bin/python" ]; then
   API_PYTHON="$REPO_ROOT/api/.venv/bin/python"
+elif [ -x /tmp/infinityscan-audit-venv/bin/python ]; then
+  API_PYTHON=/tmp/infinityscan-audit-venv/bin/python
 else
   API_PYTHON="$(command -v python3 || true)"
 fi
@@ -53,6 +59,8 @@ ENV_FILE="$TMPDIR/compose.env"
 OVERRIDE_FILE="$TMPDIR/compose.override.yml"
 STATE_DIR="$TMPDIR/state"
 BACKUP_DIR="$TMPDIR/backups"
+INFRA_ENV_FILE="$REPO_ROOT/infra/.env"
+INFRA_ENV_CREATED=false
 mkdir -p "$STATE_DIR" "$BACKUP_DIR"
 
 cleanup() {
@@ -60,6 +68,9 @@ cleanup() {
   set +e
   if [ -n "${COMPOSE_BASE+x}" ]; then
     "${COMPOSE_BASE[@]}" --profile storage down -v --remove-orphans >/dev/null 2>&1
+  fi
+  if [ "$INFRA_ENV_CREATED" = true ]; then
+    rm -f "$INFRA_ENV_FILE"
   fi
   rm -rf "$TMPDIR"
   exit "$status"
@@ -91,6 +102,9 @@ COPYMANGA_ENABLED=false
 LOCAL_CONTENT_ENABLED=false
 EOF
 chmod 600 "$ENV_FILE"
+cp "$ENV_FILE" "$INFRA_ENV_FILE"
+chmod 600 "$INFRA_ENV_FILE"
+INFRA_ENV_CREATED=true
 
 cat >"$OVERRIDE_FILE" <<EOF
 services:
@@ -101,13 +115,8 @@ services:
     ports:
       - "127.0.0.1:${MINIO_PORT}:9000"
   api:
-    env_file:
-      - "$ENV_FILE"
     ports:
       - "127.0.0.1:${API_PORT}:8000"
-  migrate:
-    env_file:
-      - "$ENV_FILE"
 EOF
 
 COMPOSE_BASE=(docker compose --project-name "$PROJECT" --env-file "$ENV_FILE" -f "$REPO_ROOT/infra/docker-compose.yml" -f "$OVERRIDE_FILE")
@@ -360,9 +369,8 @@ MEDIA_HEADERS="$TMPDIR/media.headers"
 curl -fsS -D "$MEDIA_HEADERS" -o /dev/null "http://127.0.0.1:${API_PORT}/media/pages/${PAGE_ID}"
 MEDIA_LOCATION="$(awk 'tolower($1) == "location:" {sub(/^[^:]+:[[:space:]]*/, ""); print; exit}' "$MEDIA_HEADERS" | tr -d '\r')"
 printf '%s' "$MEDIA_LOCATION" | grep -Eiq '^https?://'
-MEDIA_FETCH_URL="${MEDIA_LOCATION/http:\/\/minio:9000/http:\/\/127.0.0.1:${MINIO_PORT}}"
 MEDIA_FILE="$TMPDIR/restored-page.png"
-curl -fsSL "$MEDIA_FETCH_URL" -o "$MEDIA_FILE"
+curl -fsSL --connect-to "minio:9000:127.0.0.1:${MINIO_PORT}" "$MEDIA_LOCATION" -o "$MEDIA_FILE"
 "$API_PYTHON" - "$MEDIA_FILE" <<'PY'
 import sys
 from pathlib import Path

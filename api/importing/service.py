@@ -43,9 +43,22 @@ from .validation import validate_manifest_strict
 
 log = logging.getLogger("importing.service")
 
+_PUBLIC_REJECTION_REASONS = frozenset({
+    "file extension is not an image candidate",
+    "image resolves outside the approved import root",
+    "image exceeds the maximum byte size",
+})
+
 
 def _now() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def _safe_rejection_reason(reason: str) -> str:
+    """Persist only scanner messages that cannot expose source details."""
+    if reason in _PUBLIC_REJECTION_REASONS:
+        return reason
+    return "source file rejected during scan"
 
 
 def _lock_key(identity: str) -> int:
@@ -406,7 +419,7 @@ class ImportService:
                                 if rejected.status == "skipped"
                                 else ImportJobItemStatus.failed
                             ),
-                            error="source file rejected during scan",
+                            error=_safe_rejection_reason(rejected.reason),
                         )
                     )
             for chapter, raw_c in zip(series.chapters, raw_s["chapters"], strict=True):

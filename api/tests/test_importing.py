@@ -14,6 +14,8 @@ from PIL import Image
 from models import (
     Chapter,
     ChapterImportStatus,
+    ImportJobItem,
+    ImportJobItemStatus,
     ImportJobStatus,
     Page,
     PageIntegrityStatus,
@@ -31,7 +33,7 @@ from importing.adapters.local import (
     stable_series_id,
 )
 from importing.manifest import hash_manifest, manifest_to_dict, manifest_to_json
-from importing.service import ImportService, SeriesImportLock
+from importing.service import ImportService, SeriesImportLock, _safe_rejection_reason
 from importing.validation import validate_manifest, validate_manifest_strict
 
 
@@ -568,6 +570,23 @@ class TestImportServiceFullImport:
         assert len(storage.objects) >= 3
         for key in storage.objects:
             assert key.startswith("series/")
+
+    def test_rejection_evidence_keeps_only_public_reason(self, db, tmp_path: Path):
+        _make_series_dir(tmp_path, "Rejected Evidence", {"Ch1": 1})
+        chapter = tmp_path / "Rejected Evidence" / "Ch1"
+        (chapter / "002.txt").write_text("not an image", encoding="utf-8")
+        service = ImportService(db, storage=FakeStorage(), dry_run=False)
+
+        job = service.run(LocalAdapter(tmp_path).scan())
+
+        item = db.query(ImportJobItem).filter(ImportJobItem.job_id == job.id).filter(
+            ImportJobItem.item_kind == "rejected"
+        ).one()
+        assert item.status == ImportJobItemStatus.skipped
+        assert item.error == "file extension is not an image candidate"
+        assert str(tmp_path) not in item.error
+        assert "secret" not in item.error.lower()
+        assert _safe_rejection_reason(f"secret={tmp_path}/private") == "source file rejected during scan"
 
     def test_idempotent_import_skips_existing_objects(self, db, tmp_path: Path):
         manifest = self._make_manifest(tmp_path)

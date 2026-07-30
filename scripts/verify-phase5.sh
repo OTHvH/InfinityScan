@@ -5,6 +5,7 @@
 # infrastructure is a failure, never a skip. This script never accepts a
 # production environment and all Docker/database operations use synthetic data.
 # shellcheck disable=SC2016
+# shellcheck disable=SC2329 # Commands and cleanup handlers are invoked indirectly.
 set -uo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -30,13 +31,17 @@ if [ -n "${PYTHON:-}" ]; then
   API_PYTHON="$PYTHON"
 elif [ -x "$REPO_ROOT/api/.venv/bin/python" ]; then
   API_PYTHON="$REPO_ROOT/api/.venv/bin/python"
+elif [ -x /tmp/infinityscan-audit-venv/bin/python ]; then
+  API_PYTHON=/tmp/infinityscan-audit-venv/bin/python
 else
   API_PYTHON="$(command -v python3 || true)"
 fi
 STACK_STARTED=false
+STACK_READY=false
 MIGRATION_STARTED=false
 MIGRATION_READY=false
 MIGRATION_COMPOSE=()
+GATE_INFRA_ENV_CREATED=false
 
 # shellcheck disable=SC2329
 cleanup() {
@@ -47,6 +52,9 @@ cleanup() {
   fi
   if [ "$MIGRATION_STARTED" = true ] && [ "${#MIGRATION_COMPOSE[@]}" -gt 0 ]; then
     "${MIGRATION_COMPOSE[@]}" down -v --remove-orphans >/dev/null 2>&1
+  fi
+  if [ "$GATE_INFRA_ENV_CREATED" = true ]; then
+    rm -f "$REPO_ROOT/infra/.env"
   fi
   rm -rf "$TMPDIR"
   exit "$status"
@@ -72,6 +80,21 @@ run_check() {
 run_shell_check() {
   local label="$1" command="$2"
   run_check "$label" bash -c "$command"
+}
+
+wait_http() {
+  local url="$1"
+  for _ in $(seq 1 30); do
+    if curl -fsS "$url" >/dev/null; then
+      return 0
+    fi
+    sleep 2
+  done
+  return 1
+}
+
+no_backup_artifacts() {
+  [ ! -d backups ] && [ -z "$(git ls-files | awk 'tolower($0) ~ /(^|\/)(backups?\/|.*\.dump(\.age)?$|.*\.dump\.manifest\.json$)/ {print}')" ]
 }
 
 run_test_no_skips() {
@@ -142,7 +165,7 @@ run_check 'CHECK-01b: shellcheck' shellcheck scripts/test-disaster-recovery.sh s
 # 2-5. Repository safety and generated-artifact policy.
 run_shell_check 'CHECK-02a: no real .env present on disk' 'test ! -e infra/.env'
 run_shell_check 'CHECK-02: no real .env tracked' '[ -z "$(git ls-files | awk '\''/\.env$/ && $0 !~ /\.env\.example$/ {print}'\'')" ]'
-run_shell_check 'CHECK-03: no backup artifacts tracked or present' '[ -z "$(git ls-files | awk '\''tolower($0) ~ /(^|\/)(backups?\/|.*\.dump(\.age)?$|.*\.dump\.manifest\.json$)/ {print}'\'') ] && [ ! -d backups ]'
+run_check 'CHECK-03: no backup artifacts tracked or present' no_backup_artifacts
 run_shell_check 'CHECK-04: no private keys tracked' '[ -z "$(git ls-files | awk '\''tolower($0) ~ /(^|\/)(id_rsa|id_ed25519)$|\.(pem|key|p12|pfx)$/ {print}'\'')" ]'
 run_shell_check 'CHECK-05: no generated manga content tracked' '[ -z "$(git ls-files | awk '\''tolower($0) ~ /\.(jpg|jpeg|png|webp|avif|gif|cbz|cbr|pdf)$/ && $0 !~ /^web\/public\/ {print}'\'')" ]'
 
@@ -231,9 +254,9 @@ run_test_no_skips 'CHECK-24: missing object detection' "$API_PYTHON" -m pytest a
 run_test_no_skips 'CHECK-25: object metadata mismatch detection' "$API_PYTHON" -m pytest api/tests/test_storage_integrity.py -q
 run_test_no_skips 'CHECK-26: orphan object detection' "$API_PYTHON" -m pytest api/tests/test_storage_integrity.py -q
 run_test_no_skips 'CHECK-27: repair-safe scope' "$API_PYTHON" -m pytest api/tests/test_integrity.py api/tests/test_storage_integrity.py -q
-run_test_no_skips 'CHECK-28: stale import detection' "$API_PYTHON" -m pytest api/tests_phase5/test_import_recovery.py -q
-run_test_no_skips 'CHECK-29: safe import recovery' "$API_PYTHON" -m pytest api/tests_phase5/test_import_recovery.py -q
-run_test_no_skips 'CHECK-30: active import fencing' "$API_PYTHON" -m pytest api/tests_phase5/test_import_recovery.py -q
+run_test_no_skips 'CHECK-28: stale import detection' env PYTHONPATH="$REPO_ROOT/api" "$API_PYTHON" -m pytest api/tests_phase5/test_import_recovery.py -q
+run_test_no_skips 'CHECK-29: safe import recovery' env PYTHONPATH="$REPO_ROOT/api" "$API_PYTHON" -m pytest api/tests_phase5/test_import_recovery.py -q
+run_test_no_skips 'CHECK-30: active import fencing' env PYTHONPATH="$REPO_ROOT/api" "$API_PYTHON" -m pytest api/tests_phase5/test_import_recovery.py -q
 run_test_no_skips 'CHECK-31: session cleanup dry-run' "$API_PYTHON" -m pytest api/tests/test_sessions_tool.py -q
 run_test_no_skips 'CHECK-32: active sessions preserved' "$API_PYTHON" -m pytest api/tests/test_sessions_tool.py -q
 run_test_no_skips 'CHECK-33: expired/revoked cleanup' "$API_PYTHON" -m pytest api/tests/test_sessions_tool.py -q
@@ -276,7 +299,7 @@ fi
 
 # 50-55. Workflow and Dependabot policy.
 run_check 'CHECK-50: GitHub Actions YAML parses' "$API_PYTHON" scripts/check-workflows.py
-run_check 'CHECK-51: actionlint passes' actionlint .github/workflows
+run_check 'CHECK-51: actionlint passes' actionlint .github/workflows/*.yml
 run_check 'CHECK-52: workflow permissions are least privilege' "$API_PYTHON" scripts/check-workflows.py
 run_check 'CHECK-53: all actions use immutable pins' "$API_PYTHON" scripts/check-workflows.py
 run_shell_check 'CHECK-54: no privileged pull_request_target execution' '! git grep -n pull_request_target -- .github/workflows'
@@ -289,18 +312,13 @@ GATE_API_PORT="$((58000 + BASHPID % 1000))"
 GATE_WEB_PORT="$((59000 + BASHPID % 1000))"
 sed -i "s/^POSTGRES_USER=.*/POSTGRES_USER=phase5_user/; s/^POSTGRES_PASSWORD=.*/POSTGRES_PASSWORD=phase5_password_${BASHPID}/; s/^POSTGRES_DB=.*/POSTGRES_DB=phase5_gate_${BASHPID}/; s#^DATABASE_URL=.*#DATABASE_URL=postgresql+psycopg://phase5_user:phase5_password_${BASHPID}@db:5432/phase5_gate_${BASHPID}#" "$GATE_ENV"
 printf '\nAPI_PORT=%s\nNEXT_PUBLIC_API_URL=http://127.0.0.1:%s\n' "$GATE_API_PORT" "$GATE_API_PORT" >>"$GATE_ENV"
+cp "$GATE_ENV" "$REPO_ROOT/infra/.env"
+chmod 600 "$REPO_ROOT/infra/.env"
+GATE_INFRA_ENV_CREATED=true
 GATE_OVERRIDE="$TMPDIR/gate.override.yml"
 cat >"$GATE_OVERRIDE" <<EOF
 services:
-  migrate:
-    env_file:
-      - "$GATE_ENV"
-  api:
-    env_file:
-      - "$GATE_ENV"
   web:
-    env_file:
-      - "$GATE_ENV"
     ports:
       - "127.0.0.1:${GATE_WEB_PORT}:3000"
 EOF
@@ -315,7 +333,9 @@ run_check 'CHECK-60: API image has no real .env' docker run --rm infinityscan-ph
 run_check 'CHECK-61: production images use non-root users' bash -c 'test "$(docker image inspect infinityscan-phase5-api:gate --format "{{.Config.User}}")" = appuser && test "$(docker image inspect infinityscan-phase5-web:gate --format "{{.Config.User}}")" = nextjs'
 if docker info >/dev/null 2>&1; then
   STACK_STARTED=true
-  run_check 'CHECK-62: Docker stack starts' "${GATE_COMPOSE[@]}" up -d db migrate api web
+  if run_check 'CHECK-62: Docker stack starts' "${GATE_COMPOSE[@]}" up -d db migrate api web; then
+    STACK_READY=true
+  fi
   run_check 'CHECK-63: database becomes healthy' "${GATE_COMPOSE[@]}" exec -T db pg_isready
   migration_finished() {
     local migration_container
@@ -323,13 +343,13 @@ if docker info >/dev/null 2>&1; then
     [ -n "$migration_container" ] && [ "$(docker inspect "$migration_container" --format '{{.State.ExitCode}}')" = 0 ]
   }
   run_check 'CHECK-64: migrations finish' migration_finished
-  run_check 'CHECK-65: API health returns 200' curl -fsS "$GATE_API_URL/health"
-  run_check 'CHECK-66: frontend returns 200' curl -fsS "$GATE_WEB_URL"
+  run_check 'CHECK-65: API health returns 200' wait_http "$GATE_API_URL/health"
+  run_check 'CHECK-66: frontend returns 200' wait_http "$GATE_WEB_URL"
 else
   for check in 'CHECK-62: Docker stack starts' 'CHECK-63: database becomes healthy' 'CHECK-64: migrations finish' 'CHECK-65: API health returns 200' 'CHECK-66: frontend returns 200'; do fail "$check"; done
 fi
-run_shell_check 'CHECK-67: frontend bundle contains no credentials' '! git grep -n -E "DATABASE_URL|POSTGRES_PASSWORD|S3_SECRET_ACCESS_KEY|JWT_SECRET_KEY" -- web'
-if [ "$STACK_STARTED" = true ]; then
+run_shell_check 'CHECK-67: frontend bundle contains no credentials' 'test -d web/.next && ! grep -R -E "DATABASE_URL|POSTGRES_PASSWORD|S3_SECRET_ACCESS_KEY|JWT_SECRET_KEY" web/.next'
+if [ "$STACK_READY" = true ]; then
   run_shell_check 'CHECK-68: generated logs contain no obvious secrets' '! "${GATE_COMPOSE[@]}" logs 2>/dev/null | grep -Eiq "password=|secret_key=|BEGIN .*PRIVATE KEY"'
 else
   fail 'CHECK-68: generated logs contain no obvious secrets'
@@ -340,6 +360,10 @@ run_check 'CHECK-69: git diff --check' git diff --check
 if [ "$STACK_STARTED" = true ]; then
   "${GATE_COMPOSE[@]}" down -v --remove-orphans >/dev/null 2>&1 || true
   STACK_STARTED=false
+fi
+if [ "$GATE_INFRA_ENV_CREATED" = true ]; then
+  rm -f "$REPO_ROOT/infra/.env"
+  GATE_INFRA_ENV_CREATED=false
 fi
 if [ "$MIGRATION_STARTED" = true ]; then
   "${MIGRATION_COMPOSE[@]}" down -v --remove-orphans >/dev/null 2>&1 || true

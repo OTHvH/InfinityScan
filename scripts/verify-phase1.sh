@@ -18,7 +18,18 @@ FAIL_COUNT=0
 SKIP_COUNT=0
 RESULTS=()
 TMPDIR="$(mktemp -d /tmp/infinityscan-phase1-XXXXXX)"
-trap 'rm -rf "$TMPDIR"' EXIT
+ENV_FILE="$REPO_ROOT/infra/.env"
+ENV_WAS_PRESENT=false
+
+cleanup() {
+  local status=$?
+  if [ "$ENV_WAS_PRESENT" = false ]; then
+    rm -f "$ENV_FILE"
+  fi
+  rm -rf "$TMPDIR"
+  exit "$status"
+}
+trap cleanup EXIT
 
 pass() {
   PASS_COUNT=$((PASS_COUNT + 1))
@@ -58,7 +69,9 @@ for arg in "$@"; do
   esac
 done
 
-ENV_FILE="$REPO_ROOT/infra/.env"
+if [ -f "$ENV_FILE" ]; then
+  ENV_WAS_PRESENT=true
+fi
 if [ "$CLEANUP_ONLY" = true ]; then
   if [ -f "$ENV_FILE" ]; then
     docker compose --env-file "$ENV_FILE" -f infra/docker-compose.yml down -v --remove-orphans

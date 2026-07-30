@@ -17,6 +17,7 @@ FAIL_COUNT=0
 SKIP_COUNT=0
 RESULTS=()
 FAILED_CHECKS=()
+ENV_WAS_PRESENT=false
 
 pass() {
   PASS_COUNT=$((PASS_COUNT + 1))
@@ -44,6 +45,9 @@ cleanup_stack() {
 cleanup() {
   local status=$?
   cleanup_stack
+  if [ "$ENV_WAS_PRESENT" = false ]; then
+    rm -f "$ENV_FILE"
+  fi
   rm -rf "$TMPDIR"
   exit "$status"
 }
@@ -60,6 +64,9 @@ for arg in "$@"; do
 done
 
 ENV_FILE="$REPO_ROOT/infra/.env"
+if [ -f "$ENV_FILE" ]; then
+  ENV_WAS_PRESENT=true
+fi
 if [ ! -f "$ENV_FILE" ]; then
   cp "$REPO_ROOT/infra/.env.example" "$ENV_FILE"
 fi

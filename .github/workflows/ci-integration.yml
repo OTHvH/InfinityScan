@@ -104,6 +104,8 @@ jobs:
           cache-dependency-path: api/requirements-dev.txt
       - run: python -m pip install -r api/requirements-dev.txt
       - name: Phase 5 integrity and recovery tests
+        env:
+          PYTHONPATH: api
         run: >-
           python -m pytest
           api/tests/test_integrity.py

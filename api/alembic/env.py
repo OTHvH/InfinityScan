@@ -16,8 +16,8 @@ from models import Base  # noqa: F401
 # ---------------------------------------------------------------------------
 config = context.config
 
-# Honour DATABASE_URL env var (overrides alembic.ini value).
-database_url = os.environ.get("DATABASE_URL")
+# Programmatic verification targets take precedence over the process default.
+database_url = config.attributes.get("database_url") or os.environ.get("DATABASE_URL")
 if database_url:
     config.set_main_option("sqlalchemy.url", database_url)
 
