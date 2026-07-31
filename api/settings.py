@@ -5,7 +5,7 @@ Secrets are never logged or exposed in repr. Settings are frozen after creation.
 
 Key validation rules:
 - APP_ENV must be 'development' | 'staging' | 'production'
-- JWT_SECRET_KEY is required in production
+- Deployed environments require explicit JWT and CSRF secrets
 - COOKIE_SAME_SITE must be 'lax' | 'strict' | 'none'
 - COOKIE_SECURE must be True when COOKIE_SAME_SITE is 'none'
 - CORS_ORIGINS and TRUSTED_HOSTS are comma-separated lists
@@ -17,12 +17,20 @@ import os
 import secrets
 from dataclasses import dataclass, field
 
+from sqlalchemy.engine import make_url
+from sqlalchemy.exc import ArgumentError
+
 
 def _bool(name: str, default: bool = False) -> bool:
-    val = os.environ.get(name, "")
-    if not val:
+    raw = os.environ.get(name)
+    if raw is None or raw == "":
         return default
-    return val.lower() in ("1", "true", "yes")
+    value = raw.strip().lower()
+    if value in ("1", "true", "yes", "on"):
+        return True
+    if value in ("0", "false", "no", "off"):
+        return False
+    raise ValueError(f"{name} must be a boolean")
 
 
 def _csv(name: str, default: str = "") -> list[str]:
@@ -32,6 +40,16 @@ def _csv(name: str, default: str = "") -> list[str]:
 
 def _float(name: str, default: float) -> float:
     return float(os.environ.get(name, str(default)))
+
+
+def _secret(name: str, *aliases: str) -> str:
+    for variable in (name, *aliases):
+        value = os.environ.get(variable)
+        if value:
+            return value
+    if os.environ.get("APP_ENV", "development") == "development":
+        return secrets.token_hex(32)
+    return ""
 
 
 @dataclass(frozen=True)
@@ -50,9 +68,7 @@ class Settings:
 
     # ── JWT / Sessions ──────────────────────────────────────────────────
     secret_key: str = field(
-        default_factory=lambda: os.environ.get("JWT_SECRET_KEY")
-        or os.environ.get("SECRET_KEY")
-        or secrets.token_hex(32),
+        default_factory=lambda: _secret("JWT_SECRET_KEY", "SECRET_KEY"),
         repr=False,
     )
     jwt_algorithm: str = "HS256"
@@ -79,8 +95,7 @@ class Settings:
 
     # ── CSRF ────────────────────────────────────────────────────────────
     csrf_secret_key: str = field(
-        default_factory=lambda: os.environ.get("CSRF_SECRET_KEY")
-        or secrets.token_hex(32),
+        default_factory=lambda: _secret("CSRF_SECRET_KEY"),
         repr=False,
     )
     csrf_header_name: str = "x-csrf-token"
@@ -275,52 +290,50 @@ def get_settings() -> Settings:
 def _validate_settings(s: Settings) -> None:
     """Run-time validation of settings that cannot be enforced by type hints."""
     if s.app_env not in ("development", "staging", "production"):
-        raise ValueError(f"APP_ENV must be 'development', 'staging', or 'production', got '{s.app_env}'")
+        raise ValueError("APP_ENV must be development, staging, or production")
+
+    if s.app_env in ("staging", "production"):
+        if not s.secret_key:
+            raise ValueError("JWT_SECRET_KEY or SECRET_KEY must be explicitly set")
+        if not s.csrf_secret_key:
+            raise ValueError("CSRF_SECRET_KEY must be explicitly set")
 
     if s.app_env == "production":
-        # In production, SECRET_KEY must be explicitly set (not auto-generated)
-        if not os.environ.get("JWT_SECRET_KEY") and not os.environ.get("SECRET_KEY"):
-            raise ValueError(
-                "JWT_SECRET_KEY (or SECRET_KEY) must be explicitly set in production. "
-                "Auto-generated keys are not allowed in production."
-            )
-        if not os.environ.get("CSRF_SECRET_KEY"):
-            raise ValueError(
-                "CSRF_SECRET_KEY must be explicitly set in production. "
-                "Auto-generated keys are not allowed in production."
-            )
+        try:
+            database_url = make_url(s.database_url)
+        except ArgumentError:
+            raise ValueError("DATABASE_URL must be a parseable PostgreSQL URL") from None
+        if database_url.get_backend_name() != "postgresql":
+            raise ValueError("DATABASE_URL must be a parseable PostgreSQL URL")
 
-        # Production: reject weak JWT secret (< 32 bytes hex = 64 chars)
-        if len(s.secret_key) < 32:
-            raise ValueError(
-                "JWT secret key is too weak for production. "
-                "Use at least 32 bytes (64 hex characters)."
-            )
+        if len(s.secret_key.encode("utf-8")) < 32:
+            raise ValueError("JWT_SECRET_KEY or SECRET_KEY must contain at least 32 bytes")
+        if len(s.csrf_secret_key.encode("utf-8")) < 32:
+            raise ValueError("CSRF_SECRET_KEY must contain at least 32 bytes")
+        if s.secret_key == s.csrf_secret_key:
+            raise ValueError("JWT_SECRET_KEY and CSRF_SECRET_KEY must be distinct")
 
-        # Production: cookies MUST be Secure
         if not s.cookie_secure:
-            raise ValueError(
-                "COOKIE_SECURE must be 'true' in production. "
-                "Browsers reject non-secure cookies in HTTPS contexts."
-            )
+            raise ValueError("COOKIE_SECURE must be true in production")
 
-        # Production: reject wildcard CORS origins with credentials
-        if "*" in s.cors_origins:
+        topology_variables = ("TRUSTED_HOSTS", "ALLOWED_ORIGINS", "CORS_ORIGINS")
+        missing = [name for name in topology_variables if name not in os.environ]
+        if missing:
             raise ValueError(
-                "Wildcard '*' CORS origins are not allowed in production with credentials. "
-                "Use explicit origin domains."
+                ", ".join(missing) + " must be explicitly set in production"
             )
+        if not s.trusted_hosts:
+            raise ValueError("TRUSTED_HOSTS must not be empty in production")
+        if not s.allowed_origins:
+            raise ValueError("ALLOWED_ORIGINS must not be empty in production")
 
-        # Production: reject wildcard in allowed_origins
-        if "*" in s.allowed_origins:
-            raise ValueError(
-                "Wildcard '*' is not allowed in ALLOWED_ORIGINS in production."
-            )
+        if any("*" in origin for origin in s.cors_origins):
+            raise ValueError("CORS_ORIGINS must not contain wildcards in production")
+        if any("*" in origin for origin in s.allowed_origins):
+            raise ValueError("ALLOWED_ORIGINS must not contain wildcards in production")
 
     if s.cookie_same_site not in ("lax", "strict", "none"):
-        raise ValueError(
-            f"COOKIE_SAME_SITE must be 'lax', 'strict', or 'none', got '{s.cookie_same_site}'"
-        )
+        raise ValueError("COOKIE_SAME_SITE must be lax, strict, or none")
     if not s.cookie_path.startswith("/"):
         raise ValueError("COOKIE_PATH must start with '/'")
 

@@ -116,7 +116,7 @@ function ReaderPageView({ item, zoom, fitWidth, seeking = false, registerCleanup
 
       try {
         const response = await fetch(requestUrl, {
-          credentials: "omit",
+          credentials: "same-origin",
           signal: requestController.signal,
         });
         if (!active || generationRef.current !== generation || controller !== requestController) return;

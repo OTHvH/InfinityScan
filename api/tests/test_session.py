@@ -16,7 +16,6 @@ import uuid
 from datetime import datetime, timedelta, timezone
 
 import jwt
-import pytest
 from sqlalchemy import select
 
 from models import RefreshSession, User, UserRole

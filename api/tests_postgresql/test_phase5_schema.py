@@ -17,6 +17,7 @@ from alembic import command
 from alembic.config import Config
 from alembic.script import ScriptDirectory
 from sqlalchemy import create_engine, text
+from sqlalchemy.engine import make_url
 from sqlalchemy.exc import DBAPIError, IntegrityError
 from sqlalchemy.orm import Session
 
@@ -30,6 +31,15 @@ from tools.integrity import repair_safe  # noqa: E402
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
 if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL must point to a disposable PostgreSQL database")
+if os.environ.get("INFINITYSCAN_DISPOSABLE_TEST") != "1":
+    raise RuntimeError("INFINITYSCAN_DISPOSABLE_TEST=1 is required for destructive schema tests")
+_database = make_url(DATABASE_URL)
+if (
+    _database.get_backend_name() != "postgresql"
+    or _database.host not in {"127.0.0.1", "localhost"}
+    or not (_database.database or "").startswith("phase5_migrations_")
+):
+    raise RuntimeError("schema tests require a loopback gate-owned disposable database")
 
 SERIES_ID = uuid.UUID("71000000-0000-0000-0000-000000000001")
 CHAPTER_ID = uuid.UUID("71000000-0000-0000-0000-000000000002")

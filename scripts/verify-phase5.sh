@@ -15,18 +15,15 @@ if [ "${APP_ENV:-development}" = "production" ]; then
   printf '%s\n' 'Phase 5 refuses APP_ENV=production.' >&2
   exit 2
 fi
-if [ -e "$REPO_ROOT/infra/.env" ]; then
-  printf '%s\n' 'Phase 5 refuses to run while infra/.env exists; use a disposable synthetic environment.' >&2
-  exit 2
-fi
-
+. "$REPO_ROOT/scripts/lib/verify-runtime.sh"
+verify_runtime_init phase5
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 NC='\033[0m'
 PASS_COUNT=0
 FAIL_COUNT=0
 SKIP_COUNT=0
-TMPDIR="$(mktemp -d /tmp/infinityscan-phase5-XXXXXX)"
+TMPDIR="$VERIFY_TMPDIR"
 if [ -n "${PYTHON:-}" ]; then
   API_PYTHON="$PYTHON"
 elif [ -x "$REPO_ROOT/api/.venv/bin/python" ]; then
@@ -41,23 +38,17 @@ STACK_READY=false
 MIGRATION_STARTED=false
 MIGRATION_READY=false
 MIGRATION_COMPOSE=()
-GATE_INFRA_ENV_CREATED=false
 
 # shellcheck disable=SC2329
 cleanup() {
   local status=$?
+  trap - EXIT
   set +e
-  if [ "$STACK_STARTED" = true ] && [ -n "${GATE_COMPOSE+x}" ]; then
-    "${GATE_COMPOSE[@]}" down -v --remove-orphans >/dev/null 2>&1
-  fi
   if [ "$MIGRATION_STARTED" = true ] && [ "${#MIGRATION_COMPOSE[@]}" -gt 0 ]; then
     "${MIGRATION_COMPOSE[@]}" down -v --remove-orphans >/dev/null 2>&1
   fi
-  if [ "$GATE_INFRA_ENV_CREATED" = true ]; then
-    rm -f "$REPO_ROOT/infra/.env"
-  fi
-  rm -rf "$TMPDIR"
-  exit "$status"
+  verify_runtime_cleanup "$status"
+  exit $?
 }
 trap cleanup EXIT
 
@@ -74,6 +65,7 @@ run_check() {
     status=$?
     printf '%s\n' "$output" | tail -n 8 >&2
     fail "$label (exit $status)"
+    return "$status"
   fi
 }
 
@@ -108,6 +100,7 @@ run_test_no_skips() {
   else
     printf '%s\n' "$output" | tail -n 8 >&2
     fail "$label"
+    return 1
   fi
 }
 
@@ -123,9 +116,10 @@ finish() {
 
 run_gate() {
   local phase="$1" script="$2" log status
+  shift 2
   status=0
   log="$TMPDIR/phase-${phase}.log"
-  bash "$script" >"$log" 2>&1 || status=$?
+  bash "$script" "$@" >"$log" 2>&1 || status=$?
   if [ "$status" -eq 0 ] \
     && grep -q '^Failed: 0$' "$log" \
     && grep -q '^Skipped: 0$' "$log" \
@@ -137,33 +131,40 @@ run_gate() {
   tail -n 20 "$log" >&2
   fail "PREREQUISITE: Phase ${phase} gate"
   if [ "$status" -ne 0 ]; then
-    exit "$status"
+    return "$status"
   fi
-  exit 1
+  return 1
 }
 
 printf '%s\n' '======================================'
 printf '%s\n' '  InfinityScan Phase 5 Verification'
 printf '%s\n' '======================================'
 
-# Prerequisites are intentionally sequential and fail immediately.
-run_gate 1 scripts/verify-phase1.sh
-run_gate 2 scripts/verify-phase2.sh
-run_gate 3 scripts/verify-phase3.sh
-run_gate 4 scripts/verify-phase4.sh
+PHASE_ONLY=false
+for arg in "$@"; do
+  case "$arg" in
+    --phase-only) PHASE_ONLY=true ;;
+    *) fail "ARGUMENTS: unknown argument: $arg" ;;
+  esac
+done
 
-# Earlier phase scripts may create a local development env as part of their
-# disposable checks. It must not survive into Phase 5 or be used below.
-rm -f "$REPO_ROOT/infra/.env"
+# Prerequisites are intentionally sequential and fail immediately.
+if [ "$PHASE_ONLY" = false ]; then
+  run_gate 1 scripts/verify-phase1.sh || finish
+  run_gate 2 scripts/verify-phase2.sh || finish
+  run_gate 3 scripts/verify-phase3.sh --phase-only || finish
+  run_gate 4 scripts/verify-phase4.sh --phase-only || finish
+fi
 
 # 1. Required tools.
 # shellcheck disable=SC2016
 run_shell_check 'CHECK-01: required tools available' 'for tool in python3 node npm git jq docker curl shellcheck actionlint pg_dump pg_restore age age-keygen; do command -v "$tool" >/dev/null || exit 1; done'
 run_shell_check 'CHECK-01a: shell syntax' 'bash -n scripts/*.sh scripts/lib/*.sh'
-run_check 'CHECK-01b: shellcheck' shellcheck scripts/test-disaster-recovery.sh scripts/verify-phase5.sh scripts/backup-db.sh scripts/restore-db.sh scripts/lib/npm-audit.sh
+run_check 'CHECK-01b: shellcheck' shellcheck scripts/lib/verify-runtime.sh scripts/test-disaster-recovery.sh scripts/verify-phase5.sh scripts/backup-db.sh scripts/restore-db.sh scripts/lib/npm-audit.sh
+run_check 'CHECK-01c: verifier disk and inode preflight' verify_runtime_preflight || finish
 
 # 2-5. Repository safety and generated-artifact policy.
-run_shell_check 'CHECK-02a: no real .env present on disk' 'test ! -e infra/.env'
+run_check 'CHECK-02a: repository infra/.env remained unchanged' verify_runtime_assert_repo_env_unchanged
 run_shell_check 'CHECK-02: no real .env tracked' '[ -z "$(git ls-files | awk '\''/\.env$/ && $0 !~ /\.env\.example$/ {print}'\'')" ]'
 run_check 'CHECK-03: no backup artifacts tracked or present' no_backup_artifacts
 run_shell_check 'CHECK-04: no private keys tracked' '[ -z "$(git ls-files | awk '\''tolower($0) ~ /(^|\/)(id_rsa|id_ed25519)$|\.(pem|key|p12|pfx)$/ {print}'\'')" ]'
@@ -188,24 +189,42 @@ MIGRATION_DB_USER="phase5_user"
 MIGRATION_DB_PASSWORD="phase5_password_${BASHPID}"
 MIGRATION_DB_NAME="phase5_migrations_${BASHPID}"
 MIGRATION_SCRATCH_NAME="phase5_scratch_${BASHPID}"
-MIGRATION_DB_PORT="$((57000 + BASHPID % 1000))"
+MIGRATION_DB_PORT=""
 MIGRATION_ENV="$TMPDIR/migration.env"
 MIGRATION_OVERRIDE="$TMPDIR/migration.override.yml"
-MIGRATION_DATABASE_URL="postgresql+psycopg://${MIGRATION_DB_USER}:${MIGRATION_DB_PASSWORD}@127.0.0.1:${MIGRATION_DB_PORT}/${MIGRATION_DB_NAME}"
-MIGRATION_SCRATCH_URL="postgresql+psycopg://${MIGRATION_DB_USER}:${MIGRATION_DB_PASSWORD}@127.0.0.1:${MIGRATION_DB_PORT}/${MIGRATION_SCRATCH_NAME}"
+MIGRATION_DATABASE_URL=""
+MIGRATION_SCRATCH_URL=""
+MIGRATION_PROJECT="${VERIFY_PROJECT}-migrations"
 
 prepare_migration_database() {
   cp infra/.env.example "$MIGRATION_ENV"
   sed -i "s/^POSTGRES_USER=.*/POSTGRES_USER=$MIGRATION_DB_USER/; s/^POSTGRES_PASSWORD=.*/POSTGRES_PASSWORD=$MIGRATION_DB_PASSWORD/; s/^POSTGRES_DB=.*/POSTGRES_DB=$MIGRATION_DB_NAME/" "$MIGRATION_ENV"
+  printf 'MINIO_ROOT_PASSWORD=unused_%s\n' "$VERIFY_RUN_ID" >>"$MIGRATION_ENV"
   cat >"$MIGRATION_OVERRIDE" <<EOF
 services:
   db:
     ports:
-      - "127.0.0.1:${MIGRATION_DB_PORT}:5432"
+      - "127.0.0.1::5432"
 EOF
-  MIGRATION_COMPOSE=(docker compose --project-name "infinityscan-phase5-migrations-${BASHPID}" --env-file "$MIGRATION_ENV" -f "$REPO_ROOT/infra/docker-compose.yml" -f "$MIGRATION_OVERRIDE")
+  MIGRATION_COMPOSE=(
+    env
+    "POSTGRES_USER=$MIGRATION_DB_USER"
+    "POSTGRES_PASSWORD=$MIGRATION_DB_PASSWORD"
+    "POSTGRES_DB=$MIGRATION_DB_NAME"
+    "DATABASE_URL=postgresql+psycopg://${MIGRATION_DB_USER}:${MIGRATION_DB_PASSWORD}@db:5432/${MIGRATION_DB_NAME}"
+    "JWT_SECRET_KEY=$(verify_runtime_env_value JWT_SECRET_KEY)"
+    "CSRF_SECRET_KEY=$(verify_runtime_env_value CSRF_SECRET_KEY)"
+    "MINIO_ROOT_PASSWORD=unused_${VERIFY_RUN_ID}"
+    "INFINITYSCAN_ENV_FILE=$MIGRATION_ENV"
+    docker compose --project-name "$MIGRATION_PROJECT" --env-file "$MIGRATION_ENV"
+    -f "$REPO_ROOT/infra/docker-compose.yml" -f "$MIGRATION_OVERRIDE"
+  )
   "${MIGRATION_COMPOSE[@]}" up -d db >/dev/null || return 1
   MIGRATION_STARTED=true
+  MIGRATION_DB_PORT="$("${MIGRATION_COMPOSE[@]}" port db 5432 | awk -F: 'NR == 1 { print $NF }')"
+  [ -n "$MIGRATION_DB_PORT" ] || return 1
+  MIGRATION_DATABASE_URL="postgresql+psycopg://${MIGRATION_DB_USER}:${MIGRATION_DB_PASSWORD}@127.0.0.1:${MIGRATION_DB_PORT}/${MIGRATION_DB_NAME}"
+  MIGRATION_SCRATCH_URL="postgresql+psycopg://${MIGRATION_DB_USER}:${MIGRATION_DB_PASSWORD}@127.0.0.1:${MIGRATION_DB_PORT}/${MIGRATION_SCRATCH_NAME}"
   local container=""
   for _ in $(seq 1 60); do
     container="$("${MIGRATION_COMPOSE[@]}" ps -q db | tr -d '[:space:]')"
@@ -226,9 +245,16 @@ check_orm_drift() {
 }
 
 check_clean_migration() {
+  local status=0
   [ "$MIGRATION_READY" = true ] || return 1
   (cd api && DATABASE_URL="$MIGRATION_DATABASE_URL" "$API_PYTHON" -m tools.migration_verifier check \
-    --database-url "$MIGRATION_DATABASE_URL" --scratch-url "$MIGRATION_SCRATCH_URL" --require-db-head --require-schema --json | jq -e '.ok == true' >/dev/null)
+    --database-url "$MIGRATION_DATABASE_URL" --scratch-url "$MIGRATION_SCRATCH_URL" --require-db-head --require-schema --json | jq -e '.ok == true' >/dev/null) || return 1
+  INFINITYSCAN_DISPOSABLE_MIGRATION_TEST=1 \
+    DATABASE_URL="$MIGRATION_DATABASE_URL" \
+    TASK6_SECOND_DATABASE_URL="$MIGRATION_SCRATCH_URL" \
+    "$API_PYTHON" -m pytest api/tests_postgresql/test_task6_migrations.py -q || status=$?
+  (cd api && DATABASE_URL="$MIGRATION_DATABASE_URL" "$API_PYTHON" -m alembic upgrade head) || return 1
+  return "$status"
 }
 
 check_downgrade_upgrade() {
@@ -238,7 +264,8 @@ check_downgrade_upgrade() {
 
 check_postgresql_constraints() {
   [ "$MIGRATION_READY" = true ] || return 1
-  DATABASE_URL="$MIGRATION_DATABASE_URL" "$API_PYTHON" -m pytest api/tests_postgresql/test_phase5_schema.py -q
+  INFINITYSCAN_DISPOSABLE_TEST=1 DATABASE_URL="$MIGRATION_DATABASE_URL" \
+    "$API_PYTHON" -m pytest api/tests_postgresql/test_phase5_schema.py -q
 }
 
 prepare_migration_database || true
@@ -306,69 +333,107 @@ run_shell_check 'CHECK-54: no privileged pull_request_target execution' '! git g
 run_check 'CHECK-55: Dependabot config validates' "$API_PYTHON" scripts/check-workflows.py
 
 # 56-68. Disposable production image/stack checks.
-GATE_ENV="$TMPDIR/gate.env"
-cp infra/.env.example "$GATE_ENV"
-GATE_API_PORT="$((58000 + BASHPID % 1000))"
-GATE_WEB_PORT="$((59000 + BASHPID % 1000))"
-sed -i "s/^POSTGRES_USER=.*/POSTGRES_USER=phase5_user/; s/^POSTGRES_PASSWORD=.*/POSTGRES_PASSWORD=phase5_password_${BASHPID}/; s/^POSTGRES_DB=.*/POSTGRES_DB=phase5_gate_${BASHPID}/; s#^DATABASE_URL=.*#DATABASE_URL=postgresql+psycopg://phase5_user:phase5_password_${BASHPID}@db:5432/phase5_gate_${BASHPID}#" "$GATE_ENV"
-printf '\nAPI_PORT=%s\nNEXT_PUBLIC_API_URL=http://127.0.0.1:%s\n' "$GATE_API_PORT" "$GATE_API_PORT" >>"$GATE_ENV"
-cp "$GATE_ENV" "$REPO_ROOT/infra/.env"
-chmod 600 "$REPO_ROOT/infra/.env"
-GATE_INFRA_ENV_CREATED=true
-GATE_OVERRIDE="$TMPDIR/gate.override.yml"
-cat >"$GATE_OVERRIDE" <<EOF
-services:
-  web:
-    ports:
-      - "127.0.0.1:${GATE_WEB_PORT}:3000"
-EOF
-GATE_COMPOSE=(docker compose --project-name "infinityscan-phase5-${BASHPID}" --env-file "$GATE_ENV" -f infra/docker-compose.yml -f "$GATE_OVERRIDE")
-GATE_API_URL="http://127.0.0.1:${GATE_API_PORT}"
-GATE_WEB_URL="http://127.0.0.1:${GATE_WEB_PORT}"
+GATE_COMPOSE=("${VERIFY_COMPOSE[@]}")
+GATE_API_URL="http://127.0.0.1:0"
+GATE_WEB_URL="http://127.0.0.1:0"
+GATE_API_IMAGE="${VERIFY_PROJECT}-api:gate"
+GATE_WEB_IMAGE="${VERIFY_PROJECT}-web:gate"
 run_check 'CHECK-56: production Compose config' "${GATE_COMPOSE[@]}" config
-run_check 'CHECK-57: API production image builds' docker build -t infinityscan-phase5-api:gate api
-run_check 'CHECK-58: web production image builds' docker build -t infinityscan-phase5-web:gate web
+if run_check 'CHECK-57: API production image builds' docker build -t "$GATE_API_IMAGE" api; then
+  verify_runtime_register_image "$GATE_API_IMAGE"
+fi
+if run_check 'CHECK-58: web production image builds' docker build --build-arg API_INTERNAL_URL=http://api:8000 -t "$GATE_WEB_IMAGE" web; then
+  verify_runtime_register_image "$GATE_WEB_IMAGE"
+fi
 run_shell_check 'CHECK-59: production images contain no tracked secrets' '! git grep -n -E "-----BEGIN .*PRIVATE KEY|postgresql[^ ]*://[^ ]+:[^ ]+@" -- api web'
-run_check 'CHECK-60: API image has no real .env' docker run --rm infinityscan-phase5-api:gate sh -c 'test ! -e /app/.env'
-run_check 'CHECK-61: production images use non-root users' bash -c 'test "$(docker image inspect infinityscan-phase5-api:gate --format "{{.Config.User}}")" = appuser && test "$(docker image inspect infinityscan-phase5-web:gate --format "{{.Config.User}}")" = nextjs'
+run_check 'CHECK-60: API image has no real .env' docker run --rm "$GATE_API_IMAGE" sh -c 'test ! -e /app/.env'
+run_check 'CHECK-61: production images use non-root users' bash -c 'test "$(docker image inspect "$1" --format "{{.Config.User}}")" = appuser && test "$(docker image inspect "$2" --format "{{.Config.User}}")" = nextjs' bash "$GATE_API_IMAGE" "$GATE_WEB_IMAGE"
 if docker info >/dev/null 2>&1; then
   STACK_STARTED=true
+  STACK_CHECKS_OK=true
+  STACK_START_OK=false
   if run_check 'CHECK-62: Docker stack starts' "${GATE_COMPOSE[@]}" up -d db migrate api web; then
+    STACK_START_OK=true
+    GATE_API_PORT="$(verify_runtime_port api 8000 || true)"
+    GATE_WEB_PORT="$(verify_runtime_port web 3000 || true)"
+    GATE_API_URL="http://127.0.0.1:${GATE_API_PORT}"
+    GATE_WEB_URL="http://127.0.0.1:${GATE_WEB_PORT}"
+  else
+    STACK_CHECKS_OK=false
+  fi
+  database_ready() {
+    for _ in $(seq 1 60); do
+      if "${GATE_COMPOSE[@]}" exec -T db pg_isready -U "$(verify_runtime_env_value POSTGRES_USER)" -d "$(verify_runtime_env_value POSTGRES_DB)" >/dev/null 2>&1; then
+        return 0
+      fi
+      sleep 1
+    done
+    return 1
+  }
+  migration_finished() {
+    local migration_container state
+    for _ in $(seq 1 120); do
+      migration_container="$("${GATE_COMPOSE[@]}" ps -aq migrate | tr -d '[:space:]')"
+      if [ -n "$migration_container" ]; then
+        state="$(docker inspect "$migration_container" --format '{{.State.Status}}:{{.State.ExitCode}}' 2>/dev/null || true)"
+        case "$state" in
+          exited:0) return 0 ;;
+          exited:*) return 1 ;;
+        esac
+      fi
+      sleep 1
+    done
+    return 1
+  }
+  if [ "$STACK_START_OK" = true ]; then
+    run_check 'CHECK-63: database becomes healthy' database_ready || STACK_CHECKS_OK=false
+    run_check 'CHECK-64: migrations finish' migration_finished || STACK_CHECKS_OK=false
+    run_check 'CHECK-65: API health returns 200' wait_http "$GATE_API_URL/health" || STACK_CHECKS_OK=false
+    run_check 'CHECK-66: frontend returns 200' wait_http "$GATE_WEB_URL" || STACK_CHECKS_OK=false
+  else
+    for check in 'CHECK-63: database becomes healthy' 'CHECK-64: migrations finish' 'CHECK-65: API health returns 200' 'CHECK-66: frontend returns 200'; do fail "$check"; done
+  fi
+  if [ "$STACK_CHECKS_OK" = true ]; then
     STACK_READY=true
   fi
-  run_check 'CHECK-63: database becomes healthy' "${GATE_COMPOSE[@]}" exec -T db pg_isready
-  migration_finished() {
-    local migration_container
-    migration_container="$("${GATE_COMPOSE[@]}" ps -aq migrate | tr -d '[:space:]')"
-    [ -n "$migration_container" ] && [ "$(docker inspect "$migration_container" --format '{{.State.ExitCode}}')" = 0 ]
-  }
-  run_check 'CHECK-64: migrations finish' migration_finished
-  run_check 'CHECK-65: API health returns 200' wait_http "$GATE_API_URL/health"
-  run_check 'CHECK-66: frontend returns 200' wait_http "$GATE_WEB_URL"
 else
   for check in 'CHECK-62: Docker stack starts' 'CHECK-63: database becomes healthy' 'CHECK-64: migrations finish' 'CHECK-65: API health returns 200' 'CHECK-66: frontend returns 200'; do fail "$check"; done
 fi
 run_shell_check 'CHECK-67: frontend bundle contains no credentials' 'test -d web/.next && ! grep -R -E "DATABASE_URL|POSTGRES_PASSWORD|S3_SECRET_ACCESS_KEY|JWT_SECRET_KEY" web/.next'
+gate_logs_safe() {
+  local logs
+  logs="$("${GATE_COMPOSE[@]}" logs --no-color 2>/dev/null)" || return 1
+  ! printf '%s\n' "$logs" | grep -Eiq 'password=|secret_key=|BEGIN .*PRIVATE KEY'
+}
 if [ "$STACK_READY" = true ]; then
-  run_shell_check 'CHECK-68: generated logs contain no obvious secrets' '! "${GATE_COMPOSE[@]}" logs 2>/dev/null | grep -Eiq "password=|secret_key=|BEGIN .*PRIVATE KEY"'
+  run_check 'CHECK-68: generated logs contain no obvious secrets' gate_logs_safe
 else
   fail 'CHECK-68: generated logs contain no obvious secrets'
 fi
 
 # 69-70. Final hygiene and cleanup.
 run_check 'CHECK-69: git diff --check' git diff --check
+if [ "$FAIL_COUNT" -ne 0 ]; then
+  verify_runtime_capture_diagnostics
+fi
+CLEANUP_OK=true
 if [ "$STACK_STARTED" = true ]; then
-  "${GATE_COMPOSE[@]}" down -v --remove-orphans >/dev/null 2>&1 || true
+  "${GATE_COMPOSE[@]}" down -v --remove-orphans >/dev/null 2>&1 || CLEANUP_OK=false
   STACK_STARTED=false
 fi
-if [ "$GATE_INFRA_ENV_CREATED" = true ]; then
-  rm -f "$REPO_ROOT/infra/.env"
-  GATE_INFRA_ENV_CREATED=false
-fi
 if [ "$MIGRATION_STARTED" = true ]; then
-  "${MIGRATION_COMPOSE[@]}" down -v --remove-orphans >/dev/null 2>&1 || true
-  MIGRATION_STARTED=false
+  if "${MIGRATION_COMPOSE[@]}" down -v --remove-orphans >/dev/null 2>&1; then
+    MIGRATION_STARTED=false
+  else
+    CLEANUP_OK=false
+  fi
 fi
-run_shell_check 'CHECK-70: disposable cleanup complete' '! docker ps -a --format "{{.Names}}" | grep -E "infinityscan-(dr|phase5)-"'
+cleanup_complete() {
+  [ "$CLEANUP_OK" = true ] \
+    && verify_runtime_project_empty "$VERIFY_PROJECT" \
+    && verify_runtime_project_empty "$MIGRATION_PROJECT" \
+    && verify_runtime_assert_repo_env_unchanged
+}
+run_check 'CHECK-70: disposable cleanup complete' cleanup_complete
 
 finish

@@ -11,13 +11,14 @@ NC='\033[0m'
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$REPO_ROOT"
-TMPDIR="$(mktemp -d /tmp/infinityscan-phase2-XXXXXX)"
+. "$REPO_ROOT/scripts/lib/verify-runtime.sh"
+verify_runtime_init phase2
+TMPDIR="$VERIFY_TMPDIR"
 PASS_COUNT=0
 FAIL_COUNT=0
 SKIP_COUNT=0
 RESULTS=()
 FAILED_CHECKS=()
-ENV_WAS_PRESENT=false
 
 pass() {
   PASS_COUNT=$((PASS_COUNT + 1))
@@ -36,20 +37,12 @@ short_error() {
   printf '%s\n' "$1" | tail -n 8
 }
 
-cleanup_stack() {
-  if [ -f "$REPO_ROOT/infra/.env" ]; then
-    docker compose --env-file "$REPO_ROOT/infra/.env" -f "$REPO_ROOT/infra/docker-compose.yml" down -v --remove-orphans >/dev/null 2>&1 || true
-  fi
-}
-
+# shellcheck disable=SC2329 # Invoked by the EXIT trap.
 cleanup() {
   local status=$?
-  cleanup_stack
-  if [ "$ENV_WAS_PRESENT" = false ]; then
-    rm -f "$ENV_FILE"
-  fi
-  rm -rf "$TMPDIR"
-  exit "$status"
+  trap - EXIT
+  verify_runtime_cleanup "$status"
+  exit $?
 }
 trap cleanup EXIT
 
@@ -59,22 +52,15 @@ for arg in "$@"; do
   case "$arg" in
     --skip-docker) SKIP_DOCKER=true ;;
     --cleanup) CLEANUP_ONLY=true ;;
+    --phase-only) : ;;
     *) fail "Unknown argument: $arg" ;;
   esac
 done
 
-ENV_FILE="$REPO_ROOT/infra/.env"
-if [ -f "$ENV_FILE" ]; then
-  ENV_WAS_PRESENT=true
-fi
-if [ ! -f "$ENV_FILE" ]; then
-  cp "$REPO_ROOT/infra/.env.example" "$ENV_FILE"
-fi
-COMPOSE=(docker compose --env-file "$ENV_FILE" -f "$REPO_ROOT/infra/docker-compose.yml")
+COMPOSE=("${VERIFY_COMPOSE[@]}")
 compose() { "${COMPOSE[@]}" "$@"; }
 env_value() {
-  local key="$1"
-  awk -F= -v wanted="$key" '$1 == wanted { value=substr($0, index($0, "=") + 1) } END { print value }' "$ENV_FILE"
+  verify_runtime_env_value "$1"
 }
 DB_USER="$(env_value POSTGRES_USER)"
 DB_NAME="$(env_value POSTGRES_DB)"
@@ -83,12 +69,12 @@ DB_USER="${DB_USER:-infinityscan}"
 DB_NAME="${DB_NAME:-infinityscan}"
 
 if [ "$CLEANUP_ONLY" = true ]; then
-  cleanup_stack
+  "${VERIFY_COMPOSE[@]}" --profile storage down -v --remove-orphans
   exit 0
 fi
 
-API_BASE="http://localhost:8000"
-WEB_BASE="http://localhost:3000"
+API_BASE="http://127.0.0.1:0"
+WEB_BASE="http://127.0.0.1:0"
 API_VENV="$REPO_ROOT/api/.venv"
 if [ ! -x "$API_VENV/bin/python" ]; then
   API_VENV="/tmp/infinityscan-audit-venv"
@@ -103,6 +89,27 @@ API_PYTHON="$API_VENV/bin/python"
 echo "======================================"
 echo "  InfinityScan Phase 2 Verification"
 echo "======================================"
+
+run_local_check() {
+  local label="$1"
+  shift
+  local output status
+  if output=$("$@" 2>&1); then
+    pass "$label"
+  else
+    status=$?
+    fail "$label (exit $status): $(short_error "$output")"
+  fi
+}
+
+if verify_runtime_preflight; then
+  pass "TOOL: verifier disk and inode preflight"
+else
+  fail "TOOL: verifier disk and inode preflight"
+  printf 'Passed: %d\nFailed: %d\nSkipped: %d\n' "$PASS_COUNT" "$FAIL_COUNT" "$SKIP_COUNT"
+  printf '%bPhase 2 gate: FAIL%b\n' "$RED" "$NC"
+  exit 1
+fi
 
 for tool in python3 node npm curl jq git; do
   if command -v "$tool" >/dev/null 2>&1; then
@@ -122,18 +129,6 @@ if [ -x "$API_PYTHON" ]; then
 else
   fail "PYTHON: verifier virtualenv is unavailable"
 fi
-
-run_local_check() {
-  local label="$1"
-  shift
-  local output status
-  if output=$("$@" 2>&1); then
-    pass "$label"
-  else
-    status=$?
-    fail "$label (exit $status): $(short_error "$output")"
-  fi
-}
 
 run_pytest_no_skips() {
   local label="$1"
@@ -186,7 +181,6 @@ else
   fail "CHECK-0: Docker daemon is required"
 fi
 
-STACK_STARTED=false
 DB_CONTAINER=""
 db_query() {
   local sql="$1"
@@ -209,12 +203,15 @@ if [ "$SKIP_DOCKER" = false ] && docker info >/dev/null 2>&1; then
     fail "CHECK-2a: could not reset Docker Compose stack (exit $status): $(short_error "$DOWN_OUT")"
   fi
   if START_OUT=$(compose up -d --build 2>&1); then
-    STACK_STARTED=true
     pass "CHECK-2: full stack startup command succeeded"
   else
     status=$?
     fail "CHECK-2: full stack startup failed (exit $status): $(short_error "$START_OUT")"
   fi
+  API_HOST_PORT="$(verify_runtime_port api 8000 || true)"
+  WEB_HOST_PORT="$(verify_runtime_port web 3000 || true)"
+  API_BASE="http://127.0.0.1:${API_HOST_PORT}"
+  WEB_BASE="http://127.0.0.1:${WEB_HOST_PORT}"
 
   DB_READY=false
   for _ in $(seq 1 45); do
@@ -263,23 +260,6 @@ else
   fail "CHECK-1 through CHECK-6: stack checks cannot run without Docker"
 fi
 
-COOKIE_HEADER() {
-  local headers_file="$1" cookie_name="$2"
-  grep -i "^set-cookie:.*${cookie_name}=" "$headers_file" 2>/dev/null | head -n 1 || true
-}
-cookie_attr() {
-  local headers_file="$1" cookie_name="$2" attr="$3" line lower
-  line="$(COOKIE_HEADER "$headers_file" "$cookie_name")"
-  lower="$(printf '%s' "$line" | tr '[:upper:]' '[:lower:]')"
-  case "$attr" in
-    httponly) [[ "$lower" =~ httponly ]] && printf true || printf false ;;
-    secure) printf '%s' "$lower" | grep -qE ';[[:space:]]*secure([;[:space:]]|$)' && printf true || printf false ;;
-    samesite) printf '%s' "$lower" | sed -n 's/.*samesite=\([^; ]*\).*/\1/p' ;;
-    path) printf '%s' "$lower" | sed -n 's/.*path=\([^; ]*\).*/\1/p' ;;
-    max-age) printf '%s' "$lower" | sed -n 's/.*max-age=\([^; ]*\).*/\1/p' ;;
-    *) printf '' ;;
-  esac
-}
 cookie_value() {
   local jar="$1" name="$2"
   awk -v wanted="$name" '$6 == wanted { print $7; exit }' "$jar" 2>/dev/null || true
@@ -353,8 +333,6 @@ else
 fi
 
 LOGIN_JAR="$TMPDIR/login.jar"
-LOGIN_HEADERS="$TMPDIR/login.headers"
-LOGIN_BODY="$TMPDIR/login.body"
 if login_user "$REG_USER" "$REG_PASS" "$LOGIN_JAR"; then
   pass "CHECK-8: login succeeds"
 else
@@ -392,7 +370,6 @@ fi
 ROT_JAR="$TMPDIR/rotation.jar"
 if login_user "$REG_USER" "$REG_PASS" "$ROT_JAR"; then
   OLD_REFRESH="$(cookie_value "$ROT_JAR" is_refresh)"
-  OLD_ACCESS="$(cookie_value "$ROT_JAR" is_access)"
   OLD_CSRF="$(cookie_value "$ROT_JAR" is_csrf)"
   SESSION_INFO="$(db_query "SELECT id::text || '|' || family_id::text FROM refresh_sessions WHERE user_id = '$REG_USER_ID' ORDER BY created_at DESC LIMIT 1;")"
   OLD_SESSION_ID="${SESSION_INFO%%|*}"
@@ -412,7 +389,7 @@ if login_user "$REG_USER" "$REG_PASS" "$ROT_JAR"; then
   NEW_ACCESS="$(cookie_value "$ROT_JAR" is_access)"
   NEW_CSRF="$(cookie_value "$ROT_JAR" is_csrf)"
   REUSE_JAR="$TMPDIR/reuse.jar"
-  printf '# Netscape HTTP Cookie File\nlocalhost\tFALSE\t/\tFALSE\t0\tis_refresh\t%s\nlocalhost\tFALSE\t/\tFALSE\t0\tis_access\t%s\nlocalhost\tFALSE\t/\tFALSE\t0\tis_csrf\t%s\n' "$OLD_REFRESH" "$NEW_ACCESS" "$NEW_CSRF" > "$REUSE_JAR"
+  printf '# Netscape HTTP Cookie File\n127.0.0.1\tFALSE\t/\tFALSE\t0\tis_refresh\t%s\n127.0.0.1\tFALSE\t/\tFALSE\t0\tis_access\t%s\n127.0.0.1\tFALSE\t/\tFALSE\t0\tis_csrf\t%s\n' "$OLD_REFRESH" "$NEW_ACCESS" "$NEW_CSRF" > "$REUSE_JAR"
   REUSE_CODE="$(curl -sS -b "$REUSE_JAR" -H "X-CSRF-Token: $NEW_CSRF" -o /dev/null -w '%{http_code}' -X POST "$API_BASE/auth/refresh")"
   if [ "$REUSE_CODE" = 401 ]; then
     pass "CHECK-10c: old refresh token reuse returns exactly 401"
@@ -578,7 +555,14 @@ else
   fail "CHECK-17: rate limit did not produce 429 after valid requests"
 fi
 
-if PROD_COOKIE_OUT="$(cd api && env APP_ENV=production DATABASE_URL=sqlite:/// CSRF_SECRET_KEY=prod-csrf-secret-012345678901234567890123456789 JWT_SECRET_KEY=prod-jwt-secret-012345678901234567890123456789 COOKIE_SECURE=true COOKIE_SAME_SITE=lax "$API_PYTHON" - <<'PY'
+if (cd api && env \
+    APP_ENV=production \
+    DATABASE_URL=postgresql+psycopg://verifier:unused@localhost/verifier \
+    CSRF_SECRET_KEY=prod-csrf-secret-012345678901234567890123456789 \
+    JWT_SECRET_KEY=prod-jwt-secret-012345678901234567890123456789 \
+    COOKIE_SECURE=true COOKIE_SAME_SITE=lax \
+    TRUSTED_HOSTS=localhost ALLOWED_ORIGINS=https://app.example CORS_ORIGINS= \
+    "$API_PYTHON" - <<'PY'
 import uuid
 
 from fastapi import Response
@@ -594,7 +578,7 @@ for name in ("is_access", "is_refresh", "is_csrf"):
     assert matching and "; Secure" in matching[0], matching
 print("OK")
 PY
-  )"; then
+  ); then
   pass "CHECK-18: production configuration sets Secure on access, refresh, and CSRF cookies"
 else
   fail "CHECK-18: production cookie security check failed"
@@ -606,6 +590,8 @@ if [ "$ORIGIN_CODE" = 403 ]; then
 else
   fail "CHECK-19: untrusted Origin returned $ORIGIN_CODE"
 fi
+
+run_local_check "CHECK-ENV: repository infra/.env remained unchanged" verify_runtime_assert_repo_env_unchanged
 
 echo ""
 echo "======================================"

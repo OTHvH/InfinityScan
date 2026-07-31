@@ -1,4 +1,4 @@
-# InfinityScan — Infrastructure & Deployment
+# InfinityScan - Infrastructure and Deployment
 
 Local Docker Compose stack for development. Runs PostgreSQL, the FastAPI API,
 and the Next.js frontend. An optional MinIO profile provides local S3-compatible
@@ -16,7 +16,7 @@ cd infra
 
 # 1. Create your local environment file
 cp .env.example .env
-# Edit .env — at minimum set a real POSTGRES_PASSWORD.
+# This is a local-development file. Do not reuse its values in production.
 
 # 2. Build images
 docker compose build
@@ -32,7 +32,7 @@ docker compose --profile storage run --rm minio-setup
 
 # 4. Check health
 docker compose ps                      # all services should be "Up" or "healthy"
-curl -s http://localhost:8000/health    # should return {"status":"ok"}
+curl -s http://localhost:3000/api/health # should return {"status":"ok"}
 # Web UI: http://localhost:3000
 
 # 5. Stop everything
@@ -48,7 +48,7 @@ docker compose down -v
 |------------|-------|-------------------------------------------------|
 | `db`       | 5432  | PostgreSQL 16 (Alpine). Data persists in `postgres_data` volume. |
 | `migrate`  | —     | One-off Alembic migration. Runs then exits.     |
-| `api`      | 8000  | FastAPI + Uvicorn. Starts only after `db` is healthy and `migrate` succeeds. |
+| `api`      | 8000  | Loopback-only direct FastAPI listener. Starts after `db` is healthy and `migrate` succeeds. |
 | `web`      | 3000  | Next.js standalone server. Starts only after `api` is healthy. |
 | `minio`    | 9000/9001 | Optional private S3-compatible API and console (`storage` profile). |
 | `minio-setup` | — | Explicit local bucket setup job (`storage` profile). |
@@ -64,11 +64,23 @@ Migrations are **not** run inside the API container. Instead:
 This design prevents multiple API replicas from racing to run migrations.
 If you scale the API (`--scale api=N`), migrations have already finished.
 
+## API routing
+
+Expose the Next.js service as the public origin. Browser code calls only the
+same-origin `/api` prefix. The Next.js server proxies `/api/:path*` to
+`API_INTERNAL_URL/:path*`, so FastAPI routes remain unprefixed (`/health`,
+`/auth/*`, `/reader/*`, and so on).
+
+Compose supplies `API_INTERNAL_URL=http://api:8000`. Outside development it is
+required and must be an absolute HTTP(S) origin without credentials, a path,
+query, or fragment. It is server-only: never place it in a `NEXT_PUBLIC_*`
+variable or client bundle.
+
 ## Cross-platform builds
 
-All base images (`python:3.12-slim`, `node:20-alpine`, `postgres:16-alpine`)
-support both `linux/amd64` and `linux/arm64`. No `platform:` field is set in
-the Compose file, so images build for the host architecture.
+The Python 3.12, Node 24, PostgreSQL 16, and MinIO images support both
+`linux/amd64` and `linux/arm64`. No `platform:` field is set in Compose, so
+images build for the host architecture.
 
 To build an ARM64 image on an x86 host (or vice versa):
 
@@ -82,7 +94,7 @@ docker buildx build --platform linux/arm64 -f api/Dockerfile -t infinityscan-api
 
 # Build Web for ARM64
 docker buildx build --platform linux/arm64 \
-  --build-arg NEXT_PUBLIC_API_URL=http://localhost:8000 \
+  --build-arg API_INTERNAL_URL=http://api:8000 \
   -f web/Dockerfile -t infinityscan-web:arm64 web
 ```
 
@@ -107,21 +119,61 @@ SIGTERM for graceful shutdown.
 
 ## Environment variables
 
-See `.env.example` for the full list. The most important variables:
+Use `.env.example` only to create the development `infra/.env`. The production
+template, `.env.production.example`, contains deliberately unusable
+angle-bracket placeholders and is a checklist rather than a credential file.
+
+The most important variables are:
 
 | Variable              | Where used | Notes                                           |
 |-----------------------|------------|-------------------------------------------------|
 | `POSTGRES_PASSWORD`   | db         | **Change this.**                                |
 | `DATABASE_URL`        | api, migrate | Must match POSTGRES_* settings.               |
-| `SECRET_KEY`          | api        | Optional for local dev (ephemeral key generated if missing). |
-| `NEXT_PUBLIC_API_URL` | web (build-time) | Must be reachable by end-user browsers. |
+| `JWT_SECRET_KEY`, `CSRF_SECRET_KEY` | api | Development values may be synthetic; deployed values must be explicit. |
+| `TRUSTED_HOSTS` | api | Host-header allowlist. Include `api` for the local Compose network. |
+| `ALLOWED_ORIGINS` | api | Exact origins accepted for unsafe requests. |
+| `CORS_ORIGINS` | api | Exact cross-origin clients; explicitly empty is valid for same-origin. |
+| `API_INTERNAL_URL` | web server/build | Private FastAPI origin; Compose supplies it. Never expose it to client JS. |
 | `OBJECT_STORAGE_ENABLED` | api | Enables private server-side object storage. Disabled by default. |
 | `S3_*` | api, minio-setup | S3-compatible endpoint, credentials, bucket, timeouts, and presign settings. |
 | `STORAGE_PUBLIC_BASE_URL` | api | Optional CDN base URL; presigned delivery remains the default. |
 
+### Production fail-fast checks
+
+With `APP_ENV=production`, startup requires a parseable PostgreSQL
+`DATABASE_URL` and a successful database readiness query. It also requires
+distinct `JWT_SECRET_KEY` and `CSRF_SECRET_KEY` values of at least 32 bytes,
+`COOKIE_SECURE=true`, and explicit `TRUSTED_HOSTS`, `ALLOWED_ORIGINS`, and
+`CORS_ORIGINS`. Trusted hosts and allowed origins cannot be empty or wildcarded;
+for a same-origin deployment, set `CORS_ORIGINS=` explicitly.
+
+If `OBJECT_STORAGE_ENABLED=true`, all required S3 settings must be present and
+the configured bucket must pass its startup health check. Production R2 uses an
+explicit `S3_ENDPOINT_URL` and `S3_REGION=auto`. The API does not create a
+production bucket.
+
+### Immutable pins
+
+Dockerfiles, Compose images, workflow service images, and `docker://` actions
+are pinned by SHA-256 digest. Non-local GitHub Actions are pinned to full
+40-character commit SHAs; adjacent comments retain the reviewed release
+version. `scripts/check-workflows.py` enforces this policy. Because the current
+`actions/checkout` and `actions/setup-node` releases use the Node 24 action
+runtime, self-hosted Actions runners must be version `2.327.1` or newer.
+
+Dependabot checks GitHub Actions weekly and Docker images monthly. To refresh a
+pin, review the upstream release and provenance, update the readable tag/version
+comment and immutable SHA or digest together, then run:
+
+```bash
+python scripts/check-workflows.py
+actionlint .github/workflows/*.yml
+scripts/verify-phase5.sh
+```
+
 ## Troubleshooting
 
-**API won't start — "connection refused" on db**
+**API won't start - "connection refused" on db**
 PostgreSQL may still be starting. Check with `docker compose ps`. The API
 depends on `db` being healthy, so it should not start until ready.
 

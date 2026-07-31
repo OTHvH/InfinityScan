@@ -1,0 +1,7 @@
+name: Mutable reusable workflow
+on: push
+permissions:
+  contents: read
+jobs:
+  call:
+    uses: example/automation/.github/workflows/test.yml@main

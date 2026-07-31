@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import hashlib
+import os
 import random
+import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -23,6 +25,7 @@ from botocore.exceptions import (
 from settings import Settings
 
 from .base import (
+    DownloadResult,
     ObjectMetadata,
     ObjectPage,
     ObjectVerification,
@@ -292,6 +295,93 @@ class S3CompatibleStorage:
             sha256=sha256,
             etag=str(etag).strip('"') if etag else None,
         )
+
+    def download_file(
+        self,
+        key: str,
+        destination: str | Path,
+        *,
+        expected_sha256: str | None = None,
+        expected_size: int | None = None,
+        max_bytes: int = 1024 * 1024 * 1024,
+    ) -> DownloadResult:
+        self._validate_key(key)
+        if max_bytes < 1:
+            raise ValueError("max_bytes must be positive")
+        if expected_size is not None and expected_size < 0:
+            raise ValueError("expected_size must not be negative")
+        if expected_size is not None and expected_size > max_bytes:
+            raise StorageError(f"S3 get_object exceeded the download limit for object {key}")
+        destination_path = Path(destination)
+        if not destination_path.parent.is_dir():
+            raise StorageError("download destination directory does not exist")
+
+        def download_once() -> DownloadResult:
+            temporary_path: Path | None = None
+            body: Any | None = None
+            try:
+                descriptor, temporary_name = tempfile.mkstemp(
+                    prefix=f".{destination_path.name}.tmp-",
+                    dir=destination_path.parent,
+                )
+                os.close(descriptor)
+                temporary_path = Path(temporary_name)
+                response = self._client.get_object(Bucket=self.bucket, Key=key)
+                body = response["Body"]
+                declared_size = response.get("ContentLength")
+                if declared_size is not None and int(declared_size) > max_bytes:
+                    raise StorageError(
+                        f"S3 get_object exceeded the download limit for object {key}"
+                    )
+
+                digest = hashlib.sha256()
+                byte_size = 0
+                with temporary_path.open("wb") as stream:
+                    for chunk in iter(lambda: body.read(1024 * 1024), b""):
+                        byte_size += len(chunk)
+                        if byte_size > max_bytes:
+                            raise StorageError(
+                                f"S3 get_object exceeded the download limit for object {key}"
+                            )
+                        stream.write(chunk)
+                        digest.update(chunk)
+                    stream.flush()
+                    os.fsync(stream.fileno())
+
+                actual_sha256 = digest.hexdigest()
+                if expected_sha256 is not None and actual_sha256 != expected_sha256:
+                    raise StorageError(f"S3 get_object checksum mismatch for object {key}")
+                if expected_size is not None and byte_size != expected_size:
+                    raise StorageError(f"S3 get_object size mismatch for object {key}")
+                os.replace(temporary_path, destination_path)
+                temporary_path = None
+                etag = response.get("ETag")
+                return DownloadResult(
+                    key=key,
+                    byte_size=byte_size,
+                    mime_type=response.get("ContentType"),
+                    sha256=actual_sha256,
+                    etag=str(etag).strip('"') if etag else None,
+                )
+            except OSError as exc:
+                if self._is_retryable(exc):
+                    raise
+                raise StorageError(f"S3 get_object could not write object {key}") from exc
+            finally:
+                if body is not None:
+                    body.close()
+                if temporary_path is not None:
+                    try:
+                        temporary_path.unlink()
+                    except FileNotFoundError:
+                        pass
+
+        try:
+            return self._call("get_object", key, download_once)
+        except ClientError as exc:
+            if self._is_missing(exc):
+                raise StorageError(f"S3 get_object failed for object {key}") from exc
+            raise
 
     def delete_object(self, key: str) -> bool:
         self._validate_key(key)

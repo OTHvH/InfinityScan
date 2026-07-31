@@ -42,6 +42,15 @@ class UploadResult:
 
 
 @dataclass(frozen=True)
+class DownloadResult:
+    key: str
+    byte_size: int
+    mime_type: str | None
+    sha256: str
+    etag: str | None
+
+
+@dataclass(frozen=True)
 class ObjectVerification:
     key: str
     exists: bool
@@ -63,6 +72,17 @@ class ObjectStorage(Protocol):
 
     def upload_bytes(self, key: str, data: bytes, mime_type: str) -> UploadResult:
         """Upload bytes with verified MIME metadata."""
+
+    def download_file(
+        self,
+        key: str,
+        destination: str | Path,
+        *,
+        expected_sha256: str | None = None,
+        expected_size: int | None = None,
+        max_bytes: int = 1024 * 1024 * 1024,
+    ) -> DownloadResult:
+        """Atomically stream an object to a file with a strict size bound."""
 
     def delete_object(self, key: str) -> bool:
         """Delete an object. Missing objects are treated as already deleted."""

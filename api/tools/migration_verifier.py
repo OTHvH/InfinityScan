@@ -62,7 +62,6 @@ def _alembic_config(api_dir: Path, database_url: str | None = None) -> Config:
     config = Config(str(api_dir / "alembic.ini"))
     config.set_main_option("script_location", str(api_dir / "alembic"))
     if database_url:
-        config.set_main_option("sqlalchemy.url", database_url.replace("%", "%%"))
         config.attributes["database_url"] = database_url
     return config
 
@@ -91,6 +90,7 @@ def _check_database_head(engine, expected_head: str, findings: list[Finding]) ->
         findings.append(
             Finding(
                 "database_not_at_head",
+                "error",
                 f"database revision does not equal the single migration head (expected={expected_head}; actual={revisions})",
             )
         )

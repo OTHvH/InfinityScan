@@ -6,29 +6,31 @@ Creates admin user and sample data.
 
 import os
 import sys
-from decimal import Decimal
-
-# Add parent directory to path
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-
 from datetime import datetime
+from decimal import Decimal
 from pathlib import Path
-
-# Configure before importing models
-# Use SQLite for local development if no DATABASE_URL is set
-DATABASE_URL = os.environ.get(
-    "DATABASE_URL", 
-    "sqlite:///./infinityscan.db"
-)
 
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
-from models import (
-    Base, User, Series, Chapter, Page, 
-    ContentType, ReadingMode, SeriesStatus, UserRole
-)
+# Add parent directory to path
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
 from auth import hash_password
+from models import (
+    Base,
+    Chapter,
+    ContentType,
+    Page,
+    ReadingMode,
+    Series,
+    SeriesStatus,
+    User,
+    UserRole,
+)
+
+# Use SQLite for local development if no DATABASE_URL is set.
+DATABASE_URL = os.environ.get("DATABASE_URL", "sqlite:///./infinityscan.db")
 
 
 def create_tables():

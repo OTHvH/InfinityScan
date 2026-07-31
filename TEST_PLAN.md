@@ -55,7 +55,7 @@ This test plan covers functional testing for the InfinityScan manga reader appli
 
 ### Verification Query
 ```bash
-curl "http://localhost:8000/reader/{slug}/chunks?start_chapter_id={uuid}&limit=5" | jq '.chapters[] | [.id, .number]'
+curl "http://localhost:3000/api/reader/{slug}/chunks?start_chapter_id={uuid}&limit=5" | jq '.chapters[] | [.id, .number]'
 ```
 
 ---
@@ -149,10 +149,10 @@ localStorage.getItem('infinityscan_progress_{slug}_{chapter_uuid}')
 ### Test Commands
 ```bash
 # Authenticated (cookie-based)
-curl -b "is_access=<token>" http://localhost:8000/bookmarks
+curl -b "is_access=<token>" http://localhost:3000/api/bookmarks
 
 # Unauthenticated (should return 401)
-curl http://localhost:8000/bookmarks
+curl http://localhost:3000/api/bookmarks
 ```
 
 ---
@@ -163,16 +163,17 @@ curl http://localhost:8000/bookmarks
 
 - [ ] All tests passing in CI
 - [ ] Database migrations tested on staging DB
-- [ ] No hardcoded localhost URLs in production
+- [ ] Browser API traffic is same-origin under `/api`; `API_INTERNAL_URL` is server-only
 - [ ] Environment variables documented
 - [ ] SSL/TLS certificate configured
+- [ ] Production PostgreSQL, distinct 32-byte secrets, secure cookies, host/origin allowlists, and enabled-storage readiness verified
 
 ### Infrastructure
 
 | Check | Command |
 |-------|---------|
 | PostgreSQL connection | `docker compose exec db pg_isready` |
-| API health | `curl http://localhost:8000/health` |
+| Same-origin API health | `curl https://example.com/api/health` |
 | Web builds | `cd web && npm run build` |
 | No build warnings | `npm run lint` passes |
 
@@ -180,7 +181,7 @@ curl http://localhost:8000/bookmarks
 
 | Check | Verification |
 |-------|--------------|
-| CORS origins set | Check `CORS_ORIGINS` env var |
+| Origins explicit | Check `TRUSTED_HOSTS`, `ALLOWED_ORIGINS`, and `CORS_ORIGINS` (empty CORS is valid for same-origin) |
 | Database credentials | Not committed to git |
 | API rate limiting | Enabled in production |
 | Image URL validation | SSRF protection in place |
@@ -189,7 +190,7 @@ curl http://localhost:8000/bookmarks
 
 ```bash
 # 1. API health
-curl https://api.example.com/health
+curl https://example.com/api/health
 # Expected: {"status": "ok"}
 
 # 2. Web loads
@@ -197,22 +198,22 @@ curl -I https://example.com
 # Expected: 200 OK
 
 # 3. Series list
-curl https://api.example.com/series
+curl https://example.com/api/series
 # Expected: JSON array (may be empty)
 
 # 4. Search (if using CopyManga)
-curl "https://api.example.com/series?q=onepiece"
+curl "https://example.com/api/series?q=onepiece"
 # Expected: Search results
 
 # 5. Initial local reader chunk
-curl "https://api.example.com/reader/onepiece/chunks?start_chapter_id=uuid"
+curl "https://example.com/api/reader/onepiece/chunks?start_chapter_id=uuid"
 # Expected: Ready chapters with verified same-origin media paths
 ```
 
 ### Rollback Plan
 
 1. Check Docker Compose logs: `docker compose -f infra/docker-compose.yml logs`
-2. Revert to previous image tag
+2. Redeploy the previous reviewed image digest
 3. Restore database from backup if needed
 4. Verify with smoke tests
 
@@ -238,7 +239,7 @@ docker compose -f infra/docker-compose.yml up -d
 python api/importer.py /tmp/test_library --dry-run
 
 # Verify import
-curl http://localhost:8000/series | jq
+curl http://localhost:3000/api/series | jq
 ```
 
 ### E2E Tests (Playwright)
@@ -251,15 +252,58 @@ cd web && npm run build && npm run test:e2e
 scripts/verify-phase4.sh
 ```
 
+### Cumulative Phase 5 Release Gate
+```bash
+scripts/verify-phase5.sh
+```
+
+Direct Phase 3, 4, and 5 invocations run all required earlier phases
+sequentially. `--phase-only` suppresses that prerequisite orchestration and is
+reserved for the release workflow or a parent verifier; Phase 1 and Phase 2
+accept it as a no-op. A direct highest-phase invocation is therefore the local
+cumulative contract, while CI owns phase ordering when it passes
+`--phase-only`.
+
+Every verifier creates a temporary synthetic environment file, random
+loopback-published ports, and a run-unique Compose project with isolated volume
+names. Cleanup is scoped to those resources, verifies that repository
+`infra/.env` remains byte-identical (or absent), and retains redacted Compose
+status/log diagnostics under `/tmp/infinityscan-verifier-diagnostics` only when
+needed. Mandatory infrastructure checks cannot pass through a skip mode.
+
 ---
 
 ## 8. Disaster Recovery and CI Ownership
 
-Task 9 owns the disposable database/object-storage restore drill:
+Task 9 owns the disposable PostgreSQL/MinIO restore and import-recovery drill:
 
 ```bash
 scripts/test-disaster-recovery.sh
 ```
+
+The drill refuses production mode and non-local Docker contexts/daemons by
+default. A remote daemon requires the explicit
+`INFINITYSCAN_DR_ALLOW_REMOTE_DOCKER=1` risk override. Every run uses a unique
+Compose project, temporary environment file, source database/bucket, and empty
+restore database/bucket; it neither edits `infra/.env` nor destroys the source
+targets.
+
+The backup scenario creates an encrypted complete v2 backup with database and
+object artifacts, verifies both with backup status, restores both artifacts to
+the distinct targets, and runs schema, relationship, API, and full-content
+SHA256 integrity checks against the restored targets. The seeded object has
+run-unique bytes so matching the archive manifest cannot be satisfied by
+re-uploading the fixture's embedded PNG.
+
+The recovery scenario starts a real host `ImportService` process against the
+restored PostgreSQL and MinIO targets. Its checkpoint hook atomically records
+the job ID and exact lock-owning PID after the first of two uploads; the drill
+requires `SIGKILL` exit 137, confirms the PostgreSQL advisory lock is released
+while the durable lease remains active, and proves `recover-safe` initially
+skips the job. After the short lease expires, production `scan` and
+`recover-safe` interfaces must reuse and verify page one, upload page two,
+publish exactly two pages in one ready chapter, advance fencing once, clear the
+lease, retain all prior objects, and finish with clean full-content integrity.
 
 Task 10 owns layered GitHub Actions checks. Fast CI runs backend/frontend
 quality, dependency, migration, and workflow-policy checks; integration CI runs

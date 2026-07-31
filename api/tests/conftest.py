@@ -8,6 +8,12 @@ from __future__ import annotations
 
 import os
 import sys
+import uuid
+
+import pytest
+from fastapi.testclient import TestClient
+from sqlalchemy import create_engine, event
+from sqlalchemy.orm import sessionmaker
 
 # Ensure the api/ package is importable
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
@@ -32,19 +38,10 @@ else:
     os.environ["DATABASE_URL"] = "sqlite://"
     _USE_POSTGRESQL = False
 
-import uuid
-from datetime import datetime, timezone
-
-import pytest
-from fastapi.testclient import TestClient
-from sqlalchemy import create_engine, event, text
-from sqlalchemy.orm import sessionmaker
-
-from models import Base
-from main import app
-from database import get_db
-from auth import hash_password
-from auth import generate_csrf_token, _PREAUTH_SESSION_ID
+from auth import hash_password  # noqa: E402
+from database import get_db  # noqa: E402
+from main import app  # noqa: E402
+from models import Base  # noqa: E402
 
 # ── Database engine ───────────────────────────────────────────────────────────
 

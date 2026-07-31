@@ -18,6 +18,18 @@ import pytest
 from settings import get_settings, reset_settings
 
 
+PRODUCTION_ENV = {
+    "APP_ENV": "production",
+    "JWT_SECRET_KEY": "j" * 32,
+    "CSRF_SECRET_KEY": "c" * 32,
+    "DATABASE_URL": "postgresql+psycopg://user:pass@database/app",
+    "COOKIE_SECURE": "true",
+    "TRUSTED_HOSTS": "api.example.com",
+    "ALLOWED_ORIGINS": "https://app.example.com",
+    "CORS_ORIGINS": "https://app.example.com",
+}
+
+
 @pytest.fixture(autouse=True)
 def _reset_settings():
     """Reset settings singleton before each test."""
@@ -36,6 +48,14 @@ class TestValidDevelopmentConfig:
             settings = get_settings()
             assert settings.app_env == "development"
             assert settings.app_name == "InfinityScan"
+
+    def test_development_generates_ephemeral_distinct_secrets(self):
+        with patch.dict(os.environ, {"APP_ENV": "development"}, clear=True):
+            reset_settings()
+            settings = get_settings()
+        assert len(settings.secret_key.encode()) >= 32
+        assert len(settings.csrf_secret_key.encode()) >= 32
+        assert settings.secret_key != settings.csrf_secret_key
 
     def test_database_url_from_env(self):
         """DATABASE_URL should be read from environment."""
@@ -59,121 +79,190 @@ class TestValidDevelopmentConfig:
             assert settings.trusted_hosts == ["example.com", "*.example.com"]
 
 
+class TestBooleanParsing:
+    @pytest.mark.parametrize("value", ["2", "enabled", "truthy"])
+    def test_unknown_boolean_values_are_rejected_without_echoing_value(self, value):
+        with patch.dict(os.environ, {"COOKIE_SECURE": value}, clear=True):
+            reset_settings()
+            with pytest.raises(ValueError, match="COOKIE_SECURE") as exc_info:
+                get_settings()
+        assert value not in str(exc_info.value)
+
+    @pytest.mark.parametrize(
+        ("value", "expected"),
+        [
+            ("1", True),
+            ("TRUE", True),
+            ("yes", True),
+            ("on", True),
+            ("0", False),
+            ("FALSE", False),
+            ("no", False),
+            ("off", False),
+        ],
+    )
+    def test_known_boolean_values_are_parsed(self, value, expected):
+        with patch.dict(os.environ, {"COOKIE_SECURE": value}, clear=True):
+            reset_settings()
+            settings = get_settings()
+        assert settings.cookie_secure is expected
+
+
 class TestValidProductionConfig:
     """Test valid production configuration."""
 
     def test_production_with_secret(self):
-        """Production should be valid with explicit secret."""
-        with patch.dict(os.environ, {
-            "APP_ENV": "production",
-            "JWT_SECRET_KEY": "a-very-long-secret-key-for-production",
-            "CSRF_SECRET_KEY": "a-separate-csrf-secret-key-for-production",
-            "DATABASE_URL": "postgresql+psycopg://user:pass@host/db",
-            "COOKIE_SECURE": "true",
-            "COOKIE_SAME_SITE": "lax",
-        }):
+        with patch.dict(os.environ, PRODUCTION_ENV, clear=True):
             reset_settings()
             settings = get_settings()
-            assert settings.app_env == "production"
-            assert settings.cookie_secure is True
+        assert settings.app_env == "production"
+        assert settings.cookie_secure is True
 
     def test_production_with_secret_key_env(self):
-        """Production should accept SECRET_KEY as alternative env var."""
-        with patch.dict(os.environ, {
-            "APP_ENV": "production",
-            "SECRET_KEY": "a" * 64,
-            "CSRF_SECRET_KEY": "c" * 64,
-            "DATABASE_URL": "postgresql+psycopg://user:pass@host/db",
-            "COOKIE_SECURE": "true",
-        }):
+        """SECRET_KEY remains a supported explicit JWT secret."""
+        env = {**PRODUCTION_ENV, "SECRET_KEY": "s" * 32}
+        env.pop("JWT_SECRET_KEY")
+        with patch.dict(os.environ, env, clear=True):
             reset_settings()
             settings = get_settings()
-            assert settings.app_env == "production"
+        assert settings.secret_key == "s" * 32
+
+    def test_explicit_empty_cors_selects_same_origin_topology(self):
+        with patch.dict(
+            os.environ,
+            {**PRODUCTION_ENV, "CORS_ORIGINS": ""},
+            clear=True,
+        ):
+            reset_settings()
+            settings = get_settings()
+        assert settings.cors_origins == []
+
+    def test_secret_length_is_measured_in_bytes(self):
+        with patch.dict(
+            os.environ,
+            {**PRODUCTION_ENV, "JWT_SECRET_KEY": "\u00e9" * 16},
+            clear=True,
+        ):
+            reset_settings()
+            settings = get_settings()
+        assert len(settings.secret_key.encode()) == 32
 
 
-class TestProductionSecretRequired:
-    """Test that production requires explicit secret key."""
-
+class TestProductionRequirements:
     def test_production_without_secret_raises(self):
-        """Production without JWT_SECRET_KEY or SECRET_KEY should raise."""
-        with patch.dict(os.environ, {
-            "APP_ENV": "production",
-            "DATABASE_URL": "postgresql+psycopg://user:pass@host/db",
-        }, clear=False):
-            # Remove both secret key env vars if present
-            env = os.environ.copy()
-            env.pop("JWT_SECRET_KEY", None)
-            env.pop("SECRET_KEY", None)
-            with patch.dict(os.environ, env, clear=True):
-                reset_settings()
-                with pytest.raises(ValueError, match="JWT_SECRET_KEY"):
-                    get_settings()
+        env = PRODUCTION_ENV.copy()
+        env.pop("JWT_SECRET_KEY")
+        with patch.dict(os.environ, env, clear=True):
+            reset_settings()
+            with pytest.raises(ValueError, match="JWT_SECRET_KEY"):
+                get_settings()
 
     def test_production_weak_jwt_secret_raises(self):
-        """Production with JWT secret < 32 bytes should raise."""
-        with patch.dict(os.environ, {
-            "APP_ENV": "production",
-            "JWT_SECRET_KEY": "short",
-            "CSRF_SECRET_KEY": "a" * 64,
-            "DATABASE_URL": "postgresql+psycopg://user:pass@host/db",
-            "COOKIE_SECURE": "true",
-        }):
+        with patch.dict(
+            os.environ,
+            {**PRODUCTION_ENV, "JWT_SECRET_KEY": "short"},
+            clear=True,
+        ):
             reset_settings()
-            with pytest.raises(ValueError, match="too weak"):
+            with pytest.raises(ValueError, match="JWT_SECRET_KEY"):
                 get_settings()
 
     def test_production_missing_csrf_secret_raises(self):
-        """Production without CSRF_SECRET_KEY should raise."""
-        env = os.environ.copy()
-        env["APP_ENV"] = "production"
-        env["JWT_SECRET_KEY"] = "a" * 64
-        env["DATABASE_URL"] = "postgresql+psycopg://user:pass@host/db"
-        env["COOKIE_SECURE"] = "true"
-        env.pop("CSRF_SECRET_KEY", None)
+        env = PRODUCTION_ENV.copy()
+        env.pop("CSRF_SECRET_KEY")
         with patch.dict(os.environ, env, clear=True):
             reset_settings()
             with pytest.raises(ValueError, match="CSRF_SECRET_KEY"):
                 get_settings()
 
+    def test_production_weak_csrf_secret_raises(self):
+        with patch.dict(
+            os.environ,
+            {**PRODUCTION_ENV, "CSRF_SECRET_KEY": "short"},
+            clear=True,
+        ):
+            reset_settings()
+            with pytest.raises(ValueError, match="CSRF_SECRET_KEY"):
+                get_settings()
+
+    def test_production_secrets_must_be_distinct(self):
+        with patch.dict(
+            os.environ,
+            {**PRODUCTION_ENV, "CSRF_SECRET_KEY": PRODUCTION_ENV["JWT_SECRET_KEY"]},
+            clear=True,
+        ):
+            reset_settings()
+            with pytest.raises(ValueError, match="distinct"):
+                get_settings()
+
     def test_production_cookie_secure_false_raises(self):
-        """Production with COOKIE_SECURE=false should raise."""
-        with patch.dict(os.environ, {
-            "APP_ENV": "production",
-            "JWT_SECRET_KEY": "a" * 64,
-            "CSRF_SECRET_KEY": "a" * 64,
-            "DATABASE_URL": "postgresql+psycopg://user:pass@host/db",
-            "COOKIE_SECURE": "false",
-        }):
+        with patch.dict(
+            os.environ,
+            {**PRODUCTION_ENV, "COOKIE_SECURE": "false"},
+            clear=True,
+        ):
             reset_settings()
             with pytest.raises(ValueError, match="COOKIE_SECURE"):
                 get_settings()
 
     def test_production_wildcard_cors_raises(self):
-        """Production with wildcard CORS origins should raise."""
-        with patch.dict(os.environ, {
-            "APP_ENV": "production",
-            "JWT_SECRET_KEY": "a" * 64,
-            "CSRF_SECRET_KEY": "a" * 64,
-            "DATABASE_URL": "postgresql+psycopg://user:pass@host/db",
-            "COOKIE_SECURE": "true",
-            "CORS_ORIGINS": "*",
-        }):
+        with patch.dict(
+            os.environ,
+            {**PRODUCTION_ENV, "CORS_ORIGINS": "https://*.example.com"},
+            clear=True,
+        ):
             reset_settings()
-            with pytest.raises(ValueError, match="Wildcard.*CORS"):
+            with pytest.raises(ValueError, match="CORS_ORIGINS"):
                 get_settings()
 
     def test_production_wildcard_allowed_origins_raises(self):
-        """Production with wildcard ALLOWED_ORIGINS should raise."""
-        with patch.dict(os.environ, {
-            "APP_ENV": "production",
-            "JWT_SECRET_KEY": "a" * 64,
-            "CSRF_SECRET_KEY": "a" * 64,
-            "DATABASE_URL": "postgresql+psycopg://user:pass@host/db",
-            "COOKIE_SECURE": "true",
-            "ALLOWED_ORIGINS": "*",
-        }):
+        with patch.dict(
+            os.environ,
+            {**PRODUCTION_ENV, "ALLOWED_ORIGINS": "*"},
+            clear=True,
+        ):
             reset_settings()
             with pytest.raises(ValueError, match="ALLOWED_ORIGINS"):
+                get_settings()
+
+    @pytest.mark.parametrize(
+        "name", ["TRUSTED_HOSTS", "ALLOWED_ORIGINS", "CORS_ORIGINS"]
+    )
+    def test_production_topology_variables_must_be_explicit(self, name):
+        env = PRODUCTION_ENV.copy()
+        env.pop(name)
+        with patch.dict(os.environ, env, clear=True):
+            reset_settings()
+            with pytest.raises(ValueError, match=name):
+                get_settings()
+
+    @pytest.mark.parametrize("name", ["TRUSTED_HOSTS", "ALLOWED_ORIGINS"])
+    def test_production_required_topology_values_must_not_be_empty(self, name):
+        with patch.dict(os.environ, {**PRODUCTION_ENV, name: ""}, clear=True):
+            reset_settings()
+            with pytest.raises(ValueError, match=name):
+                get_settings()
+
+    @pytest.mark.parametrize(
+        "database_url",
+        ["", "not-a-database-url", "sqlite:///production.db"],
+    )
+    def test_production_requires_postgresql_database_url(self, database_url):
+        with patch.dict(
+            os.environ,
+            {**PRODUCTION_ENV, "DATABASE_URL": database_url},
+            clear=True,
+        ):
+            reset_settings()
+            with pytest.raises(ValueError, match="DATABASE_URL") as exc_info:
+                get_settings()
+        if database_url:
+            assert database_url not in str(exc_info.value)
+
+    def test_staging_does_not_generate_secrets(self):
+        with patch.dict(os.environ, {"APP_ENV": "staging"}, clear=True):
+            reset_settings()
+            with pytest.raises(ValueError, match="JWT_SECRET_KEY"):
                 get_settings()
 
 
@@ -392,10 +481,7 @@ class TestObjectStorageSettings:
         with patch.dict(
             os.environ,
             {
-                "APP_ENV": "production",
-                "JWT_SECRET_KEY": "a" * 64,
-                "CSRF_SECRET_KEY": "b" * 64,
-                "COOKIE_SECURE": "true",
+                **PRODUCTION_ENV,
                 "OBJECT_STORAGE_ENABLED": "true",
                 "S3_REGION": "auto",
                 "S3_BUCKET": "prod-bucket",
@@ -412,10 +498,7 @@ class TestObjectStorageSettings:
         with patch.dict(
             os.environ,
             {
-                "APP_ENV": "production",
-                "JWT_SECRET_KEY": "a" * 64,
-                "CSRF_SECRET_KEY": "b" * 64,
-                "COOKIE_SECURE": "true",
+                **PRODUCTION_ENV,
                 "OBJECT_STORAGE_ENABLED": "true",
                 "S3_REGION": "us-east-1",
                 "S3_BUCKET": "prod-bucket",

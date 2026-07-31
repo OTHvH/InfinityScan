@@ -11,6 +11,7 @@
 **/.env.*
 !.env.example
 !**/.env.example
+!infra/.env.production.example
 
 # ---------------------------------------------------------------------------
 # Python
@@ -90,6 +91,8 @@ backups/
 *.dump
 *.dump.age
 *.dump.manifest.json
+*.objects.tar
+*.objects.tar.age
 
 # ---------------------------------------------------------------------------
 # Local manga / content import directories

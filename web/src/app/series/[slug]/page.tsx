@@ -2,12 +2,10 @@
 
 import { use, useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
-import { api } from "@/lib/api";
+import { api, resolveOptionalMediaUrl } from "@/lib/api";
 import { compareDecimalStrings, type Series, type Chapter } from "@/lib/types";
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
-
-const API_BASE = process.env.NEXT_PUBLIC_API_URL ?? "";
 
 const STATUS_LABELS: Record<string, string> = {
   ongoing: "Ongoing",
@@ -55,8 +53,7 @@ export default function SeriesPage(props: {
             slug: (d.path_word as string) ?? params.slug,
             title: (d.name as string) ?? "",
             synopsis: (d.brief as string) ?? null,
-            cover_url: (d.cover as string) ?? null,
-            cover_object_key: null,
+            cover_url: (d.cover_url as string) ?? null,
             content_type: "manhua",
             status: ((d.status as string) || "ongoing") as SeriesDetail["status"],
             year: null,
@@ -101,11 +98,7 @@ export default function SeriesPage(props: {
     );
   }
 
-  const coverUrl =
-    series.cover_url ??
-    (series.cover_object_key
-      ? `${API_BASE}/covers/${series.cover_object_key.split("/").map(encodeURIComponent).join("/")}`
-      : null);
+  const coverUrl = resolveOptionalMediaUrl(series.cover_url);
 
   // Sort chapters by number descending (newest first)
   const sortedChapters = [...(series.chapters || [])].sort(

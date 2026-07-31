@@ -16,12 +16,8 @@ For the new CLI interface, use::
 from __future__ import annotations
 
 import argparse
-import json
 import logging
 import sys
-import uuid
-import os
-from decimal import Decimal
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))

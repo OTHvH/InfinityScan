@@ -1,10 +1,20 @@
 # Reader API
 
-The canonical local-content reader endpoint is:
+The public browser endpoint is same-origin:
+
+```text
+GET /api/reader/{series_slug}/chunks
+```
+
+Next.js removes `/api` when proxying. The canonical FastAPI route therefore
+remains unprefixed:
 
 ```text
 GET /reader/{series_slug}/chunks
 ```
+
+Browser code must use the root-relative public path and must not know the
+server-only `API_INTERNAL_URL`.
 
 ## Request
 
@@ -77,9 +87,11 @@ top-level cursors are the last chapter's `next_cursor` and the first chapter's
 `previous_cursor`, respectively. A cursor and its corresponding `has_more`
 value are null/false at an exhausted series boundary.
 
-`media_path` is a same-API path. Reader responses never expose object keys,
-bucket names, storage endpoints, credentials, or presigned URLs. Clients fetch
-the path and follow the media service response; HTTP 404 is a failure.
+FastAPI returns `media_path` as an unprefixed API path such as
+`/media/pages/{uuid}`. The browser client validates it and requests
+`/api/media/pages/{uuid}` through the same-origin proxy. Reader responses never
+expose object keys, bucket names, storage endpoints, credentials, or presigned
+URLs. Clients follow the media service response; HTTP 404 is a failure.
 
 ## Errors
 
@@ -89,8 +101,8 @@ the path and follow the media service response; HTTP 404 is a failure.
 
 ## Deprecated Route
 
-`GET /library/{slug}/chapter/{number}` remains temporarily for compatibility
-and is marked deprecated in OpenAPI. It is ambiguous when multiple languages
-share a chapter number. The frontend does not call or link to this route; all
-reader links use `/reader/{series_slug}/{chapter_uuid}` and all data loading uses
-the cursor endpoint above.
+The FastAPI route `GET /library/{slug}/chapter/{number}` remains temporarily for
+compatibility and is marked deprecated in OpenAPI. It is ambiguous when
+multiple languages share a chapter number. The frontend does not call or link
+to this route; all page links use `/reader/{series_slug}/{chapter_uuid}` and all
+browser data loading uses the `/api/reader/.../chunks` endpoint above.

@@ -15,20 +15,15 @@ NC='\033[0m'
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$REPO_ROOT"
+. "$REPO_ROOT/scripts/lib/verify-runtime.sh"
+verify_runtime_init phase3
 
 PASS_COUNT=0
 FAIL_COUNT=0
 SKIP_COUNT=0
 RESULTS=()
 FAILED_CHECKS=()
-TMPDIR="$(mktemp -d /tmp/infinityscan-phase3-XXXXXX)"
-ENV_FILE="$REPO_ROOT/infra/.env"
-ENV_BACKUP="$TMPDIR/infra.env.backup"
-ENV_WAS_PRESENT=false
-if [ -f "$ENV_FILE" ]; then
-  cp "$ENV_FILE" "$ENV_BACKUP"
-  ENV_WAS_PRESENT=true
-fi
+TMPDIR="$VERIFY_TMPDIR"
 
 pass() {
   PASS_COUNT=$((PASS_COUNT + 1))
@@ -51,15 +46,6 @@ skip() {
 
 short_error() {
   printf '%s\n' "$1" | tail -n 8
-}
-
-skip_if() {
-  local label="$1" condition="$2"
-  if eval "$condition"; then
-    skip "$label"
-    return 0
-  fi
-  return 1
 }
 
 run_check() {
@@ -88,27 +74,23 @@ run_pytest_no_skips() {
   fi
 }
 
+# shellcheck disable=SC2329 # Invoked by the EXIT trap.
 cleanup() {
   local status=$?
-  if [ -f "$REPO_ROOT/infra/.env" ]; then
-    docker compose --env-file "$REPO_ROOT/infra/.env" -f "$REPO_ROOT/infra/docker-compose.yml" --profile storage down -v --remove-orphans >/dev/null 2>&1 || true
-  fi
-  if [ "$ENV_WAS_PRESENT" = true ]; then
-    cp "$ENV_BACKUP" "$ENV_FILE"
-  else
-    rm -f "$ENV_FILE"
-  fi
-  rm -rf "$TMPDIR"
-  exit "$status"
+  trap - EXIT
+  verify_runtime_cleanup "$status"
+  exit $?
 }
 trap cleanup EXIT
 
 SKIP_DOCKER=false
 CLEANUP_ONLY=false
+PHASE_ONLY=false
 for arg in "$@"; do
   case "$arg" in
     --skip-docker) SKIP_DOCKER=true ;;
     --cleanup) CLEANUP_ONLY=true ;;
+    --phase-only) PHASE_ONLY=true ;;
     *) fail "Unknown argument: $arg" ;;
   esac
 done
@@ -117,36 +99,23 @@ if [ "$CLEANUP_ONLY" = true ]; then
   exit 0
 fi
 
-if [ ! -f "$ENV_FILE" ]; then
-  cp "$REPO_ROOT/infra/.env.example" "$ENV_FILE"
-fi
-
-COMPOSE=(docker compose --env-file "$ENV_FILE" -f "$REPO_ROOT/infra/docker-compose.yml")
-compose() { "${COMPOSE[@]}" "$@"; }
-
 # Create an override compose file that exposes DB port to host
 COMPOSE_OVERRIDE="$TMPDIR/docker-compose.override.yml"
 cat > "$COMPOSE_OVERRIDE" <<'OVERRIDE'
 services:
   db:
     ports:
-      - "5432:5432"
+      - "127.0.0.1::5432"
 OVERRIDE
-COMPOSE=(docker compose --env-file "$ENV_FILE" -f "$REPO_ROOT/infra/docker-compose.yml" -f "$COMPOSE_OVERRIDE" --profile storage)
+COMPOSE=()
 compose() { "${COMPOSE[@]}" "$@"; }
 
 env_value() {
-  local key="$1"
-  awk -F= -v wanted="$key" '$1 == wanted { value=substr($0, index($0, "=") + 1) } END { print value }' "$ENV_FILE"
+  verify_runtime_env_value "$1"
 }
 
 set_env_value() {
-  local key="$1" value="$2"
-  if grep -q "^${key}=" "$ENV_FILE"; then
-    sed -i "s|^${key}=.*|${key}=${value}|" "$ENV_FILE"
-  else
-    printf '%s=%s\n' "$key" "$value" >> "$ENV_FILE"
-  fi
+  verify_runtime_set_env "$1" "$2"
 }
 
 DB_USER="$(env_value POSTGRES_USER)"
@@ -167,18 +136,6 @@ db_query() {
   [ -n "$container" ] || return 1
   docker exec -e "PGPASSWORD=$DB_PASS" "$container" psql -h localhost -U "$DB_USER" -d "$DB_NAME" -t -A -v ON_ERROR_STOP=1 -c "$sql"
 }
-
-# Host-side DATABASE_URL for CLI tools (uses localhost with mapped port)
-HOST_DATABASE_URL="postgresql+psycopg://${DB_USER}:${DB_PASS}@localhost:5432/${DB_NAME}"
-export DATABASE_URL="$HOST_DATABASE_URL"
-
-# Also set host-side object storage endpoint for CLI tools
-export S3_ENDPOINT_URL="http://localhost:9000"
-export OBJECT_STORAGE_ENABLED="true"
-export S3_ACCESS_KEY_ID="$MINIO_USER"
-export S3_SECRET_ACCESS_KEY="$MINIO_PASS"
-export S3_BUCKET="infinityscan-pages"
-export S3_FORCE_PATH_STYLE="true"
 
 storage_object_exists() {
   (cd "$REPO_ROOT/api" && "$API_PYTHON" - "$1" <<'PY'
@@ -248,99 +205,43 @@ if [ -x "$API_PYTHON" ]; then
   "$API_PYTHON" -m pip install -q -r api/requirements-dev.txt >/dev/null 2>&1 || true
 fi
 
-# ── Phase 1/2 foundational checks ──────────────────────────────────────────
-#
-# Phase 1/2 manage their own Docker stacks which conflict with Phase 3's
-# infrastructure lifecycle.  We run the foundational (non-Docker) checks
-# inline here and handle Docker checks independently.
-
 echo "======================================"
 echo "  InfinityScan Phase 3 Verification"
 echo "======================================"
 echo ""
 
-echo "--- Phase 1/2 foundational checks ---"
-
-for tool in python3 node npm curl git jq; do
-  if command -v "$tool" >/dev/null 2>&1; then
-    pass "TOOL: $tool available"
-  else
-    fail "TOOL: $tool is required"
+run_prerequisite() {
+  local phase="$1" status=0
+  local log="$TMPDIR/phase${phase}.log"
+  bash "$REPO_ROOT/scripts/verify-phase${phase}.sh" >"$log" 2>&1 || status=$?
+  if [ "$status" -eq 0 ] \
+      && grep -q '^Failed: 0$' "$log" \
+      && grep -q '^Skipped: 0$' "$log" \
+      && grep -q "Phase ${phase} gate: PASS" "$log"; then
+    pass "PREREQUISITE-P${phase}: exit 0, zero failures, zero mandatory skips"
+    return 0
   fi
-done
+  fail "PREREQUISITE-P${phase}: exit $status or non-passing summary: $(tail -n 8 "$log")"
+  return 1
+}
 
-REAL_ENV="$(git ls-files | awk '/\.env$/ && $0 !~ /\.env\.example$/')"
-if [ -z "$REAL_ENV" ]; then
-  pass "REQ-06: no real .env tracked in git"
-else
-  fail "REQ-06: real .env tracked: $REAL_ENV"
+if [ "$PHASE_ONLY" = false ]; then
+  for phase in 1 2; do
+    if ! run_prerequisite "$phase"; then
+      printf 'Passed: %d\nFailed: %d\nSkipped: %d\n' "$PASS_COUNT" "$FAIL_COUNT" "$SKIP_COUNT"
+      printf '%bPhase 3 gate: FAIL%b\n' "$RED" "$NC"
+      exit 1
+    fi
+  done
 fi
 
-MANGA_FILES="$(git ls-files | awk '$0 !~ /^web\/test-results\// && /\.(jpg|jpeg|png|webp|cbz|cbr)$/ { print; count++; if (count == 5) exit }')"
-MANGA_DIRS="$(git ls-files | awk '/^[0-9]+\// { print; count++; if (count == 5) exit }')"
-if [ -z "$MANGA_FILES" ] && [ -z "$MANGA_DIRS" ]; then
-  pass "REQ-07: no bundled manga content tracked"
+if verify_runtime_preflight; then
+  pass "TOOL: verifier disk and inode preflight"
 else
-  fail "REQ-07: manga content tracked: $MANGA_FILES $MANGA_DIRS"
-fi
-
-if [ -x "$API_PYTHON" ]; then
-  if IMPORT_OUT=$(cd api && "$API_PYTHON" -c 'from main import app; assert app.title == "InfinityScan API"' 2>&1); then
-    pass "REQ-01: API imports successfully"
-  else
-    status=$?
-    fail "REQ-01: API import failed (exit $status): $(short_error "$IMPORT_OUT")"
-  fi
-
-  if REGRESSION_OUT=$(cd api && "$API_PYTHON" - <<'PY' 2>&1
-from fastapi.routing import APIRoute
-from main import app
-assert any(route.path == "/health" for route in app.routes if isinstance(route, APIRoute))
-print("OK")
-PY
-  ); then
-    pass "REQ-17a: API import and /health route verified"
-  else
-    status=$?
-    fail "REQ-17a: foundational regression failed (exit $status): $(short_error "$REGRESSION_OUT")"
-  fi
-else
-  fail "REQ-01/17a: API Python is unavailable"
-fi
-
-if [ -x "$API_PYTHON" ]; then
-  run_pytest_no_skips "TOOL-P1a: backend pytest" env OBJECT_STORAGE_ENABLED=false "$API_PYTHON" -m pytest api/tests --ignore=api/tests/integration/test_storage_minio.py -x -q
-else
-  fail "TOOL-P1a: backend pytest cannot run without API Python"
-fi
-run_check "TOOL-P1b: frontend unit tests" npm --prefix web run test
-run_check "TOOL-P1c: frontend lint" npm --prefix web run lint
-run_check "TOOL-P1d: TypeScript check" sh -c 'cd web && npx tsc --noEmit'
-run_check "TOOL-P1e: production frontend build" npm --prefix web run build
-
-if [ -x "$API_PYTHON" ]; then
-  run_check "TOOL-P1f: pip-audit runtime dependencies" "$API_PYTHON" -m pip_audit -r api/requirements.txt
-  run_check "TOOL-P1g: pip-audit development dependencies" "$API_PYTHON" -m pip_audit -r api/requirements-dev.txt
-else
-  fail "TOOL-P1f/P1g: pip-audit cannot run without API Python"
-fi
-
-run_check "TOOL-P1h: shared npm audit policy" \
-  "$REPO_ROOT/scripts/lib/npm-audit.sh" \
-  "$REPO_ROOT/web" \
-  "$REPO_ROOT/scripts/lib/npm-audit-exceptions.json" \
-  "$TMPDIR/npm-audit.json"
-
-if grep -q 'CMD \["uvicorn' api/Dockerfile && ! grep -q 'alembic' api/Dockerfile && grep -q '^  migrate:' infra/docker-compose.yml; then
-  pass "REQ-13: migrations are separate from the API runtime"
-else
-  fail "REQ-13: migration separation is invalid"
-fi
-
-if git grep -n -E 'X-User-ID|x_user_id|get_user_id' -- ':!api/tests/**' ':!scripts/**' >/dev/null 2>&1; then
-  fail "SEC-A1: forbidden identity reference exists in runtime or documentation"
-else
-  pass "SEC-A1: no forbidden identity reference in runtime or documentation"
+  fail "TOOL: verifier disk and inode preflight"
+  printf 'Passed: %d\nFailed: %d\nSkipped: %d\n' "$PASS_COUNT" "$FAIL_COUNT" "$SKIP_COUNT"
+  printf '%bPhase 3 gate: FAIL%b\n' "$RED" "$NC"
+  exit 1
 fi
 
 # ── Docker daemon check ───────────────────────────────────────────────────
@@ -372,11 +273,14 @@ set_env_value "S3_CONNECT_TIMEOUT" "5"
 set_env_value "S3_READ_TIMEOUT" "30"
 set_env_value "COPYMANGA_ENABLED" "true"
 set_env_value "COPYMANGA_API" "https://127.0.0.1:5432"
+verify_runtime_refresh_compose
+COMPOSE=("${VERIFY_COMPOSE[@]}" -f "$COMPOSE_OVERRIDE" --profile storage)
+VERIFY_COMPOSE=("${COMPOSE[@]}")
 
 # ── Infrastructure startup ────────────────────────────────────────────────
 
-API_BASE="http://localhost:8000"
-WEB_BASE="http://localhost:3000"
+API_BASE="http://127.0.0.1:0"
+WEB_BASE="http://127.0.0.1:0"
 
 if DOWN_OUT=$(compose down -v --remove-orphans 2>&1); then
   :
@@ -391,6 +295,17 @@ else
   status=$?
   fail "INFRA-1: infrastructure startup failed (exit $status): $(short_error "$START_OUT")"
 fi
+
+DB_HOST_PORT="$(verify_runtime_port db 5432 || true)"
+MINIO_HOST_PORT="$(verify_runtime_port minio 9000 || true)"
+HOST_DATABASE_URL="postgresql+psycopg://${DB_USER}:${DB_PASS}@127.0.0.1:${DB_HOST_PORT}/${DB_NAME}"
+export DATABASE_URL="$HOST_DATABASE_URL"
+export S3_ENDPOINT_URL="http://127.0.0.1:${MINIO_HOST_PORT}"
+export OBJECT_STORAGE_ENABLED=true
+export S3_ACCESS_KEY_ID="$MINIO_USER"
+export S3_SECRET_ACCESS_KEY="$MINIO_PASS"
+export S3_BUCKET=infinityscan-pages
+export S3_FORCE_PATH_STYLE=true
 
 DB_READY=false
 for _ in $(seq 1 45); do
@@ -408,7 +323,7 @@ fi
 
 MINIO_READY=false
 for _ in $(seq 1 30); do
-  if curl -sf http://localhost:9000/minio/health/live >/dev/null 2>&1; then
+  if curl -sf "http://127.0.0.1:${MINIO_HOST_PORT}/minio/health/live" >/dev/null 2>&1; then
     MINIO_READY=true
     break
   fi
@@ -493,6 +408,11 @@ else
   fail "INFRA-5: API/web startup failed (exit $status): $(short_error "$STACK_UP")"
 fi
 
+API_HOST_PORT="$(verify_runtime_port api 8000 || true)"
+WEB_HOST_PORT="$(verify_runtime_port web 3000 || true)"
+API_BASE="http://127.0.0.1:${API_HOST_PORT}"
+WEB_BASE="http://127.0.0.1:${WEB_HOST_PORT}"
+
 API_CODE=000
 WEB_CODE=000
 for _ in $(seq 1 60); do
@@ -520,7 +440,8 @@ FIXTURE_ROOT="$TMPDIR/manga"
 SERIES_SLUG="test-series-$(date +%s%N)"
 
 # Generate valid JPEG images via Python/PIL
-"$API_PYTHON" - "$FIXTURE_ROOT" "$SERIES_SLUG" <<'PYEOF' 2>&1
+FIXTURE_STATUS=0
+"$API_PYTHON" - "$FIXTURE_ROOT" "$SERIES_SLUG" <<'PYEOF' 2>&1 || FIXTURE_STATUS=$?
 import sys
 from pathlib import Path
 
@@ -593,7 +514,7 @@ total_pages = sum(p for _, _, chapters in series_configs for _, p in chapters)
 print(f"OK: {total_series} series, {total_chapters} chapters, {total_pages} pages at {root}")
 PYEOF
 
-if [ $? -eq 0 ]; then
+if [ "$FIXTURE_STATUS" -eq 0 ]; then
   pass "CHECK-6: fixture manga created"
 else
   fail "CHECK-6: fixture manga creation failed"
@@ -834,7 +755,6 @@ PYEOF2
     REIMPORT2_UPLOADED=$(printf '%s' "$REIMPORT2_OUT" | grep -oP 'uploaded=\K\d+' || echo "0")
     if [ "$REIMPORT2_UPLOADED" -ge 1 ]; then
       NEW_KEY="$(db_query "SELECT object_key FROM pages WHERE sha256 = '$NEW_SHA256' LIMIT 1;" 2>/dev/null || true)"
-      OLD_KEY_EXISTS="$(db_query "SELECT count(*) FROM import_job_items WHERE sha256 = '$OLD_SHA256';" 2>/dev/null || echo "0")"
       if [ -n "$NEW_KEY" ] && printf '%s' "$NEW_KEY" | grep -q "$NEW_SHA256"; then
         pass "CHECK-25: changed page uploaded with new object key (new sha in key)"
       else
@@ -855,7 +775,7 @@ fi
 REMOVED_PAGE_PATH="$(find "$FIXTURE_ROOT" -name '*.jpg' | sort | tail -n 1)"
 if [ -n "$REMOVED_PAGE_PATH" ]; then
   rm -f "$REMOVED_PAGE_PATH"
-  REIMPORT3_OUT=$(cd "$REPO_ROOT/api" && "$API_PYTHON" -m importing.cli import "$FIXTURE_ROOT" 2>&1 || true)
+  (cd "$REPO_ROOT/api" && "$API_PYTHON" -m importing.cli import "$FIXTURE_ROOT" >/dev/null 2>&1) || true
   REMAINING_PAGES_IN_DB="$(db_query "SELECT count(*) FROM pages WHERE chapter_id IN (SELECT c.id FROM chapters c JOIN series s ON c.series_id = s.id WHERE s.slug LIKE '$SERIES_SLUG%');" 2>/dev/null || echo "0")"
   # Import should not delete pages or objects from DB
   if [ "$REMAINING_PAGES_IN_DB" -ge 9 ]; then
@@ -896,7 +816,7 @@ except:
   if [ "$HAS_MISMATCH" = "yes" ]; then
     pass "CHECK-28: integrity check detected page_count mismatch"
     # Repair it
-    REPAIR_OUT=$(cd "$REPO_ROOT/api" && "$API_PYTHON" -m tools.integrity repair-safe --json 2>&1 || true)
+    (cd "$REPO_ROOT/api" && "$API_PYTHON" -m tools.integrity repair-safe --json >/dev/null 2>&1) || true
     REPAIRED_COUNT="$(db_query "SELECT page_count FROM chapters WHERE id = '$SAMPLE_CHAPTER_ID';" 2>/dev/null || echo "unknown")"
     if [ "$REPAIRED_COUNT" != "999" ]; then
       pass "CHECK-28a: repair-safe recalculated page_count ($REPAIRED_COUNT)"
@@ -915,7 +835,7 @@ fi
 SAMPLE_OBJ_KEY="$(db_query "SELECT object_key FROM pages WHERE integrity_status = 'verified' AND chapter_id IN (SELECT c.id FROM chapters c JOIN series s ON c.series_id = s.id WHERE s.slug LIKE '$SERIES_SLUG%') LIMIT 1;" 2>/dev/null || true)"
 if [ -n "$SAMPLE_OBJ_KEY" ]; then
   if storage_delete_object "$SAMPLE_OBJ_KEY" >/dev/null 2>&1; then
-    REPAIR2_OUT=$(cd "$REPO_ROOT/api" && "$API_PYTHON" -m tools.integrity repair-safe --json 2>&1 || true)
+    (cd "$REPO_ROOT/api" && "$API_PYTHON" -m tools.integrity repair-safe --json >/dev/null 2>&1) || true
     PAGE_STATUS="$(db_query "SELECT integrity_status::text FROM pages WHERE object_key = '$SAMPLE_OBJ_KEY';" 2>/dev/null || true)"
     if [ "$PAGE_STATUS" = "missing" ]; then
       pass "CHECK-29: integrity repair marked deleted object as 'missing'"
@@ -1099,6 +1019,7 @@ fi
 if [ -x web/node_modules/.bin/playwright ]; then
   if PLAYWRIGHT_OUT=$(PLAYWRIGHT_EXTERNAL_SERVER=1 PHASE3_MINIO_HOST_MAP=1 \
       API_URL="$API_BASE" WEB_URL="$WEB_BASE" \
+      PHASE3_MINIO_PORT="$MINIO_HOST_PORT" \
       PHASE3_SERIES_SLUG="$SERIES_SLUG" \
       PHASE3_READY_CHAPTER_ID="$PHASE3_READY_CHAPTER_ID" \
       PHASE3_IMPORTING_CHAPTER_ID="$PHASE3_IMPORTING_CHAPTER_ID" \
@@ -1283,6 +1204,8 @@ if [ "$ANIM_CHECK" = "ok" ]; then
 else
   fail "CHECK-48: mandatory animated image rejection check failed"
 fi
+
+run_check "CHECK-ENV: repository infra/.env remained unchanged" verify_runtime_assert_repo_env_unchanged
 
 # ── Summary ───────────────────────────────────────────────────────────────
 

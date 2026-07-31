@@ -1,9 +1,9 @@
 services:
   db:
-    image: postgres:16-alpine
+    image: postgres:16.14-alpine3.23@sha256:42b8b8b29c8a4e933d88943e5b03001a78794905cf786e6e7634e9f2abd5a0d3
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-infinityscan}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
       POSTGRES_DB: ${POSTGRES_DB:-infinityscan}
     volumes:
       - postgres_data:/var/lib/postgresql/data
@@ -19,8 +19,8 @@ services:
   migrate:
     build:
       context: ../api
-    env_file:
-      - .env
+    environment:
+      DATABASE_URL: ${DATABASE_URL:?DATABASE_URL is required}
     depends_on:
       db:
         condition: service_healthy
@@ -32,9 +32,13 @@ services:
     build:
       context: ../api
     ports:
-      - "${API_PORT:-8000}:8000"
+      - "127.0.0.1:${API_PORT:-8000}:8000"
     env_file:
-      - .env
+      - ${INFINITYSCAN_ENV_FILE:-.env}
+    environment:
+      DATABASE_URL: ${DATABASE_URL:?DATABASE_URL is required}
+      JWT_SECRET_KEY: ${JWT_SECRET_KEY:?JWT_SECRET_KEY is required}
+      CSRF_SECRET_KEY: ${CSRF_SECRET_KEY:?CSRF_SECRET_KEY is required}
     depends_on:
       db:
         condition: service_healthy
@@ -53,11 +57,11 @@ services:
     build:
       context: ../web
       args:
-        NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:8000}
+        API_INTERNAL_URL: http://api:8000
     ports:
-      - "3000:3000"
-    env_file:
-      - .env
+      - "127.0.0.1:${WEB_PORT:-3000}:3000"
+    environment:
+      API_INTERNAL_URL: http://api:8000
     depends_on:
       api:
         condition: service_healthy
@@ -71,15 +75,15 @@ services:
     init: true
 
   minio:
-    image: minio/minio:RELEASE.2024-06-13T22-53-53Z
+    image: minio/minio:RELEASE.2025-09-07T16-13-09Z@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e
     profiles: ["storage"]
     command: server /data --console-address ":9001"
     environment:
       MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
-      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadminsecret}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-}
     ports:
-      - "${MINIO_API_PORT:-9000}:9000"
-      - "${MINIO_CONSOLE_PORT:-9001}:9001"
+      - "127.0.0.1:${MINIO_API_PORT:-9000}:9000"
+      - "127.0.0.1:${MINIO_CONSOLE_PORT:-9001}:9001"
     volumes:
       - minio_data:/data
     healthcheck:
@@ -92,14 +96,14 @@ services:
     init: true
 
   minio-setup:
-    image: minio/mc:latest
+    image: minio/mc:RELEASE.2025-08-13T08-35-41Z@sha256:a7fe349ef4bd8521fb8497f55c6042871b2ae640607cf99d9bede5e9bdf11727
     profiles: ["storage"]
     depends_on:
       minio:
         condition: service_healthy
     environment:
       MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
-      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadminsecret}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-}
       MINIO_BUCKET: ${S3_BUCKET:-infinityscan-pages}
     entrypoint: ["/bin/sh", "-c"]
     command:

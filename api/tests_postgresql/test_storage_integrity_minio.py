@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import re
 import sys
 import threading
 import time
@@ -33,6 +34,7 @@ from storage import (  # noqa: E402
     ObjectMetadata,
     ObjectPage,
     ObjectVerification,
+    DownloadResult,
     S3CompatibleStorage,
     S3StorageConfig,
     StorageError,
@@ -109,6 +111,23 @@ class TrackingStorage:
     def upload_bytes(self, key, data, mime_type):
         return self.delegate.upload_bytes(key, data, mime_type)
 
+    def download_file(
+        self,
+        key,
+        destination,
+        *,
+        expected_sha256=None,
+        expected_size=None,
+        max_bytes=1024 * 1024 * 1024,
+    ) -> DownloadResult:
+        return self.delegate.download_file(
+            key,
+            destination,
+            expected_sha256=expected_sha256,
+            expected_size=expected_size,
+            max_bytes=max_bytes,
+        )
+
     def generate_presigned_get(self, key, expires_in=None):
         return self.delegate.generate_presigned_get(key, expires_in)
 
@@ -118,9 +137,16 @@ class TrackingStorage:
 
 @pytest.fixture()
 def engine():
+    if os.environ.get("INFINITYSCAN_DISPOSABLE_TEST") != "1":
+        pytest.fail("INFINITYSCAN_DISPOSABLE_TEST=1 is required for destructive storage tests")
     result = create_engine(DATABASE_URL, pool_pre_ping=True)
     if result.dialect.name != "postgresql":
         pytest.fail("storage integrity integration requires PostgreSQL")
+    if result.url.host not in {"127.0.0.1", "localhost"}:
+        pytest.fail("storage integrity integration requires loopback PostgreSQL")
+    database_name = result.url.database or ""
+    if not re.search(r"(?:^|[_-])(test|integration|tmp)(?:$|[_-])", database_name, re.I):
+        pytest.fail("refusing destructive storage test against a non-disposable database")
     with result.connect().execution_options(isolation_level="AUTOCOMMIT") as connection:
         connection.execute(text("DROP SCHEMA IF EXISTS public CASCADE"))
         connection.execute(text("CREATE SCHEMA public"))

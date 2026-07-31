@@ -1,6 +1,7 @@
 import { expect, test, type Response } from "@playwright/test";
 
-const API_URL = process.env.API_URL ?? "http://localhost:8000";
+const WEB_URL = process.env.WEB_URL ?? "http://localhost:3000";
+const API_URL = `${WEB_URL.replace(/\/$/, "")}/api`;
 
 function required(name: string): string {
   const value = process.env[name];
@@ -24,7 +25,7 @@ test("Phase 3 imported content is visible and private media resolves", async ({ 
     sessionStorage.clear();
   });
   page.on("request", (entry) => {
-    if (new URL(entry.url()).pathname.startsWith("/media/pages/")) mediaRequests.push(entry.url());
+    if (new URL(entry.url()).pathname.startsWith("/api/media/pages/")) mediaRequests.push(entry.url());
   });
   page.on("response", (response) => responses.push(response));
 
@@ -60,9 +61,9 @@ test("Phase 3 imported content is visible and private media resolves", async ({ 
   await expect(page.locator(".reader")).toBeVisible();
   await expect(page.locator('.reader-page-frame[data-image-state="loaded"]').first()).toBeVisible();
 
-  expect(mediaRequests.some((url) => new URL(url).pathname.startsWith("/media/pages/"))).toBe(true);
+  expect(mediaRequests.some((url) => new URL(url).pathname.startsWith("/api/media/pages/"))).toBe(true);
   const redirect = responses.find((response) =>
-    response.status() === 307 && new URL(response.url()).pathname.startsWith("/media/pages/"),
+    response.status() === 307 && new URL(response.url()).pathname.startsWith("/api/media/pages/"),
   );
   expect(redirect, "InfinityScan media endpoint must return a redirect").toBeDefined();
   const finalImage = responses.find((response) => {

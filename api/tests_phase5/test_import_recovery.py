@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import hashlib
+import importlib.util
+import json
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -26,8 +28,17 @@ from models import (
     Page,
 )
 from settings import Settings
-from storage.base import ObjectMetadata, ObjectVerification, UploadResult
+from storage.base import DownloadResult, ObjectMetadata, ObjectVerification, UploadResult
 from tools.import_recovery import recover_safe, scan_imports
+
+
+DR_FIXTURE_PATH = Path(__file__).resolve().parents[2] / "scripts" / "dr_fixture.py"
+DR_FIXTURE_SPEC = importlib.util.spec_from_file_location(
+    "dr_fixture_for_tests", DR_FIXTURE_PATH
+)
+assert DR_FIXTURE_SPEC is not None and DR_FIXTURE_SPEC.loader is not None
+dr_fixture = importlib.util.module_from_spec(DR_FIXTURE_SPEC)
+DR_FIXTURE_SPEC.loader.exec_module(dr_fixture)
 
 
 class SimulatedCrash(BaseException):
@@ -66,6 +77,26 @@ class MemoryStorage:
     def upload_bytes(self, key: str, data: bytes, mime_type: str) -> UploadResult:
         self.objects[key] = (data, mime_type)
         return UploadResult(
+            key=key,
+            byte_size=len(data),
+            mime_type=mime_type,
+            sha256=hashlib.sha256(data).hexdigest(),
+            etag=hashlib.md5(data, usedforsecurity=False).hexdigest(),
+        )
+
+    def download_file(
+        self,
+        key: str,
+        destination: str | Path,
+        *,
+        expected_sha256: str | None = None,
+        expected_size: int | None = None,
+        max_bytes: int = 1024 * 1024 * 1024,
+    ) -> DownloadResult:
+        data, mime_type = self.objects[key]
+        assert len(data) <= max_bytes
+        Path(destination).write_bytes(data)
+        return DownloadResult(
             key=key,
             byte_size=len(data),
             mime_type=mime_type,
@@ -159,6 +190,26 @@ def manifest(tmp_path: Path):
         image = Image.new("RGB", (8, 8), color=(number * 40, 80, 120))
         image.save(chapter / f"{number:03d}.jpg", format="JPEG")
     return LocalAdapter(tmp_path).scan()
+
+
+def test_dr_fixture_creates_distinct_two_page_recovery_input(tmp_path: Path):
+    root = tmp_path / "input"
+    output = tmp_path / "input.json"
+
+    dr_fixture.create_import_input(root, output)
+
+    payload = json.loads(output.read_text(encoding="utf-8"))
+    scanned = LocalAdapter(root).scan()
+    pages = scanned[0].chapters[0].pages
+    assert payload["page_count"] == 2
+    assert [page.sha256 for page in pages] == [
+        item["sha256"] for item in payload["pages"]
+    ]
+    assert pages[0].sha256 != pages[1].sha256
+    assert not list(tmp_path.glob(".*.tmp-*"))
+
+    with pytest.raises(RuntimeError, match="must be empty"):
+        dr_fixture.create_import_input(root, output)
 
 
 def _crash_at(name: str):

@@ -11,6 +11,7 @@ from alembic import command
 from alembic.config import Config
 from alembic.script import ScriptDirectory
 from sqlalchemy import create_engine, text
+from sqlalchemy.engine import make_url
 
 API_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(API_DIR))
@@ -24,12 +25,24 @@ from tools.schema_snapshot import compare_schema, snapshot_engine, snapshot_meta
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
 if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL must point to a disposable PostgreSQL database")
+if os.environ.get("INFINITYSCAN_DISPOSABLE_MIGRATION_TEST") != "1":
+    raise RuntimeError("INFINITYSCAN_DISPOSABLE_MIGRATION_TEST=1 is required for destructive migration tests")
+
+
+def _assert_disposable_url(value: str, prefix: str) -> None:
+    parsed = make_url(value)
+    if parsed.get_backend_name() != "postgresql" or parsed.host not in {"127.0.0.1", "localhost"}:
+        raise RuntimeError("migration tests require loopback PostgreSQL targets")
+    if not parsed.database or not parsed.database.startswith(prefix):
+        raise RuntimeError("migration tests require gate-owned disposable database names")
+
+
+_assert_disposable_url(DATABASE_URL, "phase5_migrations_")
 
 
 def _config() -> Config:
     config = Config(str(API_DIR / "alembic.ini"))
     config.set_main_option("script_location", str(API_DIR / "alembic"))
-    config.set_main_option("sqlalchemy.url", DATABASE_URL)
     config.attributes["database_url"] = DATABASE_URL
     return config
 
@@ -103,18 +116,22 @@ def test_live_schema_matches_canonical_orm_snapshot(engine):
     assert report.ok, report.to_dict()
 
 
-def test_two_fresh_database_snapshots_are_equal_when_configured(engine):
+def test_two_fresh_database_snapshots_are_equal(engine):
     second_url = os.environ.get("TASK6_SECOND_DATABASE_URL")
     if not second_url:
-        pytest.skip("set TASK6_SECOND_DATABASE_URL for the two-database reproducibility gate")
+        raise RuntimeError("TASK6_SECOND_DATABASE_URL is required for the two-database reproducibility gate")
+    assert second_url != DATABASE_URL
+    _assert_disposable_url(second_url, "phase5_scratch_")
     second = create_engine(second_url, pool_pre_ping=True)
     try:
         _reset(second)
         command.upgrade(_config(), "head")
         second_config = Config(str(API_DIR / "alembic.ini"))
         second_config.set_main_option("script_location", str(API_DIR / "alembic"))
-        second_config.set_main_option("sqlalchemy.url", second_url)
-        second_config.attributes["database_url"] = second_url
+        # The encoded query value exercises ConfigParser-safe programmatic URLs,
+        # while DATABASE_URL still points at the first database.
+        separator = "&" if "?" in second_url else "?"
+        second_config.attributes["database_url"] = f"{second_url}{separator}application_name=task6%25second"
         command.upgrade(second_config, "head")
         assert compare_schema(snapshot_engine(engine), snapshot_engine(second))["equal"] is True
     finally:

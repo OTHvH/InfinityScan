@@ -4,7 +4,7 @@ import { useEffect, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import Link from "next/link";
 import { useAuthStore } from "@/stores/auth";
-import { api } from "@/lib/api";
+import { api, resolveOptionalMediaUrl } from "@/lib/api";
 import type { Series } from "@/lib/types";
 
 // ─── Constants ───────────────────────────────────────────────────────────────
@@ -21,8 +21,6 @@ const CONTENT_EMOJI: Record<string, string> = {
   manhua: "\u{1F1E8}\u{1F1F3}",
   manhwa: "\u{1F1F0}\u{1F1F7}",
 };
-
-const API_BASE = process.env.NEXT_PUBLIC_API_URL ?? "";
 
 // ─── Sub-components ──────────────────────────────────────────────────────────
 
@@ -139,11 +137,7 @@ function SearchBar({
 }
 
 function SeriesCard({ series }: { series: Series }) {
-  const coverUrl =
-    series.cover_url ??
-    (series.cover_object_key
-      ? `${API_BASE}/covers/${series.cover_object_key.split("/").map(encodeURIComponent).join("/")}`
-      : null);
+  const coverUrl = resolveOptionalMediaUrl(series.cover_url);
 
   return (
     <div className="card">

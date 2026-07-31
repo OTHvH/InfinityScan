@@ -8,6 +8,7 @@ import base64
 import hashlib
 import json
 import os
+import time
 import uuid
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
@@ -16,11 +17,14 @@ from pathlib import Path
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
+from audit_events import record_event
 from auth import hash_password, verify_password
 from database import _get_engine
+from importing.adapters.local import LocalAdapter
+from importing.service import ImportService, SeriesImportLock
 from models import (
-    AuditEventOutcome,
     AuditEvent,
+    AuditEventOutcome,
     Bookmark,
     Chapter,
     ChapterImportStatus,
@@ -42,12 +46,15 @@ from models import (
     UserRole,
 )
 from storage import create_object_storage, page_object_key
-from audit_events import record_event
 
 
 USER_PASSWORD = os.environ.get("DR_USER_PASSWORD", "Drill-only-password-42")
 PNG_BYTES = base64.b64decode(
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
+)
+IMPORT_PAGE_BYTES = (
+    PNG_BYTES + b"infinityscan-dr-import-page-1",
+    PNG_BYTES + b"infinityscan-dr-import-page-2",
 )
 
 
@@ -60,6 +67,16 @@ def _engine():
 
 def _count(db: Session, model) -> int:
     return int(db.scalar(select(func.count()).select_from(model)) or 0)
+
+
+def _write_json_atomic(path: Path, value: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.tmp-{os.getpid()}")
+    try:
+        temporary.write_text(json.dumps(value, indent=2) + "\n", encoding="utf-8")
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def seed(output: Path) -> None:
@@ -112,9 +129,10 @@ def seed(output: Path) -> None:
         verified_at=now,
         published_at=now,
     )
-    page_digest = hashlib.sha256(PNG_BYTES).hexdigest()
+    seeded_png = PNG_BYTES + uuid.uuid4().bytes
+    page_digest = hashlib.sha256(seeded_png).hexdigest()
     page_key = page_object_key(series.id, chapter.id, 1, page_digest, "png")
-    upload = storage.upload_bytes(page_key, PNG_BYTES, "image/png")
+    upload = storage.upload_bytes(page_key, seeded_png, "image/png")
     page = Page(
         id=uuid.uuid4(),
         chapter=chapter,
@@ -219,27 +237,24 @@ def seed(output: Path) -> None:
         counts = {name: _count(db, model) for name, model in count_models.items()}
     finally:
         db.close()
-    output.write_text(
-        json.dumps(
-            {
-                "user_id": str(user.id),
-                "admin_id": str(admin.id),
-                "series_id": str(series.id),
-                "chapter_id": str(chapter.id),
-                "page_id": str(page.id),
-                "job_id": str(job.id),
-                "refresh_session_id": str(refresh_session.id),
-                "import_job_item_id": str(job_item.id),
-                "object_key": page_key,
-                "object_sha256": upload.sha256,
-                "object_size": upload.byte_size,
-                "orphan_key": "series/drill-orphan/object.png",
-                "counts": counts,
-            },
-            indent=2,
-        )
-        + "\n",
-        encoding="utf-8",
+    _write_json_atomic(
+        output,
+        {
+            "user_id": str(user.id),
+            "admin_id": str(admin.id),
+            "series_id": str(series.id),
+            "chapter_id": str(chapter.id),
+            "page_id": str(page.id),
+            "job_id": str(job.id),
+            "refresh_session_id": str(refresh_session.id),
+            "import_job_item_id": str(job_item.id),
+            "object_key": page_key,
+            "object_sha256": upload.sha256,
+            "object_size": upload.byte_size,
+            "embedded_fixture_sha256": hashlib.sha256(PNG_BYTES).hexdigest(),
+            "orphan_key": "series/drill-orphan/object.png",
+            "counts": counts,
+        },
     )
 
 
@@ -302,37 +317,37 @@ def validate(baseline_path: Path) -> None:
     print(json.dumps({"counts": actual_counts, "password_hash": "verified", "relationships": "verified"}))
 
 
-def inventory(output: Path) -> None:
+def inventory(output: Path, *, prefix: str = "series/") -> None:
     storage = create_object_storage()
     if storage is None or not storage.health_check():
         raise RuntimeError("object storage is unavailable")
     objects = []
     token = None
     while True:
-        page = storage.list_objects_page(prefix="series/", continuation_token=token, max_keys=1000)
-        objects.extend(
-            {
-                "key": item.key,
-                "byte_size": item.byte_size,
-                "mime_type": item.mime_type,
-                "sha256": item.sha256,
-                "etag": item.etag,
-            }
-            for item in page.objects
-        )
+        page = storage.list_objects_page(prefix=prefix, continuation_token=token, max_keys=1000)
+        for item in page.objects:
+            metadata = storage.head_object(item.key)
+            if metadata is None:
+                raise RuntimeError(f"listed object disappeared during inventory: {item.key}")
+            objects.append(
+                {
+                    "key": metadata.key,
+                    "byte_size": metadata.byte_size,
+                    "mime_type": metadata.mime_type,
+                    "sha256": metadata.sha256,
+                    "etag": metadata.etag,
+                }
+            )
         if not page.next_token:
             break
         token = page.next_token
-    output.write_text(
-        json.dumps({"object_count": len(objects), "objects": objects}, indent=2) + "\n",
-        encoding="utf-8",
-    )
+    objects.sort(key=lambda item: item["key"])
+    _write_json_atomic(output, {"object_count": len(objects), "objects": objects})
 
 
 def mutate_object(
     baseline_path: Path,
     *,
-    restore: bool,
     orphan: bool,
     cleanup_orphan: bool,
 ) -> None:
@@ -346,12 +361,157 @@ def mutate_object(
             storage.upload_bytes(orphan_key, PNG_BYTES, "image/png")
         elif not storage.delete_object(orphan_key):
             raise RuntimeError("synthetic orphan object could not be deleted")
-    elif restore:
-        upload = storage.upload_bytes(baseline["object_key"], PNG_BYTES, "image/png")
-        if upload.sha256 != baseline["object_sha256"]:
-            raise RuntimeError("restored object checksum differs")
-    elif not storage.delete_object(baseline["object_key"]):
-        raise RuntimeError("synthetic object could not be deleted")
+    else:
+        raise RuntimeError("an isolated object mutation must be selected")
+
+
+def create_import_input(root: Path, output: Path) -> None:
+    if root.exists() and any(root.iterdir()):
+        raise RuntimeError("import input directory must be empty")
+    chapter = root / "SIGKILL Recovery Series" / "Chapter 1"
+    chapter.mkdir(parents=True, exist_ok=True)
+    pages = []
+    for page_number, data in enumerate(IMPORT_PAGE_BYTES, start=1):
+        path = chapter / f"{page_number:03d}.png"
+        path.write_bytes(data)
+        pages.append(
+            {
+                "page_number": page_number,
+                "sha256": hashlib.sha256(data).hexdigest(),
+                "byte_size": len(data),
+            }
+        )
+    _write_json_atomic(output, {"page_count": 2, "pages": pages})
+
+
+def crash_import(root: Path, marker: Path) -> None:
+    if marker.exists():
+        raise RuntimeError("checkpoint marker already exists")
+    manifest = LocalAdapter(root).scan()
+    if (
+        len(manifest) != 1
+        or len(manifest[0].chapters) != 1
+        or len(manifest[0].chapters[0].pages) != 2
+    ):
+        raise RuntimeError("SIGKILL fixture must contain exactly two pages")
+
+    def checkpoint_hook(checkpoint: str, job_id: uuid.UUID | None) -> None:
+        if checkpoint != "after_first_upload":
+            return
+        if job_id is None:
+            raise RuntimeError("durable import job ID is unavailable")
+        _write_json_atomic(
+            marker,
+            {
+                "job_id": str(job_id),
+                "pid": os.getpid(),
+                "checkpoint": checkpoint,
+            },
+        )
+        while True:
+            time.sleep(3600)
+
+    db = Session(_engine())
+    try:
+        service = ImportService.from_settings(db, checkpoint_hook=checkpoint_hook)
+        service.run(
+            manifest,
+            source_key="dr-sigkill-local",
+            source_display_name="DR SIGKILL Local Fixture",
+        )
+    finally:
+        db.close()
+    raise RuntimeError("import passed the SIGKILL checkpoint without blocking")
+
+
+def recovery_state(job_id: uuid.UUID, output: Path) -> None:
+    storage = create_object_storage()
+    if storage is None or not storage.health_check():
+        raise RuntimeError("object storage is unavailable")
+    db = Session(_engine())
+    lock_available = False
+    try:
+        job = db.get(ImportJob, job_id)
+        if job is None:
+            raise RuntimeError("import job is unavailable")
+        lock = SeriesImportLock(db, f"job:{job_id}")
+        lock_available = lock.acquire(blocking=False)
+        if lock_available:
+            lock.release()
+
+        items = (
+            db.query(ImportJobItem)
+            .filter(ImportJobItem.job_id == job_id)
+            .order_by(ImportJobItem.page_number, ImportJobItem.id)
+            .all()
+        )
+        chapter_ids = {item.chapter_id for item in items if item.chapter_id is not None}
+        chapters = (
+            db.query(Chapter).filter(Chapter.id.in_(chapter_ids)).all()
+            if chapter_ids
+            else []
+        )
+        published_page_count = (
+            db.query(Page).filter(Page.chapter_id.in_(chapter_ids)).count()
+            if chapter_ids
+            else 0
+        )
+        item_states = []
+        for item in items:
+            verification = storage.verify_object(
+                item.object_key,
+                expected_sha256=item.sha256,
+                expected_size=item.byte_size,
+            )
+            metadata = storage.head_object(item.object_key)
+            item_states.append(
+                {
+                    "id": str(item.id),
+                    "page_number": item.page_number,
+                    "status": item.status.value,
+                    "attempt_count": item.attempt_count,
+                    "object_key": item.object_key,
+                    "sha256": item.sha256,
+                    "byte_size": item.byte_size,
+                    "object": {
+                        "exists": verification.exists,
+                        "verified": verification.verified,
+                        "etag": metadata.etag if metadata is not None else None,
+                    },
+                }
+            )
+        now = datetime.now(timezone.utc)
+        lease_expires_at = job.lease_expires_at
+        if lease_expires_at is not None and lease_expires_at.tzinfo is None:
+            lease_expires_at = lease_expires_at.replace(tzinfo=timezone.utc)
+        state = {
+            "job": {
+                "id": str(job.id),
+                "status": job.status.value,
+                "checkpoint": job.checkpoint,
+                "lease_owner_present": job.lease_owner_id is not None,
+                "lease_active": lease_expires_at is not None and lease_expires_at > now,
+                "fencing_token": job.fencing_token,
+                "recovery_attempt_count": job.recovery_attempt_count,
+                "uploaded_count": job.uploaded_count,
+                "skipped_count": job.skipped_count,
+                "failed_count": job.failed_count,
+            },
+            "job_lock_available": lock_available,
+            "items": item_states,
+            "chapters": [
+                {
+                    "id": str(chapter.id),
+                    "status": chapter.import_status.value,
+                    "page_count": chapter.page_count,
+                }
+                for chapter in chapters
+            ],
+            "published_page_count": published_page_count,
+        }
+    finally:
+        db.close()
+    _write_json_atomic(output, state)
 
 
 def main() -> int:
@@ -363,25 +523,40 @@ def main() -> int:
     validate_parser.add_argument("--baseline", type=Path, required=True)
     object_parser = sub.add_parser("object")
     object_parser.add_argument("--baseline", type=Path, required=True)
-    object_parser.add_argument("--restore", action="store_true")
-    object_parser.add_argument("--orphan", action="store_true")
-    object_parser.add_argument("--cleanup-orphan", action="store_true")
+    object_action = object_parser.add_mutually_exclusive_group(required=True)
+    object_action.add_argument("--orphan", action="store_true")
+    object_action.add_argument("--cleanup-orphan", action="store_true")
     inventory_parser = sub.add_parser("inventory")
     inventory_parser.add_argument("--output", type=Path, required=True)
+    inventory_parser.add_argument("--prefix", default="series/")
+    import_input_parser = sub.add_parser("create-import-input")
+    import_input_parser.add_argument("--root", type=Path, required=True)
+    import_input_parser.add_argument("--output", type=Path, required=True)
+    crash_parser = sub.add_parser("crash-import")
+    crash_parser.add_argument("--root", type=Path, required=True)
+    crash_parser.add_argument("--marker", type=Path, required=True)
+    state_parser = sub.add_parser("recovery-state")
+    state_parser.add_argument("--job", type=uuid.UUID, required=True)
+    state_parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     if args.command == "seed":
         seed(args.output)
     elif args.command == "validate":
         validate(args.baseline)
     elif args.command == "inventory":
-        inventory(args.output)
-    else:
+        inventory(args.output, prefix=args.prefix)
+    elif args.command == "object":
         mutate_object(
             args.baseline,
-            restore=args.restore,
             orphan=args.orphan,
             cleanup_orphan=args.cleanup_orphan,
         )
+    elif args.command == "create-import-input":
+        create_import_input(args.root, args.output)
+    elif args.command == "crash-import":
+        crash_import(args.root, args.marker)
+    else:
+        recovery_state(args.job, args.output)
     return 0
 
 

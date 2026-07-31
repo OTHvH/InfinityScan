@@ -1,0 +1,10 @@
+version: 2
+updates:
+  - package-ecosystem: pip
+    directory: /api
+  - package-ecosystem: npm
+    directory: /web
+  - package-ecosystem: github-actions
+    directory: /
+  - package-ecosystem: docker
+    directories: [/api, /web, /infra]

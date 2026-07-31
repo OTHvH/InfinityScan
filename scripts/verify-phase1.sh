@@ -12,22 +12,21 @@ NC='\033[0m'
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$REPO_ROOT"
+. "$REPO_ROOT/scripts/lib/verify-runtime.sh"
+verify_runtime_init phase1
 
 PASS_COUNT=0
 FAIL_COUNT=0
 SKIP_COUNT=0
 RESULTS=()
-TMPDIR="$(mktemp -d /tmp/infinityscan-phase1-XXXXXX)"
-ENV_FILE="$REPO_ROOT/infra/.env"
-ENV_WAS_PRESENT=false
+TMPDIR="$VERIFY_TMPDIR"
 
+# shellcheck disable=SC2329 # Invoked by the EXIT trap.
 cleanup() {
   local status=$?
-  if [ "$ENV_WAS_PRESENT" = false ]; then
-    rm -f "$ENV_FILE"
-  fi
-  rm -rf "$TMPDIR"
-  exit "$status"
+  trap - EXIT
+  verify_runtime_cleanup "$status"
+  exit $?
 }
 trap cleanup EXIT
 
@@ -65,30 +64,19 @@ for arg in "$@"; do
   case "$arg" in
     --skip-docker) SKIP_DOCKER=true ;;
     --cleanup) CLEANUP_ONLY=true ;;
+    --phase-only) : ;;
     *) fail "Unknown argument: $arg" ;;
   esac
 done
 
-if [ -f "$ENV_FILE" ]; then
-  ENV_WAS_PRESENT=true
-fi
 if [ "$CLEANUP_ONLY" = true ]; then
-  if [ -f "$ENV_FILE" ]; then
-    docker compose --env-file "$ENV_FILE" -f infra/docker-compose.yml down -v --remove-orphans
-  else
-    docker compose -f infra/docker-compose.yml down -v --remove-orphans
-  fi
+  "${VERIFY_COMPOSE[@]}" --profile storage down -v --remove-orphans
   exit 0
 fi
 
-if [ ! -f "$ENV_FILE" ]; then
-  cp "$REPO_ROOT/infra/.env.example" "$ENV_FILE"
-fi
-
-COMPOSE=(docker compose --env-file "$ENV_FILE" -f "$REPO_ROOT/infra/docker-compose.yml")
+COMPOSE=("${VERIFY_COMPOSE[@]}")
 env_value() {
-  local key="$1"
-  awk -F= -v wanted="$key" '$1 == wanted { value=substr($0, index($0, "=") + 1) } END { print value }' "$ENV_FILE"
+  verify_runtime_env_value "$1"
 }
 
 DB_USER="$(env_value POSTGRES_USER)"
@@ -109,6 +97,15 @@ db_query() {
 echo "======================================"
 echo "  InfinityScan Phase 1 Audit"
 echo "======================================"
+
+if verify_runtime_preflight; then
+  pass "TOOL: verifier disk and inode preflight"
+else
+  fail "TOOL: verifier disk and inode preflight"
+  printf 'Passed: %d\nFailed: %d\nSkipped: %d\n' "$PASS_COUNT" "$FAIL_COUNT" "$SKIP_COUNT"
+  printf '%bPhase 1 gate: FAIL%b\n' "$RED" "$NC"
+  exit 1
+fi
 
 for tool in python3 node npm curl git jq; do
   if command -v "$tool" >/dev/null 2>&1; then
@@ -323,7 +320,7 @@ else
     fail "REQ-11: native Docker Compose build failed (exit $status): $(short_error "$NATIVE_OUT")"
   fi
 
-  BUILDER=infinityscan-multiarch
+  BUILDER="${VERIFY_PROJECT}-multiarch"
   BUILDER_READY=false
   if EXISTING_BUILDER_OUT=$(docker buildx inspect "$BUILDER" 2>&1); then
     EXISTING_DRIVER="$(printf '%s\n' "$EXISTING_BUILDER_OUT" | awk -F: '/^Driver:/ { gsub(/^[[:space:]]+/, "", $2); print $2; exit }')"
@@ -360,6 +357,7 @@ else
     pass "REQ-12c: reusing dedicated $BUILDER builder"
   elif CREATE_OUT=$(docker buildx create --name "$BUILDER" --driver docker-container 2>&1); then
     BUILDER_READY=true
+    verify_runtime_register_builder "$BUILDER"
     pass "REQ-12c: created dedicated $BUILDER docker-container builder"
   else
     status=$?
@@ -412,17 +410,23 @@ else
     api \
     "$BUILDX_CACHE_ROOT/buildx-api" \
     -f api/Dockerfile \
-    -t infinityscan-api:arm64 \
+    -t "${VERIFY_PROJECT}-api:arm64" \
     api
+  if docker image inspect "${VERIFY_PROJECT}-api:arm64" >/dev/null 2>&1; then
+    verify_runtime_register_image "${VERIFY_PROJECT}-api:arm64"
+  fi
 
   run_arm64_build \
     "REQ-12f: web linux/arm64 --load build succeeds" \
     web \
     "$BUILDX_CACHE_ROOT/buildx-web" \
-    --build-arg NEXT_PUBLIC_API_URL=http://localhost:8000 \
+    --build-arg API_INTERNAL_URL=http://api:8000 \
     -f web/Dockerfile \
-    -t infinityscan-web:arm64 \
+    -t "${VERIFY_PROJECT}-web:arm64" \
     web
+  if docker image inspect "${VERIFY_PROJECT}-web:arm64" >/dev/null 2>&1; then
+    verify_runtime_register_image "${VERIFY_PROJECT}-web:arm64"
+  fi
 
   if DOWN_OUT=$(compose down -v --remove-orphans 2>&1); then
     :
@@ -486,11 +490,13 @@ else
     status=$?
     fail "REQ-15/16: API/web startup failed (exit $status): $(short_error "$STACK_OUT")"
   fi
+  API_HOST_PORT="$(verify_runtime_port api 8000 || true)"
+  WEB_HOST_PORT="$(verify_runtime_port web 3000 || true)"
   API_CODE=000
   WEB_CODE=000
   for _ in $(seq 1 60); do
-    API_CODE="$(curl -sS -o /dev/null -w '%{http_code}' http://localhost:8000/health 2>/dev/null || printf '000')"
-    WEB_CODE="$(curl -sS -o /dev/null -w '%{http_code}' http://localhost:3000 2>/dev/null || printf '000')"
+    API_CODE="$(curl -sS -o /dev/null -w '%{http_code}' "http://127.0.0.1:${API_HOST_PORT}/health" 2>/dev/null || printf '000')"
+    WEB_CODE="$(curl -sS -o /dev/null -w '%{http_code}' "http://127.0.0.1:${WEB_HOST_PORT}" 2>/dev/null || printf '000')"
     if [ "$API_CODE" = 200 ] && [ "$WEB_CODE" = 200 ]; then
       break
     fi
@@ -506,8 +512,9 @@ else
   else
     fail "REQ-16: frontend returned $WEB_CODE"
   fi
-  compose down -v --remove-orphans >/dev/null
 fi
+
+run_check "REQ-ENV: repository infra/.env remained unchanged" verify_runtime_assert_repo_env_unchanged
 
 echo ""
 echo "======================================"

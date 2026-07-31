@@ -21,7 +21,13 @@ from models import (
     PageIntegrityStatus,
     Series,
 )
-from storage.base import ObjectMetadata, ObjectVerification, StorageError, UploadResult
+from storage.base import (
+    DownloadResult,
+    ObjectMetadata,
+    ObjectVerification,
+    StorageError,
+    UploadResult,
+)
 
 from importing.adapters.base import ManifestChapter, ManifestPage, ManifestSeries
 from importing.adapters.local import (
@@ -70,6 +76,26 @@ class FakeStorage:
         self.objects[key] = (data, mime_type)
         sha256 = hashlib.sha256(data).hexdigest()
         return UploadResult(key=key, byte_size=len(data), mime_type=mime_type, sha256=sha256, etag="fake-etag")
+
+    def download_file(
+        self,
+        key: str,
+        destination: str | Path,
+        *,
+        expected_sha256: str | None = None,
+        expected_size: int | None = None,
+        max_bytes: int = 1024 * 1024 * 1024,
+    ) -> DownloadResult:
+        data, mime_type = self.objects[key]
+        assert len(data) <= max_bytes
+        Path(destination).write_bytes(data)
+        return DownloadResult(
+            key=key,
+            byte_size=len(data),
+            mime_type=mime_type,
+            sha256=hashlib.sha256(data).hexdigest(),
+            etag="fake-etag",
+        )
 
     def delete_object(self, key: str) -> bool:
         self.objects.pop(key, None)

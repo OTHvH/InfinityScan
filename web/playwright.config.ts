@@ -31,7 +31,7 @@ export default defineConfig({
       timeout: 120_000,
     },
     {
-      command: 'npm run start',
+      command: 'API_INTERNAL_URL=http://127.0.0.1:8000 npm run start',
       url: WEB_URL,
       reuseExistingServer: true,
       timeout: 120_000,

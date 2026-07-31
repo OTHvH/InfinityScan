@@ -13,7 +13,7 @@ Production-ready monorepo with a Next.js frontend, FastAPI backend, and Docker C
 
 ## Prerequisites
 
-- [Node.js 20+](https://nodejs.org/)
+- [Node.js 24](https://nodejs.org/) (`web/package.json` requires `>=24.18.1 <25`)
 - [Python 3.12+](https://www.python.org/)
 - [Docker](https://www.docker.com/) & [Docker Compose](https://docs.docker.com/compose/)
 
@@ -31,8 +31,9 @@ pip install -r requirements.txt
 uvicorn main:app --reload
 ```
 
-API available at <http://localhost:8000>  
-Interactive docs at <http://localhost:8000/docs>
+FastAPI listens directly at <http://127.0.0.1:8000>; its routes are unprefixed,
+so interactive docs are at <http://127.0.0.1:8000/docs>. This listener is the
+web server's upstream, not the URL browser code should use.
 
 The local reader API contract is documented in [`docs/reader-api.md`](docs/reader-api.md).
 
@@ -40,11 +41,17 @@ The local reader API contract is documented in [`docs/reader-api.md`](docs/reade
 
 ```bash
 cd web
-npm install
+npm ci
 npm run dev
 ```
 
-Web available at <http://localhost:3000>
+Open <http://localhost:3000>. Browser API requests are always same-origin under
+`/api` (for example, <http://localhost:3000/api/health>). Next.js strips that
+prefix when proxying to FastAPI, where the route remains `/health`.
+
+`API_INTERNAL_URL` selects the Next.js server's upstream and defaults to
+`http://localhost:8000` only in development. It is server-only and must never be
+renamed to a `NEXT_PUBLIC_*` variable or otherwise exposed in client JavaScript.
 
 ---
 
@@ -53,36 +60,40 @@ Web available at <http://localhost:3000>
 ```bash
 cp infra/.env.example infra/.env
 # edit infra/.env as needed
-docker compose -f infra/docker-compose.yml up --build
+docker compose --env-file infra/.env -f infra/docker-compose.yml up --build
 ```
 
 | Service | URL                    |
 |---------|------------------------|
 | Web     | <http://localhost:3000> |
-| API     | <http://localhost:8000> |
+| Browser API | <http://localhost:3000/api> |
+| FastAPI direct (operator diagnostics) | <http://127.0.0.1:8000> |
 
 ---
 
 ## Environment Variables
 
-See [`infra/.env.example`](infra/.env.example) for all available variables.
+[`infra/.env.example`](infra/.env.example) is the local development template
+copied to `infra/.env`. [`infra/.env.production.example`](infra/.env.production.example)
+is a placeholder-only production checklist: replace every angle-bracket value
+in a protected environment source before use; do not use it as credentials.
 
-| Variable              | Default                                                          | Description                              |
-|-----------------------|------------------------------------------------------------------|------------------------------------------|
-| `DATABASE_URL`        | `postgresql+psycopg://infinityscan:changeme@db:5432/infinityscan` | PostgreSQL connection URL (required)    |
-| `POSTGRES_USER`       | `infinityscan`                                                   | Postgres username (used by `db` service) |
-| `POSTGRES_PASSWORD`   | `changeme`                                                       | Postgres password — **change in prod**  |
-| `POSTGRES_DB`         | `infinityscan`                                                   | Postgres database name                   |
-| `NEXT_PUBLIC_API_URL` | `http://localhost:8000`                                          | Base URL the frontend uses for API       |
-| `API_HOST`            | `0.0.0.0`                                                        | Host the API listens on                  |
-| `API_PORT`            | `8000`                                                           | Port the API listens on                  |
-| `OBJECT_STORAGE_ENABLED` | `false`                                                        | Enable private S3-compatible storage    |
-| `S3_BUCKET`           | `infinityscan-pages`                                             | Object-storage bucket                   |
+| Variable | Description |
+|----------|-------------|
+| `DATABASE_URL` | Required PostgreSQL SQLAlchemy URL for the API and migrations |
+| `JWT_SECRET_KEY`, `CSRF_SECRET_KEY` | Separate authentication secrets; production requires distinct values of at least 32 bytes each |
+| `TRUSTED_HOSTS`, `ALLOWED_ORIGINS` | Explicit deployment host and unsafe-request origin allowlists |
+| `CORS_ORIGINS` | Exact cross-origin browser origins; set it explicitly empty for a same-origin deployment |
+| `API_INTERNAL_URL` | Private Next.js-server-to-FastAPI origin; never available to browser JavaScript |
+| `OBJECT_STORAGE_ENABLED` | Enables private S3-compatible storage and startup readiness checks |
+| `S3_BUCKET` | Object-storage bucket used by the API |
 
 To run local object-storage integration, configure the `S3_*` variables in
-`infra/.env`, then run `docker compose --profile storage up -d minio` followed
-by `docker compose --profile storage run --rm minio-setup`. The API never creates
-production buckets automatically.
+`infra/.env`, then run
+`docker compose --env-file infra/.env -f infra/docker-compose.yml --profile storage up -d minio`
+followed by
+`docker compose --env-file infra/.env -f infra/docker-compose.yml --profile storage run --rm minio-setup`.
+The API never creates production buckets automatically.
 
 ---
 
@@ -141,21 +152,21 @@ uses native scrolling, except for chapter, zoom, fit, and help shortcuts.
 
 ## Release Verification
 
-Run the complete Phase 4 release gate from a non-`master` branch:
+Run the cumulative Phase 5 release gate:
 
 ```bash
-scripts/verify-phase4.sh
+scripts/verify-phase5.sh
 ```
 
-The gate first requires the Phase 1, 2, and 3 verifiers to complete with exit
-code 0, no failures, and no mandatory skips. It then creates disposable
-PostgreSQL and MinIO volumes, verifies the 200-chapter reader fixture and all
-frontend quality gates, measures the long-scroll browser bounds, runs both
-dependency audits, and always removes its containers and volumes.
+Direct Phase 3-5 invocations run their prerequisite phases sequentially;
+`--phase-only` is for CI/orchestrators that already enforce those dependencies.
+Each verifier uses a temporary synthetic environment, random loopback ports, a
+unique Compose project and volumes, and checks that `infra/.env` remains
+byte-identical. Failed runs retain only redacted diagnostics under `/tmp`.
 
-## PostgreSQL Backups
+## Backups
 
-Production-safe PostgreSQL backup and restore commands are documented in
-[`docs/backup-tooling.md`](docs/backup-tooling.md). They use custom-format
-`pg_dump` archives, manifest checksums, optional age encryption, and refuse
-ambiguous or non-empty restore targets by default.
+Production backup and restore commands are documented in
+[`docs/backup-tooling.md`](docs/backup-tooling.md). v1 remains database-only for
+compatibility; `--objects` (alias `--complete`) creates the v2 database and
+object sidecar. Production requires an explicit mode and age encryption.

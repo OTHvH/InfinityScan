@@ -20,7 +20,7 @@ from models import (
     PageIntegrityStatus,
     Series,
 )
-from storage import ObjectMetadata, ObjectPage, ObjectVerification, StorageError
+from storage import DownloadResult, ObjectMetadata, ObjectPage, ObjectVerification, StorageError
 from storage.keys import cover_object_key, page_object_key
 from tools.storage_integrity import delete_unreferenced_objects, run_storage_integrity
 
@@ -129,6 +129,28 @@ class InstrumentedStorage:
 
     def upload_bytes(self, key, data, mime_type):
         raise AssertionError("not used")
+
+    def download_file(
+        self,
+        key,
+        destination,
+        *,
+        expected_sha256=None,
+        expected_size=None,
+        max_bytes=1024 * 1024 * 1024,
+    ):
+        data = self.objects[key]
+        assert len(data) <= max_bytes
+        from pathlib import Path
+
+        Path(destination).write_bytes(data)
+        return DownloadResult(
+            key=key,
+            byte_size=len(data),
+            mime_type=self.metadata[key].mime_type,
+            sha256=hashlib.sha256(data).hexdigest(),
+            etag=self.metadata[key].etag,
+        )
 
     def generate_presigned_get(self, key, expires_in=None):
         raise AssertionError("not used")

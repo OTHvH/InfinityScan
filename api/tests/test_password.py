@@ -13,12 +13,8 @@ Covers:
 
 from __future__ import annotations
 
-import uuid
-
 import pytest
-from sqlalchemy import select
 
-from models import User, UserRole
 from conftest import _do_login, _do_register
 
 

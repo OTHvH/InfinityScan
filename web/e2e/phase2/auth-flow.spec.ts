@@ -1,6 +1,7 @@
 import { test, expect, type Page } from '@playwright/test'
 
-const API_URL = process.env.API_URL ?? 'http://localhost:8000'
+const WEB_URL = process.env.WEB_URL ?? 'http://localhost:3000'
+const API_URL = `${WEB_URL.replace(/\/$/, '')}/api`
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -74,19 +75,6 @@ test.describe('Complete authentication and data isolation flow', () => {
   test('1-11: Register, bookmark, progress, logout, isolate, re-login, verify', async ({
     page,
   }) => {
-    await page.route('**/auth/**', async (route) => {
-      const requestUrl = new URL(route.request().url())
-      const apiOrigin = new URL(API_URL).origin
-      if (requestUrl.origin === apiOrigin) {
-        await route.continue()
-        return
-      }
-      const response = await route.fetch({
-        url: new URL(`${requestUrl.pathname}${requestUrl.search}`, API_URL).toString(),
-      })
-      await route.fulfill({ response })
-    })
-
     // ── Step 1: Register User A via API ───────────────────────────────────
     await registerUser(page, USER_A.username, USER_A.password)
 

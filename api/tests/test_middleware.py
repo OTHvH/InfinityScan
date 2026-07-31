@@ -6,15 +6,7 @@ security boundaries on incoming HTTP requests.
 
 from __future__ import annotations
 
-import pytest
-from unittest.mock import patch
-
-from middleware import (
-    OriginValidationMiddleware,
-    RequestBodyLimitMiddleware,
-    NoCacheAuthMiddleware,
-    _origin_is_allowed,
-)
+from middleware import _origin_is_allowed
 
 
 # ── _origin_is_allowed helper ───────────────────────────────────────────────

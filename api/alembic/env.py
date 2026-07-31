@@ -6,7 +6,7 @@ import os
 from logging.config import fileConfig
 
 from alembic import context
-from sqlalchemy import engine_from_config, pool
+from sqlalchemy import create_engine, engine_from_config, pool
 
 # Import all models so Alembic can detect schema changes via autogenerate.
 from models import Base  # noqa: F401
@@ -17,9 +17,11 @@ from models import Base  # noqa: F401
 config = context.config
 
 # Programmatic verification targets take precedence over the process default.
-database_url = config.attributes.get("database_url") or os.environ.get("DATABASE_URL")
-if database_url:
-    config.set_main_option("sqlalchemy.url", database_url)
+# Keep URLs out of ConfigParser so percent-encoded credentials are not treated
+# as interpolation syntax.
+database_url = config.attributes.get("database_url")
+if database_url is None:
+    database_url = os.environ.get("DATABASE_URL")
 
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)
@@ -33,7 +35,7 @@ target_metadata = Base.metadata
 
 def run_migrations_offline() -> None:
     """Run migrations in 'offline' mode (no DB connection required)."""
-    url = config.get_main_option("sqlalchemy.url")
+    url = database_url or config.get_main_option("sqlalchemy.url")
     context.configure(
         url=url,
         target_metadata=target_metadata,
@@ -47,11 +49,14 @@ def run_migrations_offline() -> None:
 
 def run_migrations_online() -> None:
     """Run migrations in 'online' mode (live DB connection)."""
-    connectable = engine_from_config(
-        config.get_section(config.config_ini_section, {}),
-        prefix="sqlalchemy.",
-        poolclass=pool.NullPool,
-    )
+    if database_url:
+        connectable = create_engine(database_url, poolclass=pool.NullPool)
+    else:
+        connectable = engine_from_config(
+            config.get_section(config.config_ini_section, {}),
+            prefix="sqlalchemy.",
+            poolclass=pool.NullPool,
+        )
     with connectable.connect() as connection:
         context.configure(
             connection=connection,

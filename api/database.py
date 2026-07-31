@@ -10,7 +10,7 @@ from __future__ import annotations
 from typing import Generator
 
 from fastapi import HTTPException
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, text
 from sqlalchemy.orm import Session, sessionmaker
 
 from settings import get_settings
@@ -41,6 +41,18 @@ def _get_session_local():
     return _SessionLocal
 
 
+def is_database_ready() -> bool:
+    """Return whether the configured database accepts a minimal query."""
+    try:
+        engine = _get_engine()
+        if engine is None:
+            return False
+        with engine.connect() as connection:
+            return connection.execute(text("SELECT 1")).scalar_one() == 1
+    except Exception:
+        return False
+
+
 def get_db() -> Generator[Session, None, None]:
     """Yield a SQLAlchemy session; called per-request."""
     SessionLocal = _get_session_local()
@@ -56,6 +68,7 @@ def get_db() -> Generator[Session, None, None]:
 def create_all_tables():
     """Create all tables (for testing only)."""
     from models import Base
+
     engine = _get_engine()
     if engine:
         Base.metadata.create_all(engine)
@@ -64,6 +77,7 @@ def create_all_tables():
 def drop_all_tables():
     """Drop all tables (for testing only)."""
     from models import Base
+
     engine = _get_engine()
     if engine:
         Base.metadata.drop_all(engine)

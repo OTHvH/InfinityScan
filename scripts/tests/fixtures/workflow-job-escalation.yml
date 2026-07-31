@@ -1,0 +1,10 @@
+name: Escalated job
+on: push
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps: []

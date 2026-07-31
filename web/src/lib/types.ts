@@ -13,7 +13,6 @@ export interface Series {
   title: string;
   synopsis: string | null;
   cover_url?: string | null;
-  cover_object_key: string | null;
   content_type: "manga" | "manhua" | "manhwa";
   status: "ongoing" | "completed" | "hiatus" | "cancelled";
   year: number | null;

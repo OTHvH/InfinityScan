@@ -46,7 +46,7 @@ describe("credentials: include on all requests", () => {
     mockFetch.mockResolvedValueOnce(okJson({ ok: true }));
     await api.get("/test");
     expect(mockFetch).toHaveBeenCalledWith(
-      "/test",
+      "/api/test",
       expect.objectContaining({ credentials: "include" }),
     );
   });
@@ -55,7 +55,7 @@ describe("credentials: include on all requests", () => {
     mockFetch.mockResolvedValueOnce(okJson({ ok: true }));
     await api.post("/test", { a: 1 });
     expect(mockFetch).toHaveBeenCalledWith(
-      "/test",
+      "/api/test",
       expect.objectContaining({ credentials: "include" }),
     );
   });
@@ -141,8 +141,8 @@ describe("Refresh coordination", () => {
       .mockResolvedValueOnce(okJson({ ok: true }));          // retry → ok
     const result = await api.get("/protected");
     expect(mockFetch).toHaveBeenCalledTimes(3);
-    expect(mockFetch.mock.calls[1][0]).toContain("/auth/refresh");
-    expect(mockFetch.mock.calls[2][0]).toBe("/protected");
+    expect(mockFetch.mock.calls[1][0]).toBe("/api/auth/refresh");
+    expect(mockFetch.mock.calls[2][0]).toBe("/api/protected");
     expect(result).toEqual({ ok: true });
   });
 

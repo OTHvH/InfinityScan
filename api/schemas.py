@@ -15,7 +15,7 @@ from decimal import Decimal
 from typing import Optional
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_serializer
+from pydantic import BaseModel, ConfigDict, Field, field_serializer
 
 
 # ── Shared base ──────────────────────────────────────────────────────────────

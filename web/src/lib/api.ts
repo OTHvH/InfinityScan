@@ -14,39 +14,56 @@
 
 import type { User } from "./types";
 
-// ── Base URL ─────────────────────────────────────────────────────────────────
+const API_BASE = "/api";
+const MEDIA_PATH_PREFIX = "/media/";
+const PAGE_MEDIA_PATH_PREFIX = "/media/pages/";
 
-const API_BASE = process.env.NEXT_PUBLIC_API_URL ?? "";
+function apiUrl(path: string): string {
+  if (!path.startsWith("/") || path.startsWith("//") || path.includes("://")) {
+    throw new Error("Invalid API path");
+  }
+  return `${API_BASE}${path}`;
+}
 
-const MEDIA_PATH_PREFIX = "/media/pages/";
-
-/** Resolve only same-API, root-relative media paths returned by the server. */
+/** Resolve only trusted root-relative media paths returned by the backend. */
 export function resolveMediaUrl(path: string): string {
   if (
     typeof path !== "string" ||
     !path.startsWith(MEDIA_PATH_PREFIX) ||
     path.startsWith("//") ||
     path.includes("://") ||
+    path.includes("%") ||
+    path.includes("\\") ||
     path.includes("?") ||
     path.includes("#")
   ) {
-    throw new Error("Invalid reader media path");
+    throw new Error("Invalid media path");
   }
-  if (API_BASE) return `${API_BASE.replace(/\/$/, "")}${path}`;
-  if (typeof window !== "undefined") return `${window.location.origin}${path}`;
-  return path;
+  const parsed = new URL(path, "http://infinityscan.invalid");
+  if (parsed.origin !== "http://infinityscan.invalid" || parsed.pathname !== path) {
+    throw new Error("Invalid media path");
+  }
+  return apiUrl(path);
+}
+
+export function resolveOptionalMediaUrl(path: string | null | undefined): string | null {
+  if (!path) return null;
+  try {
+    return resolveMediaUrl(path);
+  } catch {
+    return null;
+  }
 }
 
 /** Build a request URL for the same validated page endpoint, optionally cache-busting a retry. */
 export function resolvePageMediaRequest(path: string, attempt = 1): string {
   const origin = typeof window !== "undefined" ? window.location.origin : "http://localhost";
-  const marker = "__infinityscan_page__";
-  const expected = new URL(resolveMediaUrl(`${MEDIA_PATH_PREFIX}${marker}`), origin);
-  const candidate = new URL(path.startsWith("/") ? resolveMediaUrl(path) : path, origin);
-  const expectedPrefix = expected.pathname.slice(0, -marker.length);
+  const candidatePath = path.startsWith(PAGE_MEDIA_PATH_PREFIX) ? resolveMediaUrl(path) : path;
+  const candidate = new URL(candidatePath, origin);
+  const expectedPrefix = `${API_BASE}${PAGE_MEDIA_PATH_PREFIX}`;
   const pageId = candidate.pathname.slice(expectedPrefix.length);
   if (
-    candidate.origin !== expected.origin
+    candidate.origin !== origin
     || !!candidate.username
     || !!candidate.password
     || !candidate.pathname.startsWith(expectedPrefix)
@@ -60,7 +77,7 @@ export function resolvePageMediaRequest(path: string, attempt = 1): string {
     throw new Error("Invalid reader media path");
   }
   if (attempt > 1) candidate.searchParams.set("attempt", String(attempt));
-  return candidate.toString();
+  return `${candidate.pathname}${candidate.search}`;
 }
 
 // ── CSRF cookie reader ───────────────────────────────────────────────────────
@@ -120,7 +137,7 @@ function doRefresh(): Promise<boolean> {
 
   refreshPromise = (async () => {
     try {
-      const res = await fetch(`${API_BASE}/auth/refresh`, {
+      const res = await fetch(apiUrl("/auth/refresh"), {
         method: "POST",
         credentials: "include",
         headers: {
@@ -159,7 +176,7 @@ async function request<T = unknown>(
     }
   }
 
-  let res = await fetch(`${API_BASE}${path}`, {
+  let res = await fetch(apiUrl(path), {
     ...options,
     method,
     credentials: "include",
@@ -175,7 +192,7 @@ async function request<T = unknown>(
       if (isUnsafe(method) && newCsrf) {
         headers["X-CSRF-Token"] = newCsrf;
       }
-      res = await fetch(`${API_BASE}${path}`, {
+      res = await fetch(apiUrl(path), {
         ...options,
         method,
         credentials: "include",
@@ -231,7 +248,7 @@ export const api = {
 
   /** Fetch a pre-auth CSRF token from the server. */
   async fetchCsrf(): Promise<string> {
-    const res = await fetch(`${API_BASE}/auth/csrf`, {
+    const res = await fetch(apiUrl("/auth/csrf"), {
       credentials: "include",
     });
     if (!res.ok) throw new ApiError(res.status, "Failed to fetch CSRF token");

@@ -1,0 +1,7 @@
+name: Broad permissions
+on: push
+permissions: write-all
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps: []

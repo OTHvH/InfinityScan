@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # InfinityScan Phase 4 bottomless-reader release gate.
+# shellcheck disable=SC2016 # bash -c snippets intentionally expand positional parameters in child shells.
 set -uo pipefail
 
 RED='\033[0;31m'
@@ -7,7 +8,9 @@ GREEN='\033[0;32m'
 NC='\033[0m'
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-cd "$REPO_ROOT"
+cd "$REPO_ROOT" || exit 1
+. "$REPO_ROOT/scripts/lib/verify-runtime.sh"
+verify_runtime_init phase4
 
 PASS_COUNT=0
 FAIL_COUNT=0
@@ -15,22 +18,14 @@ SKIP_COUNT=0
 RESULTS=()
 FAILED_CHECKS=()
 CHECK_INDEX=0
-TMPDIR="$(mktemp -d /tmp/infinityscan-phase4-XXXXXX)"
-ENV_FILE="$REPO_ROOT/infra/.env"
-ENV_BACKUP="$TMPDIR/infra.env.backup"
-ENV_WAS_PRESENT=false
+TMPDIR="$VERIFY_TMPDIR"
+ENV_FILE="$VERIFY_ENV_FILE"
 COMPOSE_OVERRIDE="$TMPDIR/docker-compose.override.yml"
 FIXTURE_FILE="$TMPDIR/phase4-fixture.json"
 API_METRICS_FILE="$TMPDIR/phase4-api-metrics.json"
 E2E_LOG="$TMPDIR/playwright-reader.log"
 MEMORY_METRICS_FILE="$TMPDIR/phase4-memory.json"
 NETWORK_METRICS_FILE="$TMPDIR/phase4-network.json"
-CLEANED=false
-
-if [ -f "$ENV_FILE" ]; then
-  cp "$ENV_FILE" "$ENV_BACKUP"
-  ENV_WAS_PRESENT=true
-fi
 
 pass() {
   PASS_COUNT=$((PASS_COUNT + 1))
@@ -60,11 +55,16 @@ run_check() {
   local status log
   CHECK_INDEX=$((CHECK_INDEX + 1))
   log="$TMPDIR/check-${CHECK_INDEX}.log"
-  if timeout --foreground "$seconds" "$@" >"$log" 2>&1; then
+  if declare -F "${1:-}" >/dev/null 2>&1; then
+    "$@" >"$log" 2>&1
+    status=$?
+  else
+    timeout --foreground "$seconds" "$@" >"$log" 2>&1
+    status=$?
+  fi
+  if [ "$status" -eq 0 ]; then
     pass "$label"
     return 0
-  else
-    status=$?
   fi
   if [ "$status" -eq 124 ]; then
     fail "$label (timeout after ${seconds}s): $(failure_tail "$log")"
@@ -74,34 +74,19 @@ run_check() {
   return 1
 }
 
-restore_environment() {
-  if [ "$ENV_WAS_PRESENT" = true ]; then
-    cp "$ENV_BACKUP" "$ENV_FILE"
-  else
-    rm -f "$ENV_FILE"
-  fi
-}
-
 cleanup_stack() {
-  if [ ! -f "$ENV_FILE" ] || ! command -v docker >/dev/null 2>&1; then
+  if ! command -v docker >/dev/null 2>&1; then
     return 0
   fi
-  local args=(docker compose --env-file "$ENV_FILE" -f "$REPO_ROOT/infra/docker-compose.yml")
-  if [ -f "$COMPOSE_OVERRIDE" ]; then
-    args+=(-f "$COMPOSE_OVERRIDE")
-  fi
-  timeout --foreground 180 "${args[@]}" --profile storage down -v --remove-orphans >/dev/null 2>&1
+  timeout --foreground 180 "${VERIFY_COMPOSE[@]}" --profile storage down -v --remove-orphans >/dev/null 2>&1
 }
 
+# shellcheck disable=SC2329 # Invoked by the EXIT trap.
 cleanup() {
   local status=$?
   trap - EXIT
-  if [ "$CLEANED" = false ]; then
-    cleanup_stack || true
-  fi
-  restore_environment
-  rm -rf "$TMPDIR"
-  exit "$status"
+  verify_runtime_cleanup "$status"
+  exit $?
 }
 trap cleanup EXIT
 
@@ -131,8 +116,14 @@ summary() {
   return 1
 }
 
-if [ "$#" -ne 0 ]; then
-  fail "ARGUMENTS: Phase 4 has no skip mode"
+PHASE_ONLY=false
+for arg in "$@"; do
+  case "$arg" in
+    --phase-only) PHASE_ONLY=true ;;
+    *) fail "ARGUMENTS: Phase 4 has no skip mode" ;;
+  esac
+done
+if [ "$FAIL_COUNT" -ne 0 ]; then
   summary
   exit 1
 fi
@@ -142,8 +133,10 @@ printf '  InfinityScan Phase 4 Verification\n'
 printf '======================================\n'
 
 run_prerequisite() {
-  local phase="$1" script="$2" log="$TMPDIR/phase${phase}.log" status
-  if timeout --foreground 10800 bash "$script" >"$log" 2>&1; then
+  local phase="$1" script="$2" status
+  local log="$TMPDIR/phase${phase}.log"
+  shift 2
+  if timeout --foreground 10800 bash "$script" "$@" >"$log" 2>&1; then
     status=0
   else
     status=$?
@@ -163,12 +156,18 @@ run_prerequisite() {
   return 1
 }
 
-for phase in 1 2 3; do
-  if ! run_prerequisite "$phase" "$REPO_ROOT/scripts/verify-phase${phase}.sh"; then
+if [ "$PHASE_ONLY" = false ]; then
+  for phase in 1 2; do
+    if ! run_prerequisite "$phase" "$REPO_ROOT/scripts/verify-phase${phase}.sh"; then
+      summary
+      exit 1
+    fi
+  done
+  if ! run_prerequisite 3 "$REPO_ROOT/scripts/verify-phase3.sh" --phase-only; then
     summary
     exit 1
   fi
-done
+fi
 
 for tool in python3 node npm curl jq git docker timeout; do
   if command -v "$tool" >/dev/null 2>&1; then
@@ -177,6 +176,10 @@ for tool in python3 node npm curl jq git docker timeout; do
     fail "TOOL: $tool is required"
   fi
 done
+if ! run_check "TOOL: verifier disk and inode preflight" 30 verify_runtime_preflight; then
+  summary
+  exit 1
+fi
 
 BRANCH="$(git branch --show-current 2>/dev/null || true)"
 if [ -n "$BRANCH" ] && [ "$BRANCH" != master ]; then
@@ -195,22 +198,12 @@ else
   fail "P4-02: tracked content/secrets detected: $MANGA_FILES $REAL_ENV $SECRET_FILES $SECRET_CONTENT"
 fi
 
-if [ ! -f "$ENV_FILE" ]; then
-  cp "$REPO_ROOT/infra/.env.example" "$ENV_FILE"
-fi
-
 set_env_value() {
-  local key="$1" value="$2"
-  if grep -q "^${key}=" "$ENV_FILE"; then
-    sed -i "s|^${key}=.*|${key}=${value}|" "$ENV_FILE"
-  else
-    printf '%s=%s\n' "$key" "$value" >> "$ENV_FILE"
-  fi
+  verify_runtime_set_env "$1" "$2"
 }
 
 env_value() {
-  local key="$1"
-  awk -F= -v wanted="$key" '$1 == wanted { value=substr($0, index($0, "=") + 1) } END { print value }' "$ENV_FILE"
+  verify_runtime_env_value "$1"
 }
 
 set_env_value OBJECT_STORAGE_ENABLED true
@@ -233,21 +226,21 @@ MINIO_USER="${MINIO_USER:-minioadmin}"
 MINIO_PASS="${MINIO_PASS:-minioadminsecret}"
 set_env_value S3_ACCESS_KEY_ID "$MINIO_USER"
 set_env_value S3_SECRET_ACCESS_KEY "$MINIO_PASS"
+verify_runtime_refresh_compose
 
 cat > "$COMPOSE_OVERRIDE" <<'YAML'
 services:
   db:
     ports:
-      - "127.0.0.1:5432:5432"
+      - "127.0.0.1::5432"
 YAML
 
 COMPOSE=(
-  docker compose
-  --env-file "$ENV_FILE"
-  -f "$REPO_ROOT/infra/docker-compose.yml"
+  "${VERIFY_COMPOSE[@]}"
   -f "$COMPOSE_OVERRIDE"
   --profile storage
 )
+VERIFY_COMPOSE=("${COMPOSE[@]}")
 
 INFRA_OK=true
 DB_CONTAINER=""
@@ -255,17 +248,21 @@ run_check "P4-03a: Docker Compose configuration is valid" 60 "${COMPOSE[@]}" con
 run_check "P4-03b: previous containers and volumes removed" 180 "${COMPOSE[@]}" down -v --remove-orphans || INFRA_OK=false
 run_check "P4-03c: clean PostgreSQL and MinIO services started" 600 "${COMPOSE[@]}" up -d --build db minio || INFRA_OK=false
 
+DB_HOST_PORT="$(verify_runtime_port db 5432 || true)"
+MINIO_HOST_PORT="$(verify_runtime_port minio 9000 || true)"
 run_check "P4-03d: PostgreSQL and MinIO became healthy" 120 bash -c '
   for _ in $(seq 1 60); do
     db_ok=false
     minio_ok=false
-    docker compose --env-file "$1" -f "$2" -f "$3" --profile storage exec -T db pg_isready -U "$4" -d "$5" >/dev/null 2>&1 && db_ok=true
-    curl --fail --silent --show-error --connect-timeout 2 --max-time 5 http://127.0.0.1:9000/minio/health/live >/dev/null 2>&1 && minio_ok=true
+    docker compose --project-name "$1" --env-file "$2" -f "$3" -f "$4" --profile storage \
+      exec -T db pg_isready -U "$5" -d "$6" >/dev/null 2>&1 && db_ok=true
+    curl --fail --silent --show-error --connect-timeout 2 --max-time 5 \
+      "http://127.0.0.1:$7/minio/health/live" >/dev/null 2>&1 && minio_ok=true
     if [ "$db_ok" = true ] && [ "$minio_ok" = true ]; then exit 0; fi
     sleep 2
   done
   exit 1
-' bash "$ENV_FILE" "$REPO_ROOT/infra/docker-compose.yml" "$COMPOSE_OVERRIDE" "$DB_USER" "$DB_NAME" || INFRA_OK=false
+' bash "$VERIFY_PROJECT" "$ENV_FILE" "$REPO_ROOT/infra/docker-compose.yml" "$COMPOSE_OVERRIDE" "$DB_USER" "$DB_NAME" "$MINIO_HOST_PORT" || INFRA_OK=false
 
 run_check "P4-03e: private MinIO fixture bucket created" 180 "${COMPOSE[@]}" run --rm minio-setup || INFRA_OK=false
 if [ "$INFRA_OK" = true ]; then
@@ -280,11 +277,11 @@ MIGRATIONS_OK=false
 if [ "$INFRA_OK" = true ]; then
   if run_check "P4-04a: all Alembic migrations completed" 300 "${COMPOSE[@]}" run --rm --build migrate; then
     if run_check "P4-04b: database revision equals the sole Alembic head" 120 bash -c '
-      head_revision=$(docker compose --env-file "$1" -f "$2" -f "$3" --profile storage run --rm --entrypoint alembic migrate heads | awk "/[(]head[)]/ { print \$1; exit }") || exit $?
+      head_revision=$(docker compose --project-name "$1" --env-file "$2" -f "$3" -f "$4" --profile storage run --rm --entrypoint alembic migrate heads | awk "/[(]head[)]/ { print \$1; exit }") || exit $?
       [ -n "$head_revision" ] || exit 1
-      actual=$(docker exec -e "PGPASSWORD=$6" "$4" psql -h localhost -U "$5" -d "$7" -t -A -v ON_ERROR_STOP=1 -c "SELECT version_num FROM alembic_version;") || exit $?
+      actual=$(docker exec -e "PGPASSWORD=$7" "$5" psql -h localhost -U "$6" -d "$8" -t -A -v ON_ERROR_STOP=1 -c "SELECT version_num FROM alembic_version;") || exit $?
       [ "$actual" = "$head_revision" ]
-    ' bash "$ENV_FILE" "$REPO_ROOT/infra/docker-compose.yml" "$COMPOSE_OVERRIDE" "$DB_CONTAINER" "$DB_USER" "$DB_PASS" "$DB_NAME"; then
+    ' bash "$VERIFY_PROJECT" "$ENV_FILE" "$REPO_ROOT/infra/docker-compose.yml" "$COMPOSE_OVERRIDE" "$DB_CONTAINER" "$DB_USER" "$DB_PASS" "$DB_NAME"; then
       MIGRATIONS_OK=true
     fi
   fi
@@ -301,13 +298,13 @@ if [ ! -x "$API_PYTHON" ]; then
   fail "PYTHON: verifier virtualenv is unavailable after prerequisites"
 fi
 
-HOST_DATABASE_URL="postgresql+psycopg://${DB_USER}:${DB_PASS}@127.0.0.1:5432/${DB_NAME}"
+HOST_DATABASE_URL="postgresql+psycopg://${DB_USER}:${DB_PASS}@127.0.0.1:${DB_HOST_PORT}/${DB_NAME}"
 FIXTURE_OK=false
 if [ "$MIGRATIONS_OK" = true ] && [ -x "$API_PYTHON" ]; then
   if run_check "P4-05a: 200-chapter reader fixture seeded" 300 env \
       DATABASE_URL="$HOST_DATABASE_URL" \
       OBJECT_STORAGE_ENABLED=true \
-      S3_ENDPOINT_URL=http://127.0.0.1:9000 \
+      S3_ENDPOINT_URL="http://127.0.0.1:${MINIO_HOST_PORT}" \
       S3_REGION=auto \
       S3_BUCKET=infinityscan-pages \
       S3_ACCESS_KEY_ID="$MINIO_USER" \
@@ -334,7 +331,7 @@ if [ "$INFRA_OK" = true ] && [ -x "$API_PYTHON" ]; then
       docker exec -e "PGPASSWORD=$2" "$1" psql -h localhost -U "$3" -d postgres -v ON_ERROR_STOP=1 -c "DROP DATABASE IF EXISTS $4 WITH (FORCE);" >/dev/null &&
       docker exec -e "PGPASSWORD=$2" "$1" psql -h localhost -U "$3" -d postgres -v ON_ERROR_STOP=1 -c "CREATE DATABASE $4;" >/dev/null
     ' bash "$DB_CONTAINER" "$DB_PASS" "$DB_USER" "$TEST_DB"; then
-    TEST_DATABASE_URL="postgresql+psycopg://${DB_USER}:${DB_PASS}@127.0.0.1:5432/${TEST_DB}"
+    TEST_DATABASE_URL="postgresql+psycopg://${DB_USER}:${DB_PASS}@127.0.0.1:${DB_HOST_PORT}/${TEST_DB}"
     if run_check "P4-06b: backend cursor reader tests passed on PostgreSQL" 900 env \
         TEST_DATABASE_URL="$TEST_DATABASE_URL" OBJECT_STORAGE_ENABLED=false \
         "$API_PYTHON" -m pytest api/tests/test_reader.py api/tests/test_reader_phase4.py -q; then
@@ -359,8 +356,10 @@ else
   fail "P4-11: complete stack not started because fixture setup failed"
 fi
 
-API_BASE=http://127.0.0.1:8000
-WEB_BASE=http://127.0.0.1:3000
+API_HOST_PORT="$(verify_runtime_port api 8000 || true)"
+WEB_HOST_PORT="$(verify_runtime_port web 3000 || true)"
+API_BASE="http://127.0.0.1:${API_HOST_PORT}"
+WEB_BASE="http://127.0.0.1:${WEB_HOST_PORT}"
 ROOT_HTML="$TMPDIR/frontend.html"
 if [ "$STACK_OK" = true ]; then
   run_check "P4-12: API health returned HTTP 200 and status ok" 150 bash -c '
@@ -417,6 +416,8 @@ E2E_OK=false
 if [ "$STACK_OK" = true ] && [ "$LIVE_API_OK" = true ] && [ -x web/node_modules/.bin/playwright ]; then
   if timeout --foreground 900 env \
       PLAYWRIGHT_EXTERNAL_SERVER=1 \
+      PHASE3_MINIO_HOST_MAP=1 \
+      PHASE3_MINIO_PORT="$MINIO_HOST_PORT" \
       API_URL="$API_BASE" \
       WEB_URL="$WEB_BASE" \
       npm --prefix web run test:e2e:phase4 >"$E2E_LOG" 2>&1; then
@@ -456,8 +457,11 @@ else
   fail "P4-36: pip-audit cannot run because API Python is unavailable"
 fi
 
+run_check "P4-37a: repository infra/.env remained unchanged" 30 verify_runtime_assert_repo_env_unchanged
+if [ "$FAIL_COUNT" -ne 0 ]; then
+  verify_runtime_capture_diagnostics
+fi
 if cleanup_stack; then
-  CLEANED=true
   pass "P4-37: containers and volumes removed"
 else
   fail "P4-37: container and volume cleanup failed"

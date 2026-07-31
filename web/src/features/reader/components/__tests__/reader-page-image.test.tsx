@@ -85,8 +85,8 @@ describe("ReaderPage resilient image loading", () => {
 
     await waitFor(() => expect(screen.getByRole("img")).toHaveAttribute("src", "blob:reader-page-1"));
     expect(fetchMock).toHaveBeenCalledWith(
-      "http://localhost:3000/media/pages/page-id",
-      expect.objectContaining({ credentials: "omit", signal: expect.any(AbortSignal) }),
+      "/api/media/pages/page-id",
+      expect.objectContaining({ credentials: "same-origin", signal: expect.any(AbortSignal) }),
     );
     expect(screen.getByRole("img").getAttribute("src")).not.toContain("objects.");
     expect(consoleSpy).not.toHaveBeenCalled();
@@ -129,7 +129,7 @@ describe("ReaderPage resilient image loading", () => {
     await act(async () => { await vi.advanceTimersByTimeAsync(500); });
     await flushPromises();
     expect(fetchMock).toHaveBeenCalledTimes(2);
-    expect(fetchMock.mock.calls[1][0]).toBe("http://localhost:3000/media/pages/page-id?attempt=2");
+    expect(fetchMock.mock.calls[1][0]).toBe("/api/media/pages/page-id?attempt=2");
     expect(screen.getByRole("img")).toHaveAttribute("src", "blob:reader-page-1");
   });
 
@@ -145,7 +145,7 @@ describe("ReaderPage resilient image loading", () => {
     await act(async () => { await vi.advanceTimersByTimeAsync(500); });
     await flushPromises();
     expect(fetchMock).toHaveBeenCalledTimes(2);
-    expect(fetchMock.mock.calls[1][0]).toBe("http://localhost:3000/media/pages/page-id?attempt=2");
+    expect(fetchMock.mock.calls[1][0]).toBe("/api/media/pages/page-id?attempt=2");
   });
 
   it("treats a media endpoint 404 as unavailable without retrying", async () => {
@@ -183,7 +183,7 @@ describe("ReaderPage resilient image loading", () => {
     fireEvent.click(screen.getByRole("button", { name: "Retry" }));
     await flushPromises();
     expect(fetchMock).toHaveBeenCalledTimes(2);
-    expect(fetchMock.mock.calls[1][0]).toBe("http://localhost:3000/media/pages/page-id?attempt=2");
+    expect(fetchMock.mock.calls[1][0]).toBe("/api/media/pages/page-id?attempt=2");
     await act(async () => { await vi.advanceTimersByTimeAsync(10_000); });
     expect(fetchMock).toHaveBeenCalledTimes(2);
   });
@@ -200,10 +200,10 @@ describe("ReaderPage resilient image loading", () => {
 
     expect(fetchMock).toHaveBeenCalledTimes(4);
     expect(fetchMock.mock.calls.map((call) => call[0])).toEqual([
-      "http://localhost:3000/media/pages/page-id",
-      "http://localhost:3000/media/pages/page-id?attempt=2",
-      "http://localhost:3000/media/pages/page-id?attempt=3",
-      "http://localhost:3000/media/pages/page-id?attempt=4",
+      "/api/media/pages/page-id",
+      "/api/media/pages/page-id?attempt=2",
+      "/api/media/pages/page-id?attempt=3",
+      "/api/media/pages/page-id?attempt=4",
     ]);
     expect(screen.getByRole("img").parentElement).toHaveAttribute("data-image-state", "unavailable");
     await act(async () => { await vi.advanceTimersByTimeAsync(60_000); });

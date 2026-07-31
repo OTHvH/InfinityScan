@@ -20,7 +20,6 @@ import time
 import uuid
 from decimal import Decimal
 
-import pytest
 from sqlalchemy import select
 
 from auth import (
@@ -28,7 +27,7 @@ from auth import (
     validate_csrf_token,
     _PREAUTH_SESSION_ID,
 )
-from models import Bookmark, ReadingProgress, Series, Chapter, Page, ContentType, ReadingMode, SeriesStatus
+from models import Bookmark, Chapter, ContentType, ReadingProgress, Series, SeriesStatus
 from settings import get_settings
 
 # Import test helpers from conftest
@@ -423,7 +422,6 @@ class TestCSRF:
     def test_signed_token_rejects_expired(self):
         """A token older than csrf_token_ttl_seconds is rejected."""
         sid = uuid.uuid4()
-        token = generate_csrf_token(sid)
         # Temporarily patch the TTL to 1 second, wait, then validate
         from auth import _csrf_hmac
         import base64 as b64
@@ -569,7 +567,6 @@ class TestCSRF:
     def test_login_with_preauth_csrf_succeeds(self, client, user_factory):
         """Login via /auth/login succeeds with valid pre-auth CSRF."""
         user_factory(username="csrf_login2", password="pass12345")
-        cfg = get_settings()
         # Get pre-auth CSRF from /auth/csrf endpoint
         resp = client.get("/auth/csrf")
         assert resp.status_code == 200
@@ -607,7 +604,6 @@ class TestCSRF:
 
     def test_register_with_preauth_csrf_succeeds(self, client):
         """Register via /auth/register succeeds with valid pre-auth CSRF."""
-        cfg = get_settings()
         resp = client.get("/auth/csrf")
         preauth_csrf = resp.json()["csrf_token"]
 

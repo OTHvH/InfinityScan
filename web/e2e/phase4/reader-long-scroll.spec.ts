@@ -262,9 +262,9 @@ test("Phase 4 long scroll remains bounded and resumable", async ({ page, context
     });
   });
 
-  await page.route("**/auth/me", (route) => route.fulfill({ status: 401, contentType: "application/json", body: JSON.stringify({ detail: "Not authenticated" }) }));
-  await page.route("**/auth/refresh", (route) => route.fulfill({ status: 401, contentType: "application/json", body: JSON.stringify({ detail: "Not authenticated" }) }));
-  await page.route("**/reader/phase4-reader/chunks?*", async (route: Route) => {
+  await page.route("**/api/auth/me", (route) => route.fulfill({ status: 401, contentType: "application/json", body: JSON.stringify({ detail: "Not authenticated" }) }));
+  await page.route("**/api/auth/refresh", (route) => route.fulfill({ status: 401, contentType: "application/json", body: JSON.stringify({ detail: "Not authenticated" }) }));
+  await page.route("**/api/reader/phase4-reader/chunks?*", async (route: Route) => {
     const url = new URL(route.request().url());
     const direction = url.searchParams.get("direction") === "previous" ? "previous" : "next";
     const requestedCursor = url.searchParams.get("cursor");
@@ -332,7 +332,7 @@ test("Phase 4 long scroll remains bounded and resumable", async ({ page, context
       else activePrevious -= 1;
     }
   });
-  await page.route(/\/media\/pages\/[^/?]+(?:\?.*)?$/, async (route) => {
+  await page.route(/\/api\/media\/pages\/[^/?]+(?:\?.*)?$/, async (route) => {
     mediaRequests += 1;
     const url = new URL(route.request().url());
     if (url.searchParams.has("attempt")) mediaRetryRequests += 1;

@@ -16,11 +16,10 @@ All identity derives from the session cookies.  No identity headers are accepted
 Environment variables
 ---------------------
 DATABASE_URL       postgresql+psycopg://user:pass@host:5432/db
-SECRET_KEY         HMAC signing key for JWTs (auto-generated if omitted)
+JWT_SECRET_KEY     HMAC signing key (generated only during development)
 CORS_ORIGINS       comma-separated list of allowed origins (default: http://localhost:3000)
 """
 
-import sys
 import uuid
 from contextlib import asynccontextmanager
 from decimal import Decimal
@@ -36,14 +35,15 @@ from sqlalchemy.orm import Session, joinedload
 from slowapi.errors import RateLimitExceeded
 from slowapi.middleware import SlowAPIMiddleware
 
+from database import get_db, is_database_ready
+from deps import get_current_user, require_admin, require_csrf
 from limiter import limiter
-
-from settings import get_settings
-from database import get_db
-from storage import ObjectStorage, StorageError, create_object_storage
-from providers.base import ProviderError, ProviderSecurityError, ProviderTimeout
-from providers.copymanga import CopyMangaAdapter
-from providers.local import LocalContentAdapter
+from middleware import (
+    NoCacheAuthMiddleware,
+    OriginValidationMiddleware,
+    RequestBodyLimitMiddleware,
+    RequestIDMiddleware,
+)
 from models import (
     AuditEventOutcome,
     Bookmark,
@@ -54,13 +54,15 @@ from models import (
     PageIntegrityStatus,
     ReadingMode,
     ReadingProgress,
-    RefreshSession,
     Series,
     SeriesStatus,
     User,
-    UserRole,
 )
-from deps import get_current_user, require_admin, require_csrf
+from providers.base import ProviderError, ProviderSecurityError, ProviderTimeout
+from providers.copymanga import CopyMangaAdapter
+from providers.local import LocalContentAdapter
+from routes.auth import router as auth_router
+from routes.reader import router as reader_router
 from schemas import (
     BookmarkIn,
     BookmarkOut,
@@ -76,6 +78,8 @@ from schemas import (
     ProviderSeriesListOut,
     ProviderSeriesOut,
 )
+from settings import get_settings
+from storage import ObjectStorage, StorageError, create_object_storage
 
 # ---------------------------------------------------------------------------
 # Config
@@ -121,13 +125,29 @@ _http_client: httpx.AsyncClient | None = None
 @asynccontextmanager
 async def lifespan(_: Any):
     global _http_client
+    if _cfg.app_env == "production" and not is_database_ready():
+        raise RuntimeError("DATABASE_URL readiness check failed")
+    if _cfg.object_storage_enabled:
+        try:
+            storage_ready = (
+                _media_storage is not None and _media_storage.health_check()
+            )
+        except Exception:
+            storage_ready = False
+        if not storage_ready:
+            raise RuntimeError("OBJECT_STORAGE_ENABLED readiness check failed")
+
     _http_client = httpx.AsyncClient(
         timeout=httpx.Timeout(15.0),
         follow_redirects=True,
     )
-    yield
-    await _copymanga.close()
-    await _http_client.aclose()
+    try:
+        yield
+    finally:
+        try:
+            await _copymanga.close()
+        finally:
+            await _http_client.aclose()
 
 
 # ---------------------------------------------------------------------------
@@ -169,9 +189,6 @@ app.add_middleware(
 # Trusted hosts
 app.add_middleware(TrustedHostMiddleware, allowed_hosts=_cfg.trusted_hosts)
 
-# Custom security middleware
-from middleware import OriginValidationMiddleware, RequestBodyLimitMiddleware, NoCacheAuthMiddleware, RequestIDMiddleware
-
 app.add_middleware(RequestIDMiddleware)
 app.add_middleware(NoCacheAuthMiddleware)
 app.add_middleware(RequestBodyLimitMiddleware)
@@ -181,9 +198,6 @@ app.add_middleware(OriginValidationMiddleware)
 # ---------------------------------------------------------------------------
 # Mount canonical /auth/* router
 # ---------------------------------------------------------------------------
-
-from routes.auth import router as auth_router
-from routes.reader import router as reader_router
 
 app.include_router(auth_router)
 app.include_router(reader_router)
@@ -673,8 +687,6 @@ def remove_bookmark(
     _csrf: None = Depends(require_csrf),
     db: Session = Depends(get_db),
 ):
-    from fastapi.responses import Response
-
     series_row = db.scalar(select(Series).where(Series.slug == path_word))
     if series_row is None:
         return Response(status_code=204)

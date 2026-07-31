@@ -12,6 +12,7 @@ import pytest
 from alembic import command
 from alembic.config import Config
 from sqlalchemy import create_engine, select, text
+from sqlalchemy.engine import make_url
 from sqlalchemy.orm import sessionmaker
 
 API_DIR = Path(__file__).resolve().parents[1]
@@ -28,8 +29,20 @@ pytestmark = pytest.mark.skipif(
 )
 
 
+def _assert_disposable_database() -> None:
+    if os.environ.get("INFINITYSCAN_DISPOSABLE_TEST") != "1":
+        raise RuntimeError("INFINITYSCAN_DISPOSABLE_TEST=1 is required for destructive session tests")
+    database = make_url(DATABASE_URL)
+    if (
+        database.host not in {"127.0.0.1", "localhost"}
+        or not (database.database or "").startswith("phase5_migrations_")
+    ):
+        raise RuntimeError("session tests require a loopback gate-owned disposable database")
+
+
 @pytest.fixture()
 def factory():
+    _assert_disposable_database()
     engine = create_engine(DATABASE_URL, pool_pre_ping=True)
     config = Config(str(API_DIR / "alembic.ini"))
     config.set_main_option("script_location", str(API_DIR / "alembic"))

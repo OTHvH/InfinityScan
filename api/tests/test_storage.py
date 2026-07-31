@@ -10,7 +10,15 @@ from typing import Any
 import pytest
 from botocore.exceptions import ClientError, EndpointConnectionError, ReadTimeoutError
 
-from storage import ObjectMetadata, ObjectPage, ObjectStorage, S3CompatibleStorage, S3StorageConfig, StorageError
+from storage import (
+    DownloadResult,
+    ObjectMetadata,
+    ObjectPage,
+    ObjectStorage,
+    S3CompatibleStorage,
+    S3StorageConfig,
+    StorageError,
+)
 
 
 def _client_error(code: str, status: int) -> ClientError:
@@ -54,8 +62,14 @@ class FakeS3Client:
 
     def get_object(self, Bucket: str, Key: str) -> dict[str, Any]:
         self.calls.append(("get_object", {"Bucket": Bucket, "Key": Key}))
-        data, _ = self.objects[Key]
-        return {"Body": io.BytesIO(data)}
+        data, args = self.objects[Key]
+        return {
+            "Body": io.BytesIO(data),
+            "ContentLength": len(data),
+            "ContentType": args.get("ContentType"),
+            "Metadata": args.get("Metadata", {}),
+            "ETag": '"fake-etag"',
+        }
 
     def delete_object(self, Bucket: str, Key: str) -> dict[str, Any]:
         self.calls.append(("delete_object", {"Bucket": Bucket, "Key": Key}))
@@ -118,6 +132,28 @@ class FakeStorage:
     def upload_bytes(self, key: str, data: bytes, mime_type: str):
         self.objects[key] = data
         return {"key": key, "byte_size": len(data), "mime_type": mime_type}
+
+    def download_file(
+        self,
+        key: str,
+        destination: str | Path,
+        *,
+        expected_sha256: str | None = None,
+        expected_size: int | None = None,
+        max_bytes: int = 1024 * 1024 * 1024,
+    ) -> DownloadResult:
+        data = self.objects[key]
+        assert len(data) <= max_bytes
+        assert expected_sha256 in (None, hashlib.sha256(data).hexdigest())
+        assert expected_size in (None, len(data))
+        Path(destination).write_bytes(data)
+        return DownloadResult(
+            key=key,
+            byte_size=len(data),
+            mime_type="application/octet-stream",
+            sha256=hashlib.sha256(data).hexdigest(),
+            etag=None,
+        )
 
     def delete_object(self, key: str) -> bool:
         self.objects.pop(key, None)
@@ -219,6 +255,100 @@ def test_verify_object_hashes_downloaded_bytes():
     assert result.verified is True
     assert result.actual_sha256 == hashlib.sha256(payload).hexdigest()
     assert result.actual_size == len(payload)
+
+
+def test_download_file_is_atomic_bounded_and_returns_verified_metadata(tmp_path: Path):
+    client = FakeS3Client()
+    storage = S3CompatibleStorage(_config(), client=client)
+    payload = b"downloaded image"
+    storage.upload_bytes("pages/download.jpg", payload, "image/jpeg")
+    destination = tmp_path / "download.jpg"
+    destination.write_bytes(b"old")
+
+    result = storage.download_file(
+        "pages/download.jpg",
+        destination,
+        expected_sha256=hashlib.sha256(payload).hexdigest(),
+        expected_size=len(payload),
+        max_bytes=len(payload),
+    )
+
+    assert destination.read_bytes() == payload
+    assert result.sha256 == hashlib.sha256(payload).hexdigest()
+    assert result.byte_size == len(payload)
+    assert result.mime_type == "image/jpeg"
+    assert result.etag == "fake-etag"
+    assert list(tmp_path.glob(".download.jpg.tmp-*")) == []
+
+
+def test_download_failure_preserves_destination_and_removes_retry_temps(tmp_path: Path):
+    client = FakeS3Client()
+    storage = S3CompatibleStorage(_config(), client=client)
+    storage.upload_bytes("pages/large.jpg", b"too large", "image/jpeg")
+    destination = tmp_path / "large.jpg"
+    destination.write_bytes(b"keep")
+
+    with pytest.raises(StorageError, match="download limit"):
+        storage.download_file("pages/large.jpg", destination, max_bytes=2)
+
+    assert destination.read_bytes() == b"keep"
+    assert list(tmp_path.glob(".large.jpg.tmp-*")) == []
+
+
+def test_download_stream_retry_restarts_atomically_and_closes_every_response(tmp_path: Path):
+    client = FakeS3Client()
+    payload = b"complete payload"
+    bodies: list[io.BytesIO] = []
+    attempts = 0
+
+    class FlakyBody(io.BytesIO):
+        def __init__(self, data: bytes, fail_after_first_chunk: bool):
+            super().__init__(data)
+            self.fail_after_first_chunk = fail_after_first_chunk
+            self.read_count = 0
+
+        def read(self, size: int = -1) -> bytes:
+            self.read_count += 1
+            if self.fail_after_first_chunk and self.read_count == 2:
+                raise ReadTimeoutError(endpoint_url="http://minio:9000")
+            if self.fail_after_first_chunk and self.read_count == 1:
+                return super().read(4)
+            return super().read(size)
+
+    def flaky_get(**_kwargs: Any):
+        nonlocal attempts
+        attempts += 1
+        body = FlakyBody(payload, fail_after_first_chunk=attempts == 1)
+        bodies.append(body)
+        return {
+            "Body": body,
+            "ContentLength": len(payload),
+            "ContentType": "image/jpeg",
+            "ETag": '"stable"',
+        }
+
+    client.get_object = flaky_get  # type: ignore[method-assign]
+    storage = S3CompatibleStorage(
+        _config(),
+        client=client,
+        sleep=lambda _delay: None,
+        random_value=lambda: 0.0,
+    )
+    destination = tmp_path / "retry.jpg"
+    destination.write_bytes(b"old")
+
+    result = storage.download_file(
+        "pages/retry-download.jpg",
+        destination,
+        expected_sha256=hashlib.sha256(payload).hexdigest(),
+        expected_size=len(payload),
+    )
+
+    assert result.etag == "stable"
+    assert destination.read_bytes() == payload
+    assert attempts == 2
+    assert all(body.closed for body in bodies)
+    assert list(tmp_path.glob(".retry.jpg.tmp-*")) == []
 
 
 def test_inventory_paginates_with_bounded_pages():

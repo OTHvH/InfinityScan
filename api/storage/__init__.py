@@ -5,6 +5,7 @@ from __future__ import annotations
 from settings import Settings, get_settings
 
 from .base import (
+    DownloadResult,
     ObjectMetadata,
     ObjectPage,
     ObjectStorage,
@@ -26,6 +27,7 @@ def create_object_storage(settings: Settings | None = None) -> ObjectStorage | N
 
 
 __all__ = [
+    "DownloadResult",
     "ObjectMetadata",
     "ObjectPage",
     "ObjectStorage",
