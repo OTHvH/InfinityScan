@@ -106,6 +106,10 @@ services:
   db:
     ports:
       - "127.0.0.1::5432"
+  minio:
+    ports: !override
+      - "0.0.0.0::9000"
+      - "0.0.0.0::9001"
 OVERRIDE
 COMPOSE=()
 compose() { "${COMPOSE[@]}" "$@"; }
@@ -307,6 +311,24 @@ export S3_SECRET_ACCESS_KEY="$MINIO_PASS"
 export S3_BUCKET=infinityscan-pages
 export S3_FORCE_PATH_STYLE=true
 
+# The API must reach MinIO through Docker's host gateway while browser tests
+# reach the same dynamically published port from the host.
+cat > "$COMPOSE_OVERRIDE" <<OVERRIDE
+services:
+  db:
+    ports:
+      - "127.0.0.1::5432"
+  minio:
+    ports: !override
+      - "0.0.0.0::9000"
+      - "0.0.0.0::9001"
+  api:
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    environment:
+      S3_ENDPOINT_URL: "http://host.docker.internal:${MINIO_HOST_PORT}"
+OVERRIDE
+
 DB_READY=false
 for _ in $(seq 1 45); do
   if compose exec -T db pg_isready -U "$DB_USER" -d "$DB_NAME" >/dev/null 2>&1; then
@@ -340,7 +362,8 @@ if [ "$MINIO_READY" = true ]; then
   if MINIO_SETUP_OUT=$(compose run --rm minio-setup 2>&1); then
     pass "INFRA-4: MinIO bucket is ready"
     run_pytest_no_skips "INFRA-4a: MinIO integration test passed without skips" \
-      env RUN_MINIO_TESTS=1 "$API_PYTHON" -m pytest api/tests/integration/test_storage_minio.py -q
+      env RUN_MINIO_TESTS=1 MINIO_TEST_ENDPOINT_URL="$S3_ENDPOINT_URL" \
+      "$API_PYTHON" -m pytest api/tests/integration/test_storage_minio.py -q
   else
     status=$?
     fail "INFRA-4: MinIO bucket setup failed (exit $status): $(short_error "$MINIO_SETUP_OUT")"

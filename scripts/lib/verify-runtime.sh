@@ -122,7 +122,7 @@ verify_runtime_port() {
   local service="$1" container_port="$2" published
   published="$("${VERIFY_COMPOSE[@]}" port "$service" "$container_port" 2>/dev/null | awk 'NR == 1 { print }')"
   case "$published" in
-    127.0.0.1:*) printf '%s\n' "${published##*:}" ;;
+    127.0.0.1:*|0.0.0.0:*|\[::\]:*) printf '%s\n' "${published##*:}" ;;
     *) return 1 ;;
   esac
 }

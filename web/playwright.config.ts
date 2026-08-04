@@ -18,7 +18,7 @@ export default defineConfig({
       use: {
         ...devices['Desktop Chrome'],
         launchOptions: process.env.PHASE3_MINIO_HOST_MAP === '1'
-          ? { args: ['--host-resolver-rules=MAP minio 127.0.0.1'] }
+          ? { args: ['--host-resolver-rules=MAP minio 127.0.0.1,MAP host.docker.internal 127.0.0.1'] }
           : undefined,
       },
     },

@@ -102,6 +102,17 @@ run_local_check() {
   fi
 }
 
+# Keep transport failures in the check result instead of letting set -e abort
+# the verifier before it can print its summary and retain diagnostics.
+http_code() {
+  local code
+  if code="$(curl "$@" 2>/dev/null)"; then
+    printf '%s' "$code"
+  else
+    printf '000'
+  fi
+}
+
 if verify_runtime_preflight; then
   pass "TOOL: verifier disk and inode preflight"
 else
@@ -304,7 +315,7 @@ if [ -n "$REG_TOKEN" ] && REG_CODE="$(curl -sS -b "$REG_JAR" -c "$REG_JAR" -D "$
     "$API_BASE/auth/register")"; then
   if [ "$REG_CODE" = 201 ]; then
     pass "CHECK-7b: registration returned 201"
-    REG_USER_ID="$(jq -r '.user.id // empty' "$REG_BODY")"
+    REG_USER_ID="$(jq -r '.user.id // empty' "$REG_BODY" 2>/dev/null || true)"
   else
     fail "CHECK-7b: registration returned $REG_CODE"
   fi
@@ -371,16 +382,24 @@ ROT_JAR="$TMPDIR/rotation.jar"
 if login_user "$REG_USER" "$REG_PASS" "$ROT_JAR"; then
   OLD_REFRESH="$(cookie_value "$ROT_JAR" is_refresh)"
   OLD_CSRF="$(cookie_value "$ROT_JAR" is_csrf)"
-  SESSION_INFO="$(db_query "SELECT id::text || '|' || family_id::text FROM refresh_sessions WHERE user_id = '$REG_USER_ID' ORDER BY created_at DESC LIMIT 1;")"
+  if SESSION_INFO="$(db_query "SELECT id::text || '|' || family_id::text FROM refresh_sessions WHERE user_id = '$REG_USER_ID' ORDER BY created_at DESC LIMIT 1;")"; then
+    :
+  else
+    SESSION_INFO=''
+  fi
   OLD_SESSION_ID="${SESSION_INFO%%|*}"
   FAMILY_ID="${SESSION_INFO#*|}"
-  REFRESH_CODE="$(curl -sS -b "$ROT_JAR" -c "$ROT_JAR" -H "X-CSRF-Token: $OLD_CSRF" -o /dev/null -w '%{http_code}' -X POST "$API_BASE/auth/refresh")"
+  REFRESH_CODE="$(http_code -sS -b "$ROT_JAR" -c "$ROT_JAR" -H "X-CSRF-Token: $OLD_CSRF" -o /dev/null -w '%{http_code}' -X POST "$API_BASE/auth/refresh")"
   if [ "$REFRESH_CODE" = 200 ]; then
     pass "CHECK-10a: refresh rotation returns 200"
   else
     fail "CHECK-10a: refresh rotation returned $REFRESH_CODE"
   fi
-  OLD_REVOKED="$(db_query "SELECT (revoked_at IS NOT NULL)::text FROM refresh_sessions WHERE id = '$OLD_SESSION_ID';")"
+  if OLD_REVOKED="$(db_query "SELECT (revoked_at IS NOT NULL)::text FROM refresh_sessions WHERE id = '$OLD_SESSION_ID';")"; then
+    :
+  else
+    OLD_REVOKED=''
+  fi
   if [ "$OLD_REVOKED" = true ] || [ "$OLD_REVOKED" = t ]; then
     pass "CHECK-10b: rotated old session is revoked in PostgreSQL"
   else
@@ -390,13 +409,17 @@ if login_user "$REG_USER" "$REG_PASS" "$ROT_JAR"; then
   NEW_CSRF="$(cookie_value "$ROT_JAR" is_csrf)"
   REUSE_JAR="$TMPDIR/reuse.jar"
   printf '# Netscape HTTP Cookie File\n127.0.0.1\tFALSE\t/\tFALSE\t0\tis_refresh\t%s\n127.0.0.1\tFALSE\t/\tFALSE\t0\tis_access\t%s\n127.0.0.1\tFALSE\t/\tFALSE\t0\tis_csrf\t%s\n' "$OLD_REFRESH" "$NEW_ACCESS" "$NEW_CSRF" > "$REUSE_JAR"
-  REUSE_CODE="$(curl -sS -b "$REUSE_JAR" -H "X-CSRF-Token: $NEW_CSRF" -o /dev/null -w '%{http_code}' -X POST "$API_BASE/auth/refresh")"
+  REUSE_CODE="$(http_code -sS -b "$REUSE_JAR" -H "X-CSRF-Token: $NEW_CSRF" -o /dev/null -w '%{http_code}' -X POST "$API_BASE/auth/refresh")"
   if [ "$REUSE_CODE" = 401 ]; then
     pass "CHECK-10c: old refresh token reuse returns exactly 401"
   else
     fail "CHECK-10c: old refresh token reuse returned $REUSE_CODE"
   fi
-  ACTIVE_FAMILY="$(db_query "SELECT count(*) FROM refresh_sessions WHERE family_id = '$FAMILY_ID' AND revoked_at IS NULL;")"
+  if ACTIVE_FAMILY="$(db_query "SELECT count(*) FROM refresh_sessions WHERE family_id = '$FAMILY_ID' AND revoked_at IS NULL;")"; then
+    :
+  else
+    ACTIVE_FAMILY='-1'
+  fi
   if [ "$ACTIVE_FAMILY" = 0 ]; then
     pass "CHECK-10d: refresh reuse revoked every active session in the family"
   else
@@ -431,7 +454,7 @@ fi
 SERIES_SLUG="verify-series-$(date +%s%N)"
 UA_CSRF="$(cookie_value "$USERA_JAR" is_csrf)"
 UA_BM_BODY="$TMPDIR/usera-bookmark.json"
-UA_BM_CODE="$(curl -sS -b "$USERA_JAR" -H "X-CSRF-Token: $UA_CSRF" -H 'Content-Type: application/json' -d "{\"series_path_word\":\"$SERIES_SLUG\",\"series_name\":\"Verifier Series\"}" -o "$UA_BM_BODY" -w '%{http_code}' -X POST "$API_BASE/bookmarks")"
+UA_BM_CODE="$(http_code -sS -b "$USERA_JAR" -H "X-CSRF-Token: $UA_CSRF" -H 'Content-Type: application/json' -d "{\"series_path_word\":\"$SERIES_SLUG\",\"series_name\":\"Verifier Series\"}" -o "$UA_BM_BODY" -w '%{http_code}' -X POST "$API_BASE/bookmarks")"
 if [ "$UA_BM_CODE" = 201 ]; then
   pass "CHECK-12a: User A bookmark creation returns documented 201"
 else
@@ -439,10 +462,10 @@ else
 fi
 UA_BOOKMARKS="$TMPDIR/usera-bookmarks.json"
 UB_BOOKMARKS="$TMPDIR/userb-bookmarks.json"
-UA_LIST_CODE="$(curl -sS -b "$USERA_JAR" -o "$UA_BOOKMARKS" -w '%{http_code}' "$API_BASE/bookmarks")"
-UB_LIST_CODE="$(curl -sS -b "$USERB_JAR" -o "$UB_BOOKMARKS" -w '%{http_code}' "$API_BASE/bookmarks")"
-UA_BM_COUNT="$(jq 'length' "$UA_BOOKMARKS")"
-UB_BM_COUNT="$(jq 'length' "$UB_BOOKMARKS")"
+UA_LIST_CODE="$(http_code -sS -b "$USERA_JAR" -o "$UA_BOOKMARKS" -w '%{http_code}' "$API_BASE/bookmarks")"
+UB_LIST_CODE="$(http_code -sS -b "$USERB_JAR" -o "$UB_BOOKMARKS" -w '%{http_code}' "$API_BASE/bookmarks")"
+UA_BM_COUNT="$(jq 'length' "$UA_BOOKMARKS" 2>/dev/null || printf '0')"
+UB_BM_COUNT="$(jq 'length' "$UB_BOOKMARKS" 2>/dev/null || printf '0')"
 if [ "$UA_LIST_CODE" = 200 ] && [ "$UA_BM_COUNT" -gt 0 ]; then
   pass "CHECK-12b: User A bookmark count is greater than zero ($UA_BM_COUNT)"
 else
@@ -454,7 +477,11 @@ else
   fail "CHECK-12c: User B bookmark isolation failed (HTTP $UB_LIST_CODE, count $UB_BM_COUNT)"
 fi
 
-SERIES_ID="$(db_query "SELECT id::text FROM series WHERE slug = '$SERIES_SLUG';")"
+if SERIES_ID="$(db_query "SELECT id::text FROM series WHERE slug = '$SERIES_SLUG';")"; then
+  :
+else
+  SERIES_ID=''
+fi
 CHAPTER_UUID="$(python3 -c 'import uuid; print(uuid.uuid4())')"
 if [ -n "$SERIES_ID" ] && db_query "INSERT INTO chapters (id, series_id, number, language) VALUES ('$CHAPTER_UUID', '$SERIES_ID', 1.0, 'en');" >/dev/null; then
   pass "CHECK-13a: seeded real Series and Chapter in PostgreSQL"
@@ -464,48 +491,56 @@ fi
 UA_PROGRESS_CSRF="$(cookie_value "$USERA_JAR" is_csrf)"
 UB_PROGRESS_CSRF="$(cookie_value "$USERB_JAR" is_csrf)"
 PROGRESS_BODY="$TMPDIR/progress.json"
-PROGRESS_CODE="$(curl -sS -b "$USERA_JAR" -H "X-CSRF-Token: $UA_PROGRESS_CSRF" -H 'Content-Type: application/json' -d "{\"chapter_uuid\":\"$CHAPTER_UUID\",\"last_page\":5,\"scroll_position\":0.5,\"completed\":false}" -o "$PROGRESS_BODY" -w '%{http_code}' -X POST "$API_BASE/progress/$SERIES_SLUG/$CHAPTER_UUID")"
+PROGRESS_CODE="$(http_code -sS -b "$USERA_JAR" -H "X-CSRF-Token: $UA_PROGRESS_CSRF" -H 'Content-Type: application/json' -d "{\"chapter_uuid\":\"$CHAPTER_UUID\",\"last_page\":5,\"scroll_position\":0.5,\"completed\":false}" -o "$PROGRESS_BODY" -w '%{http_code}' -X POST "$API_BASE/progress/$SERIES_SLUG/$CHAPTER_UUID")"
 if [ "$PROGRESS_CODE" = 200 ]; then
   pass "CHECK-13b: User A saved valid progress"
 else
   fail "CHECK-13b: User A progress save returned $PROGRESS_CODE"
 fi
 UA_PROGRESS_GET="$TMPDIR/usera-progress.json"
-UA_PROGRESS_GET_CODE="$(curl -sS -b "$USERA_JAR" -o "$UA_PROGRESS_GET" -w '%{http_code}' "$API_BASE/progress/$SERIES_SLUG/$CHAPTER_UUID")"
-if [ "$UA_PROGRESS_GET_CODE" = 200 ] && [ "$(jq -r '.scroll_position' "$UA_PROGRESS_GET")" = 0.5 ]; then
+UA_PROGRESS_GET_CODE="$(http_code -sS -b "$USERA_JAR" -o "$UA_PROGRESS_GET" -w '%{http_code}' "$API_BASE/progress/$SERIES_SLUG/$CHAPTER_UUID")"
+UA_SCROLL_POSITION="$(jq -r '.scroll_position // empty' "$UA_PROGRESS_GET" 2>/dev/null || true)"
+if [ "$UA_PROGRESS_GET_CODE" = 200 ] && [ "$UA_SCROLL_POSITION" = 0.5 ]; then
   pass "CHECK-13c: User A reads saved progress successfully"
 else
   fail "CHECK-13c: User A could not read saved progress"
 fi
 UB_PROGRESS_GET="$TMPDIR/userb-progress.json"
-UB_PROGRESS_GET_CODE="$(curl -sS -b "$USERB_JAR" -o "$UB_PROGRESS_GET" -w '%{http_code}' "$API_BASE/progress/$SERIES_SLUG/$CHAPTER_UUID")"
-if [ "$UB_PROGRESS_GET_CODE" = 200 ] && [ "$(jq -r '.scroll_position' "$UB_PROGRESS_GET")" = null ]; then
+UB_PROGRESS_GET_CODE="$(http_code -sS -b "$USERB_JAR" -o "$UB_PROGRESS_GET" -w '%{http_code}' "$API_BASE/progress/$SERIES_SLUG/$CHAPTER_UUID")"
+UB_SCROLL_POSITION="$(jq -r '.scroll_position // empty' "$UB_PROGRESS_GET" 2>/dev/null || true)"
+if [ "$UB_PROGRESS_GET_CODE" = 200 ] && [ -z "$UB_SCROLL_POSITION" ]; then
   pass "CHECK-13d: User B cannot see User A progress"
 else
   fail "CHECK-13d: User B can see User A progress"
 fi
-UB_PROGRESS_CODE="$(curl -sS -b "$USERB_JAR" -H "X-CSRF-Token: $UB_PROGRESS_CSRF" -H 'Content-Type: application/json' -d "{\"chapter_uuid\":\"$CHAPTER_UUID\",\"last_page\":9,\"scroll_position\":0.9,\"completed\":true}" -o /dev/null -w '%{http_code}' -X POST "$API_BASE/progress/$SERIES_SLUG/$CHAPTER_UUID")"
+UB_PROGRESS_CODE="$(http_code -sS -b "$USERB_JAR" -H "X-CSRF-Token: $UB_PROGRESS_CSRF" -H 'Content-Type: application/json' -d "{\"chapter_uuid\":\"$CHAPTER_UUID\",\"last_page\":9,\"scroll_position\":0.9,\"completed\":true}" -o /dev/null -w '%{http_code}' -X POST "$API_BASE/progress/$SERIES_SLUG/$CHAPTER_UUID")"
 UA_PROGRESS_AFTER="$TMPDIR/usera-progress-after.json"
-curl -sS -b "$USERA_JAR" -o "$UA_PROGRESS_AFTER" "$API_BASE/progress/$SERIES_SLUG/$CHAPTER_UUID" >/dev/null
-if [ "$UB_PROGRESS_CODE" = 200 ] && [ "$(jq -r '.scroll_position' "$UA_PROGRESS_AFTER")" = 0.5 ]; then
+UA_PROGRESS_AFTER_STATUS=0
+if curl -sS -b "$USERA_JAR" -o "$UA_PROGRESS_AFTER" "$API_BASE/progress/$SERIES_SLUG/$CHAPTER_UUID" >/dev/null 2>&1; then
+  :
+else
+  UA_PROGRESS_AFTER_STATUS=$?
+fi
+UA_PROGRESS_AFTER_POSITION="$(jq -r '.scroll_position // empty' "$UA_PROGRESS_AFTER" 2>/dev/null || true)"
+if [ "$UB_PROGRESS_CODE" = 200 ] && [ "$UA_PROGRESS_AFTER_STATUS" -eq 0 ] && [ "$UA_PROGRESS_AFTER_POSITION" = 0.5 ]; then
   pass "CHECK-13e: User B cannot overwrite User A progress"
 else
   fail "CHECK-13e: User B progress mutation affected User A"
 fi
 
-SERIES_CODE="$(curl -sS -o "$TMPDIR/series.json" -w '%{http_code}' "$API_BASE/series")"
+SERIES_CODE="$(http_code -sS -o "$TMPDIR/series.json" -w '%{http_code}' "$API_BASE/series")"
 if [ "$SERIES_CODE" = 200 ]; then
   pass "CHECK-14: public GET /series without search query returns 200"
 else
   fail "CHECK-14: public GET /series returned $SERIES_CODE"
 fi
 ROOT_HTML="$TMPDIR/root.html"
-ROOT_CODE="$(curl -sS -o "$ROOT_HTML" -w '%{http_code}' "$WEB_BASE")"
-ASSET_URL="$(grep -oE '/_next/static/[^" ]+\.(js|css)(\?[^" ]*)?' "$ROOT_HTML" | sed -n '1p')"
+ROOT_CODE="$(http_code -sS -o "$ROOT_HTML" -w '%{http_code}' "$WEB_BASE")"
+ASSET_URL="$(grep -oE '/_next/static/[^" ]+\.(js|css)(\?[^" ]*)?' "$ROOT_HTML" | sed -n '1p' || true)"
 if [ -z "$ASSET_URL" ]; then
   fail "CHECK-15a: no concrete /_next/static asset URL found in returned HTML"
 else
-  ASSET_CODE="$(curl -sS -o /dev/null -w '%{http_code}' "$WEB_BASE$ASSET_URL")"
+  ASSET_CODE="$(http_code -sS -o /dev/null -w '%{http_code}' "$WEB_BASE$ASSET_URL")"
   if [ "$ASSET_CODE" = 200 ]; then
     pass "CHECK-15a: concrete static asset returns 200"
   else
@@ -519,8 +554,9 @@ else
 fi
 
 USERA_ME="$TMPDIR/usera-me.json"
-SPOOF_CODE="$(curl -sS -b "$USERA_JAR" -H 'X-User-ID: 00000000-0000-0000-0000-000000000000' -o "$USERA_ME" -w '%{http_code}' "$API_BASE/auth/me")"
-if [ "$SPOOF_CODE" = 200 ] && [ "$(jq -r '.username' "$USERA_ME")" = "$REG_USER" ]; then
+SPOOF_CODE="$(http_code -sS -b "$USERA_JAR" -H 'X-User-ID: 00000000-0000-0000-0000-000000000000' -o "$USERA_ME" -w '%{http_code}' "$API_BASE/auth/me")"
+SPOOF_USERNAME="$(jq -r '.username // empty' "$USERA_ME" 2>/dev/null || true)"
+if [ "$SPOOF_CODE" = 200 ] && [ "$SPOOF_USERNAME" = "$REG_USER" ]; then
   pass "CHECK-16: identity spoof header cannot change authenticated user"
 else
   fail "CHECK-16: identity spoof test returned unexpected identity/status"
@@ -541,7 +577,7 @@ RATE_CSRF="$(cookie_value "$USERA_JAR" is_csrf)"
 RATE_429=false
 RATE_INVALID=false
 for i in $(seq 1 40); do
-  RATE_CODE="$(curl -sS -b "$USERA_JAR" -H "X-CSRF-Token: $RATE_CSRF" -H 'Content-Type: application/json' -d "{\"series_path_word\":\"rate-series-$i-$(date +%s%N)\",\"series_name\":\"Rate Series\"}" -o /dev/null -w '%{http_code}' -X POST "$API_BASE/bookmarks")"
+  RATE_CODE="$(http_code -sS -b "$USERA_JAR" -H "X-CSRF-Token: $RATE_CSRF" -H 'Content-Type: application/json' -d "{\"series_path_word\":\"rate-series-$i-$(date +%s%N)\",\"series_name\":\"Rate Series\"}" -o /dev/null -w '%{http_code}' -X POST "$API_BASE/bookmarks")"
   if [ "$RATE_CODE" = 429 ]; then
     RATE_429=true
     break
@@ -584,7 +620,7 @@ else
   fail "CHECK-18: production cookie security check failed"
 fi
 
-ORIGIN_CODE="$(curl -sS -b "$USERA_JAR" -H 'Origin: https://evil.example.com' -H 'Content-Type: application/json' -d '{}' -o /dev/null -w '%{http_code}' -X POST "$API_BASE/auth/logout")"
+ORIGIN_CODE="$(http_code -sS -b "$USERA_JAR" -H 'Origin: https://evil.example.com' -H 'Content-Type: application/json' -d '{}' -o /dev/null -w '%{http_code}' -X POST "$API_BASE/auth/logout")"
 if [ "$ORIGIN_CODE" = 403 ]; then
   pass "CHECK-19: untrusted Origin is rejected with 403"
 else

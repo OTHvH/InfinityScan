@@ -5,8 +5,8 @@ const require = createRequire(import.meta.url);
 const packagePath = require.resolve("brace-expansion/package.json");
 const packageMetadata = JSON.parse(readFileSync(packagePath, "utf8"));
 
-if (packageMetadata.version !== "5.0.8") {
-  throw new Error(`Expected brace-expansion 5.0.8, found ${packageMetadata.version}`);
+if (packageMetadata.version !== "5.0.9") {
+  throw new Error(`Expected brace-expansion 5.0.9, found ${packageMetadata.version}`);
 }
 
 const commonJsPath = require.resolve("brace-expansion");
