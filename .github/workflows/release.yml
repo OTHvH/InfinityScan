@@ -3,7 +3,7 @@ name: Full Release Verification
 on:
   workflow_dispatch:
   push:
-    branches: [phase-5-integrity-security-testing]
+    branches: [phase-6-production-deployment]
 
 permissions:
   contents: read

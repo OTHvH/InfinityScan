@@ -56,3 +56,18 @@ def test_mutable_dockerfile_base_is_rejected() -> None:
 def test_mutable_compose_image_is_rejected() -> None:
     with pytest.raises(CHECKER.PolicyError, match="not digest-pinned"):
         CHECKER.validate_compose(FIXTURES / "mutable-compose.fixture")
+
+
+def test_publication_workflow_has_trusted_permissions_and_no_pr_trigger() -> None:
+    workflow = Path(__file__).resolve().parents[2] / ".github" / "workflows" / "publish-images.yml"
+    CHECKER.validate_workflow(workflow)
+    data = CHECKER.load_yaml(workflow)
+    assert "pull_request" not in CHECKER._trigger_names(data["on"], workflow)
+    assert data["jobs"]["publish"]["permissions"] == {
+        "contents": "read",
+        "packages": "write",
+        "id-token": "write",
+        "attestations": "write",
+    }
+    assert data["jobs"]["publish"]["environment"] == "image-publication"
+    assert data["jobs"]["publish"]["needs"] == "verify"

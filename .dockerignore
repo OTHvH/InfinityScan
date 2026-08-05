@@ -1,0 +1,32 @@
+# Repository-level contexts are not used for production images, but keep any
+# accidental root-context build free of credentials and local state.
+.git/
+.env
+.env.*
+**/.env
+**/.env.*
+node_modules/
+.next/
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+backups/
+backup/
+reports/
+test-reports/
+screenshots/
+playwright-report/
+test-results/
+traces/
+*.trace.zip
+age-keys/
+*.age
+*.db
+*.sqlite
+*.sqlite3
+mangas/
+manga/
+comics/
+content/
+local_imports/

@@ -1,0 +1,87 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://infinityscan.example/schemas/release-manifest.schema.json",
+  "title": "InfinityScan immutable image release manifest",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "release_id",
+    "git_sha",
+    "repository",
+    "created_at",
+    "lock_hashes",
+    "images"
+  ],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "release_id": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+    },
+    "git_sha": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$"
+    },
+    "repository": {
+      "type": "string",
+      "pattern": "^[^/\\s]+/[^/\\s]+$"
+    },
+    "created_at": { "type": "string", "format": "date-time" },
+    "lock_hashes": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["api/requirements.txt", "web/package-lock.json"],
+      "properties": {
+        "api/requirements.txt": { "$ref": "#/$defs/sha256" },
+        "web/package-lock.json": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "images": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["api", "web"],
+      "properties": {
+        "api": { "$ref": "#/$defs/image" },
+        "web": { "$ref": "#/$defs/image" }
+      }
+    }
+  },
+  "$defs": {
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "image": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["repository", "digest", "reference", "platforms", "dockerfile"],
+      "properties": {
+        "repository": {
+          "type": "string",
+          "pattern": "^ghcr\\.io/[^/@\\s]+/[^/@\\s]+$"
+        },
+        "digest": { "$ref": "#/$defs/sha256" },
+        "reference": {
+          "type": "string",
+          "pattern": "^ghcr\\.io/[^/@\\s]+/[^/@\\s]+@sha256:[0-9a-f]{64}$"
+        },
+        "platforms": {
+          "type": "array",
+          "prefixItems": [
+            { "const": "linux/amd64" },
+            { "const": "linux/arm64" }
+          ],
+          "items": { "enum": ["linux/amd64", "linux/arm64"] },
+          "minItems": 2,
+          "maxItems": 2,
+          "uniqueItems": true
+        },
+        "dockerfile": {
+          "type": "string",
+          "enum": ["api/Dockerfile", "web/Dockerfile"]
+        }
+      }
+    }
+  }
+}

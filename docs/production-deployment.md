@@ -82,3 +82,13 @@ Initial VM deployment can therefore use ARM64 while staging may use AMD64.
 Resource limits are conservative for a small VM and can be tuned in
 `docker-compose.production.yml` after observing health, reader, and recovery
 workloads.
+
+The immutable publication workflow produces `release-manifest.json`. Operators
+may supply that exact artifact instead of copying image values by hand:
+
+```bash
+RELEASE_MANIFEST_FILE=/path/to/release-manifest.json \
+scripts/deploy-production.sh <release-id>
+```
+
+The manifest is validated before its API and web digest references are used.

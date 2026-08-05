@@ -54,3 +54,19 @@ npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
 pnpm-debug.log*
+
+# Release and test artifacts
+backups/
+backup/
+reports/
+test-reports/
+screenshots/
+playwright-report/
+test-results/
+traces/
+*.trace.zip
+age-keys/
+*.age
+e2e/
+tests/
+__tests__/

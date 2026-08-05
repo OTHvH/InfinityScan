@@ -9,6 +9,7 @@ RELEASE_ID="${1:-}"
 API_IMAGE="${API_IMAGE:-}"
 WEB_IMAGE="${WEB_IMAGE:-}"
 CADDY_IMAGE="${CADDY_IMAGE:-}"
+RELEASE_MANIFEST_FILE="${RELEASE_MANIFEST_FILE:-}"
 ENV_FILE="${PRODUCTION_ENV_FILE:-/etc/infinityscan/production.env}"
 SECRET_DIR="${PRODUCTION_SECRET_DIR:-/etc/infinityscan/secrets}"
 DEPLOY_DIR="${DEPLOYMENT_DIR:-/opt/infinityscan}"
@@ -19,13 +20,29 @@ DRY_RUN="${DRY_RUN:-false}"
 BACKUP_METADATA_FILE="${BACKUP_METADATA_FILE:-}"
 BACKUP_MAX_AGE_SECONDS="${BACKUP_MAX_AGE_SECONDS:-86400}"
 
-[[ -n "$RELEASE_ID" && "$RELEASE_ID" != *"/"* && "$RELEASE_ID" != *".."* ]] || production_die "a safe release ID is required"
 production_require_linux
 production_require_command docker
 production_require_command python3
 production_require_command flock
 [[ -f "$ENV_FILE" ]] || production_die "production environment file is missing"
 [[ "$(production_env_value APP_ENV "$ENV_FILE")" == production ]] || production_die "APP_ENV must be production"
+if [[ -n "$RELEASE_MANIFEST_FILE" ]]; then
+  [[ -f "$RELEASE_MANIFEST_FILE" ]] || production_die "release manifest is missing"
+  read -r manifest_release manifest_api manifest_web < <(
+    python3 "$ROOT_DIR/scripts/validate-release-manifest.py" "$RELEASE_MANIFEST_FILE" >/dev/null
+    python3 - "$RELEASE_MANIFEST_FILE" <<'PY'
+import json
+import sys
+
+manifest = json.load(open(sys.argv[1], encoding="utf-8"))
+print(manifest["release_id"], manifest["images"]["api"]["reference"], manifest["images"]["web"]["reference"])
+PY
+  )
+  RELEASE_ID="${RELEASE_ID:-$manifest_release}"
+  API_IMAGE="${API_IMAGE:-$manifest_api}"
+  WEB_IMAGE="${WEB_IMAGE:-$manifest_web}"
+fi
+[[ -n "$RELEASE_ID" && "$RELEASE_ID" != *"/"* && "$RELEASE_ID" != *".."* ]] || production_die "a safe release ID is required"
 API_IMAGE="${API_IMAGE:-$(production_env_value API_IMAGE "$ENV_FILE")}"; WEB_IMAGE="${WEB_IMAGE:-$(production_env_value WEB_IMAGE "$ENV_FILE")}";
 CADDY_IMAGE="${CADDY_IMAGE:-$(production_env_value CADDY_IMAGE "$ENV_FILE")}";
 production_validate_digest API_IMAGE "$API_IMAGE"

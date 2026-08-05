@@ -17,6 +17,7 @@ from yaml.nodes import MappingNode
 ROOT = Path(__file__).resolve().parents[1]
 SHA_REF = re.compile(r"^[0-9a-f]{40}$")
 SHA256_REF = re.compile(r"^[0-9a-f]{64}$")
+COMPOSE_IMAGE_VAR = re.compile(r"^\$\{(?:API|WEB|CADDY)_IMAGE(?::\?[^}]*)?\}$")
 YAML12_BOOL = re.compile(r"^(?:true|false)$", re.IGNORECASE)
 COMPOSE_NAME = re.compile(r"^(?:docker-)?compose(?:\.[^.]+)?\.ya?ml$")
 DOCKER_FROM = re.compile(
@@ -32,6 +33,14 @@ REQUIRED_DEPENDABOT = {
     ("docker", "/web"),
     ("docker", "/infra"),
 }
+PUBLISH_WORKFLOW = "publish-images.yml"
+PUBLISH_JOB_PERMISSIONS = {
+    "contents": "read",
+    "packages": "write",
+    "id-token": "write",
+    "attestations": "write",
+}
+PUBLISH_VERIFY_PERMISSIONS = {"contents": "read", "actions": "read"}
 
 
 class PolicyError(ValueError):
@@ -151,17 +160,34 @@ def _validate_top_permissions(value: Any, path: Path) -> None:
         raise PolicyError(f"{path}: write-all permissions are forbidden")
     if not isinstance(value, Mapping):
         raise PolicyError(f"{path}: top-level permissions must be a mapping")
+    if path.name == PUBLISH_WORKFLOW:
+        if dict(value) != {"contents": "read"}:
+            raise PolicyError(
+                f"{path}: publication workflow top-level permissions must be exactly contents: read"
+            )
+        return
     if dict(value) != {"contents": "read"}:
         raise PolicyError(f"{path}: top-level permissions must be exactly contents: read")
 
 
-def _validate_job_permissions(value: Any, location: str, *, codeql: bool) -> None:
+def _validate_job_permissions(
+    value: Any,
+    location: str,
+    *,
+    codeql: bool,
+    publication_job: bool = False,
+    publication_verify: bool = False,
+) -> None:
     if value is None:
         return
     if value == "write-all":
         raise PolicyError(f"{location}: write-all permissions are forbidden")
     if not isinstance(value, Mapping):
         raise PolicyError(f"{location}: job permissions must be a mapping")
+    if publication_job and dict(value) != PUBLISH_JOB_PERMISSIONS:
+        raise PolicyError(f"{location}: publication permissions are broader or narrower than policy")
+    if publication_verify and dict(value) != PUBLISH_VERIFY_PERMISSIONS:
+        raise PolicyError(f"{location}: verification permissions are broader or narrower than policy")
     for scope, level in value.items():
         if (
             not isinstance(scope, str)
@@ -172,6 +198,8 @@ def _validate_job_permissions(value: Any, location: str, *, codeql: bool) -> Non
         if level == "none" or (scope == "contents" and level == "read"):
             continue
         if codeql and scope == "security-events" and level == "write":
+            continue
+        if publication_job or publication_verify:
             continue
         raise PolicyError(f"{location}: job-level privilege escalation {scope}: {level}")
 
@@ -202,6 +230,11 @@ def validate_workflow(path: Path) -> None:
     if "pull_request_target" in triggers:
         raise PolicyError(f"{path}: pull_request_target is forbidden")
     _validate_top_permissions(data.get("permissions"), path)
+    publication_workflow = path.name == PUBLISH_WORKFLOW
+    if publication_workflow and "workflow_dispatch" not in triggers:
+        raise PolicyError(f"{path}: publication workflow must support workflow_dispatch")
+    if publication_workflow and ({"pull_request", "pull_request_target"} & triggers):
+        raise PolicyError(f"{path}: publication workflow must not run for pull requests")
 
     jobs = data.get("jobs")
     if not isinstance(jobs, Mapping) or not jobs:
@@ -218,6 +251,11 @@ def validate_workflow(path: Path) -> None:
         location = f"{path}: job {job_name}"
         if not isinstance(job, Mapping):
             raise PolicyError(f"{location} is not a mapping")
+        if publication_workflow and job_name == "publish":
+            if job.get("environment") != "image-publication":
+                raise PolicyError(f"{location}: protected publication environment is required")
+            if job.get("needs") != "verify":
+                raise PolicyError(f"{location}: publication must depend on the verification job")
         if pull_request and job.get("secrets") == "inherit":
             raise PolicyError(f"{location}: secrets: inherit is unsafe for pull requests")
 
@@ -241,7 +279,13 @@ def validate_workflow(path: Path) -> None:
             and str(step.get("uses", "")).startswith("github/codeql-action/analyze@")
             for step in steps
         )
-        _validate_job_permissions(job.get("permissions"), location, codeql=codeql)
+        _validate_job_permissions(
+            job.get("permissions"),
+            location,
+            codeql=codeql,
+            publication_job=publication_workflow and job_name == "publish",
+            publication_verify=publication_workflow and job_name == "verify",
+        )
         _validate_workflow_containers(job, location)
 
 
@@ -305,7 +349,14 @@ def validate_compose(path: Path) -> None:
         if not isinstance(service, Mapping):
             raise PolicyError(f"{path}: Compose service {service_name!r} is invalid")
         if "image" in service:
-            _validate_image(service["image"], f"{path}: service {service_name}")
+            image = service["image"]
+            if (
+                path.name == "docker-compose.production.yml"
+                and isinstance(image, str)
+                and COMPOSE_IMAGE_VAR.fullmatch(image)
+            ):
+                continue
+            _validate_image(image, f"{path}: service {service_name}")
 
 
 def validate_repository(root: Path = ROOT) -> tuple[int, int]:

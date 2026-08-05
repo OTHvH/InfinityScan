@@ -54,3 +54,21 @@ local_imports/
 
 # Logs
 *.log
+
+# Release and test artifacts
+backups/
+backup/
+reports/
+test-reports/
+screenshots/
+playwright-report/
+test-results/
+traces/
+*.trace.zip
+age-keys/
+*.age
+tests/
+tests_*/
+test_*.py
+conftest.py
+scripts/
