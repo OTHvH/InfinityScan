@@ -36,6 +36,56 @@ export function resolveApiInternalUrl(
   return canonicalOrigin;
 }
 
+export function resolveMediaCspOrigins(value: string | undefined): string[] {
+  const developmentDefaults = [
+    "http://host.docker.internal:*",
+    "http://127.0.0.1:*",
+    "http://localhost:*",
+  ];
+  const origins = (value?.trim() || (process.env.APP_ENV === "development" ? developmentDefaults.join(",") : ""))
+    .split(",")
+    .map((origin) => origin.trim())
+    .filter(Boolean);
+  const localHttpOrigin = /^http:\/\/(?:localhost|127(?:\.\d{1,3}){3}|host\.docker\.internal)(?::\*)?$/;
+  for (const origin of origins) {
+    if (localHttpOrigin.test(origin)) continue;
+    let parsed: URL;
+    try {
+      parsed = new URL(origin);
+    } catch {
+      throw new Error("MEDIA_CSP_ORIGINS must contain exact HTTPS origins");
+    }
+    if (
+      parsed.protocol !== "https:"
+      || !parsed.hostname
+      || parsed.username
+      || parsed.password
+      || parsed.pathname !== "/"
+      || parsed.search
+      || parsed.hash
+      || parsed.hostname.includes("*")
+      || /[\s;'"<>]/.test(origin)
+    ) {
+      throw new Error("MEDIA_CSP_ORIGINS must contain exact HTTPS origins");
+    }
+  }
+  return origins.map((origin) => origin.endsWith("/") ? origin.slice(0, -1) : origin);
+}
+
+const mediaCspOrigins = resolveMediaCspOrigins(process.env.MEDIA_CSP_ORIGINS);
+const contentSecurityPolicy = [
+  "default-src 'self'",
+  "base-uri 'self'",
+  "object-src 'none'",
+  "frame-ancestors 'none'",
+  "form-action 'self'",
+  "script-src 'self' 'unsafe-inline'",
+  "style-src 'self' 'unsafe-inline'",
+  "font-src 'self' data:",
+  `img-src 'self' data: blob: ${mediaCspOrigins.join(" ")}`,
+  "connect-src 'self'",
+].join("; ");
+
 const nextConfig: NextConfig = {
   output: "standalone",
   reactCompiler: true,
@@ -44,6 +94,19 @@ const nextConfig: NextConfig = {
       {
         source: "/api/:path*",
         destination: `${resolveApiInternalUrl(process.env.API_INTERNAL_URL, process.env.NODE_ENV)}/:path*`,
+      },
+    ];
+  },
+  async headers() {
+    return [
+      {
+        source: "/(.*)",
+        headers: [
+          { key: "Content-Security-Policy", value: contentSecurityPolicy },
+          { key: "X-Content-Type-Options", value: "nosniff" },
+          { key: "Referrer-Policy", value: "strict-origin-when-cross-origin" },
+          { key: "Permissions-Policy", value: "camera=(), geolocation=(), microphone=(), payment=()" },
+        ],
       },
     ];
   },

@@ -1,0 +1,46 @@
+{
+	admin localhost:2019
+	http_port 8080
+	https_port 8443
+}
+
+http://{$APP_DOMAIN} {
+	redir https://{$APP_DOMAIN}{uri} permanent
+}
+
+{$APP_DOMAIN} {
+	encode gzip zstd
+
+	request_body {
+		max_size 1MB
+	}
+
+	header {
+		X-Content-Type-Options nosniff
+		Referrer-Policy strict-origin-when-cross-origin
+		Permissions-Policy "camera=(), geolocation=(), microphone=(), payment=()"
+	}
+
+	log {
+		output stdout
+		format filter {
+			request>headers.Authorization delete
+			request>headers.Cookie delete
+			request>headers.Set-Cookie delete
+			request>uri query delete
+		}
+	}
+
+	reverse_proxy {$CADDY_UPSTREAM} {
+		transport http {
+			dial_timeout 5s
+			response_header_timeout 30s
+			read_timeout 60s
+			write_timeout 30s
+		}
+		header_up -X-Forwarded-For
+		header_up X-Forwarded-For {http.request.remote.host}
+		header_up X-Forwarded-Proto {http.request.scheme}
+		header_up X-Forwarded-Host {http.request.host}
+	}
+}

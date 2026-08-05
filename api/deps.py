@@ -59,6 +59,7 @@ from auth import (
     validate_csrf_token,
 )
 from database import get_db
+from request_context import user_id_context
 from models import RefreshSession, User
 from settings import get_settings
 
@@ -176,6 +177,11 @@ def get_current_user(
     if not user.is_active:
         raise HTTPException(status_code=403, detail="User account is disabled")
 
+    # The dependency runs inside Starlette's request task. The context is
+    # scoped to that task and must not be reset by an outer middleware task.
+    request.state.user_id = str(user.id)
+    user_id_context.set(str(user.id))
+
     return user
 
 
@@ -229,6 +235,8 @@ def get_optional_user(
     if user is None or not user.is_active:
         return None
 
+    request.state.user_id = str(user.id)
+    user_id_context.set(str(user.id))
     return user
 
 

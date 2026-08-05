@@ -593,11 +593,14 @@ fi
 
 if (cd api && env \
     APP_ENV=production \
-    DATABASE_URL=postgresql+psycopg://verifier:unused@localhost/verifier \
+    DATABASE_URL=postgresql+psycopg://verifier:unused@db.example/verifier?sslmode=require \
     CSRF_SECRET_KEY=prod-csrf-secret-012345678901234567890123456789 \
     JWT_SECRET_KEY=prod-jwt-secret-012345678901234567890123456789 \
     COOKIE_SECURE=true COOKIE_SAME_SITE=lax \
     TRUSTED_HOSTS=localhost ALLOWED_ORIGINS=https://app.example CORS_ORIGINS= \
+    OBJECT_STORAGE_ENABLED=true S3_ENDPOINT_URL=https://objects.example \
+    S3_REGION=auto S3_BUCKET=verify-bucket S3_ACCESS_KEY_ID=verify-access \
+    S3_SECRET_ACCESS_KEY=verify-secret \
     "$API_PYTHON" - <<'PY'
 import uuid
 

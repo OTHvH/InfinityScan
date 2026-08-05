@@ -15,10 +15,14 @@ from __future__ import annotations
 
 import os
 import secrets
+import ipaddress
 from dataclasses import dataclass, field
+from urllib.parse import urlsplit
 
 from sqlalchemy.engine import make_url
 from sqlalchemy.exc import ArgumentError
+
+from runtime_secrets import runtime_value
 
 
 def _bool(name: str, default: bool = False) -> bool:
@@ -42,9 +46,61 @@ def _float(name: str, default: float) -> float:
     return float(os.environ.get(name, str(default)))
 
 
+def _int(name: str, default: int) -> int:
+    return int(os.environ.get(name, str(default)))
+
+
+def _database_query_value(name: str) -> str | None:
+    raw_url = runtime_value("DATABASE_URL") or ""
+    if not raw_url:
+        return None
+    try:
+        value = make_url(raw_url).query.get(name)
+    except (ArgumentError, TypeError, ValueError):
+        return None
+    if isinstance(value, tuple):
+        return str(value[0]) if value else None
+    return str(value) if value is not None else None
+
+
+def _db_sslmode() -> str:
+    configured = os.environ.get("DB_SSLMODE") or _database_query_value("sslmode")
+    if configured:
+        return configured.strip().lower()
+    return "require" if os.environ.get("APP_ENV", "development") == "production" else "prefer"
+
+
+def _validate_endpoint_url(name: str, value: str, *, require_https: bool) -> None:
+    parsed = urlsplit(value)
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        raise ValueError(f"{name} must be an absolute HTTP(S) URL")
+    if parsed.username or parsed.password or parsed.query or parsed.fragment:
+        raise ValueError(f"{name} must not contain credentials, query, or fragment")
+    if require_https and parsed.scheme != "https":
+        raise ValueError(f"{name} must use HTTPS in production")
+    if require_https:
+        host = parsed.hostname.lower().rstrip(".")
+        if host in {
+            "localhost",
+            "minio",
+            "host.docker.internal",
+            "gateway.docker.internal",
+            "docker.for.mac.localhost",
+            "127.0.0.1",
+            "::1",
+        }:
+            raise ValueError(f"{name} must not use a local endpoint in production")
+        try:
+            address = ipaddress.ip_address(host)
+        except ValueError:
+            address = None
+        if address is not None and (address.is_private or address.is_loopback or address.is_link_local or address.is_reserved or address.is_unspecified):
+            raise ValueError(f"{name} must not use a private endpoint in production")
+
+
 def _secret(name: str, *aliases: str) -> str:
     for variable in (name, *aliases):
-        value = os.environ.get(variable)
+        value = runtime_value(variable)
         if value:
             return value
     if os.environ.get("APP_ENV", "development") == "development":
@@ -63,7 +119,26 @@ class Settings:
 
     # ── Database ────────────────────────────────────────────────────────
     database_url: str = field(
-        default_factory=lambda: os.environ.get("DATABASE_URL", ""), repr=False
+        default_factory=lambda: runtime_value("DATABASE_URL") or "", repr=False
+    )
+    db_pool_size: int = field(default_factory=lambda: _int("DB_POOL_SIZE", 5))
+    db_max_overflow: int = field(default_factory=lambda: _int("DB_MAX_OVERFLOW", 5))
+    db_pool_timeout_seconds: float = field(
+        default_factory=lambda: _float("DB_POOL_TIMEOUT_SECONDS", 10.0)
+    )
+    db_pool_recycle_seconds: int = field(
+        default_factory=lambda: _int("DB_POOL_RECYCLE_SECONDS", 1800)
+    )
+    db_connect_timeout_seconds: int = field(
+        default_factory=lambda: _int("DB_CONNECT_TIMEOUT_SECONDS", 10)
+    )
+    db_statement_timeout_ms: int = field(
+        default_factory=lambda: _int("DB_STATEMENT_TIMEOUT_MS", 30000)
+    )
+    db_sslmode: str = field(default_factory=_db_sslmode)
+    db_sslrootcert: str | None = field(
+        default_factory=lambda: os.environ.get("DB_SSLROOTCERT") or None,
+        repr=False,
     )
 
     # ── JWT / Sessions ──────────────────────────────────────────────────
@@ -146,6 +221,18 @@ class Settings:
     trusted_hosts: list[str] = field(
         default_factory=lambda: _csv("TRUSTED_HOSTS", "localhost,127.0.0.1")
     )
+    trusted_proxy_cidrs: list[str] = field(
+        default_factory=lambda: _csv("TRUSTED_PROXY_CIDRS")
+    )
+    trust_forwarded_headers: bool = field(
+        default_factory=lambda: _bool("TRUST_FORWARDED_HEADERS", False)
+    )
+    forwarded_header_max_length: int = field(
+        default_factory=lambda: _int("FORWARDED_HEADER_MAX_LENGTH", 2048)
+    )
+    forwarded_max_hops: int = field(
+        default_factory=lambda: _int("FORWARDED_MAX_HOPS", 5)
+    )
 
     # ── Request body limit ──────────────────────────────────────────────
     max_body_bytes: int = field(
@@ -206,10 +293,10 @@ class Settings:
     s3_region: str = field(default_factory=lambda: os.environ.get("S3_REGION", "auto"))
     s3_bucket: str = field(default_factory=lambda: os.environ.get("S3_BUCKET", ""))
     s3_access_key_id: str = field(
-        default_factory=lambda: os.environ.get("S3_ACCESS_KEY_ID", ""), repr=False
+        default_factory=lambda: runtime_value("S3_ACCESS_KEY_ID") or "", repr=False
     )
     s3_secret_access_key: str = field(
-        default_factory=lambda: os.environ.get("S3_SECRET_ACCESS_KEY", ""), repr=False
+        default_factory=lambda: runtime_value("S3_SECRET_ACCESS_KEY") or "", repr=False
     )
     s3_presign_ttl_seconds: int = field(
         default_factory=lambda: int(os.environ.get("S3_PRESIGN_TTL_SECONDS", "300"))
@@ -274,6 +361,15 @@ class Settings:
 
     # ── Logging ─────────────────────────────────────────────────────────
     log_level: str = field(default_factory=lambda: os.environ.get("LOG_LEVEL", "INFO"))
+    log_format: str = field(
+        default_factory=lambda: os.environ.get(
+            "LOG_FORMAT",
+            "json" if os.environ.get("APP_ENV", "development") == "production" else "text",
+        )
+    )
+    readiness_cache_seconds: float = field(
+        default_factory=lambda: _float("READINESS_CACHE_SECONDS", 5.0)
+    )
 
 
 _settings: Settings | None = None
@@ -305,6 +401,36 @@ def _validate_settings(s: Settings) -> None:
             raise ValueError("DATABASE_URL must be a parseable PostgreSQL URL") from None
         if database_url.get_backend_name() != "postgresql":
             raise ValueError("DATABASE_URL must be a parseable PostgreSQL URL")
+        database_host = (database_url.host or "").lower().rstrip(".")
+        if not database_host:
+            raise ValueError("DATABASE_URL must include a database host")
+        if database_host in {
+            "localhost",
+            "db",
+            "postgres",
+            "host.docker.internal",
+            "gateway.docker.internal",
+            "127.0.0.1",
+            "::1",
+        }:
+            raise ValueError("DATABASE_URL must not use a local database host in production")
+        try:
+            database_address = ipaddress.ip_address(database_host)
+        except ValueError:
+            database_address = None
+        if database_address is not None and (
+            database_address.is_private
+            or database_address.is_loopback
+            or database_address.is_link_local
+            or database_address.is_reserved
+            or database_address.is_unspecified
+        ):
+            raise ValueError("DATABASE_URL must not use a private database host in production")
+
+        if s.db_sslmode not in {"require", "verify-ca", "verify-full"}:
+            raise ValueError("DB_SSLMODE must require PostgreSQL TLS in production")
+        if s.db_sslrootcert and not s.db_sslrootcert.strip():
+            raise ValueError("DB_SSLROOTCERT must not be empty when supplied")
 
         if len(s.secret_key.encode("utf-8")) < 32:
             raise ValueError("JWT_SECRET_KEY or SECRET_KEY must contain at least 32 bytes")
@@ -331,6 +457,47 @@ def _validate_settings(s: Settings) -> None:
             raise ValueError("CORS_ORIGINS must not contain wildcards in production")
         if any("*" in origin for origin in s.allowed_origins):
             raise ValueError("ALLOWED_ORIGINS must not contain wildcards in production")
+
+        if "OBJECT_STORAGE_ENABLED" not in os.environ or not s.object_storage_enabled:
+            raise ValueError("OBJECT_STORAGE_ENABLED must be true in production")
+
+    if s.db_pool_size < 1 or s.db_pool_size > 100:
+        raise ValueError("DB_POOL_SIZE must be between 1 and 100")
+    if s.db_max_overflow < 0 or s.db_max_overflow > 100:
+        raise ValueError("DB_MAX_OVERFLOW must be between 0 and 100")
+    if s.db_pool_timeout_seconds <= 0:
+        raise ValueError("DB_POOL_TIMEOUT_SECONDS must be positive")
+    if s.db_pool_recycle_seconds < 0:
+        raise ValueError("DB_POOL_RECYCLE_SECONDS must not be negative")
+    if s.db_connect_timeout_seconds <= 0:
+        raise ValueError("DB_CONNECT_TIMEOUT_SECONDS must be positive")
+    if s.db_statement_timeout_ms <= 0:
+        raise ValueError("DB_STATEMENT_TIMEOUT_MS must be positive")
+    if s.db_sslmode not in {"disable", "allow", "prefer", "require", "verify-ca", "verify-full"}:
+        raise ValueError("DB_SSLMODE is not a supported PostgreSQL sslmode")
+    if s.log_level.upper() not in {
+        "DEBUG",
+        "INFO",
+        "WARNING",
+        "ERROR",
+        "CRITICAL",
+    }:
+        raise ValueError("LOG_LEVEL must be DEBUG, INFO, WARNING, ERROR, or CRITICAL")
+    if s.forwarded_header_max_length < 128 or s.forwarded_header_max_length > 16384:
+        raise ValueError("FORWARDED_HEADER_MAX_LENGTH must be between 128 and 16384")
+    if s.forwarded_max_hops < 1 or s.forwarded_max_hops > 20:
+        raise ValueError("FORWARDED_MAX_HOPS must be between 1 and 20")
+    if s.trust_forwarded_headers and not s.trusted_proxy_cidrs:
+        raise ValueError("TRUSTED_PROXY_CIDRS is required when forwarded headers are trusted")
+    for cidr in s.trusted_proxy_cidrs:
+        try:
+            ipaddress.ip_network(cidr, strict=False)
+        except ValueError:
+            raise ValueError("TRUSTED_PROXY_CIDRS contains an invalid CIDR") from None
+    if s.log_format not in {"json", "text"}:
+        raise ValueError("LOG_FORMAT must be json or text")
+    if s.readiness_cache_seconds < 0 or s.readiness_cache_seconds > 60:
+        raise ValueError("READINESS_CACHE_SECONDS must be between 0 and 60")
 
     if s.cookie_same_site not in ("lax", "strict", "none"):
         raise ValueError("COOKIE_SAME_SITE must be lax, strict, or none")
@@ -390,14 +557,29 @@ def _validate_settings(s: Settings) -> None:
         }
         if s.app_env == "production":
             required["S3_ENDPOINT_URL"] = s.s3_endpoint_url or ""
-            if s.s3_region != "auto":
-                raise ValueError("Production R2 storage requires S3_REGION=auto")
-        missing = [name for name, value in required.items() if not value]
+            if "S3_REGION" not in os.environ:
+                raise ValueError("S3_REGION must be explicitly set in production")
+        missing = [
+            name for name, value in required.items()
+            if not value or (isinstance(value, str) and not value.strip())
+        ]
         if missing:
             raise ValueError(
                 "Object storage is enabled but required settings are missing: "
                 + ", ".join(missing)
             )
+        if s.app_env == "production" and s.s3_endpoint_url:
+            _validate_endpoint_url(
+                "S3_ENDPOINT_URL",
+                s.s3_endpoint_url,
+                require_https=True,
+            )
+    if s.s3_public_url:
+        _validate_endpoint_url(
+            "S3_PUBLIC_URL",
+            s.s3_public_url,
+            require_https=s.app_env == "production",
+        )
 
 
 def reset_settings() -> None:

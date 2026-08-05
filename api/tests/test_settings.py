@@ -27,6 +27,12 @@ PRODUCTION_ENV = {
     "TRUSTED_HOSTS": "api.example.com",
     "ALLOWED_ORIGINS": "https://app.example.com",
     "CORS_ORIGINS": "https://app.example.com",
+    "OBJECT_STORAGE_ENABLED": "true",
+    "S3_ENDPOINT_URL": "https://account.r2.cloudflarestorage.com",
+    "S3_REGION": "auto",
+    "S3_BUCKET": "production-bucket",
+    "S3_ACCESS_KEY_ID": "access",
+    "S3_SECRET_ACCESS_KEY": "secret",
 }
 
 
@@ -478,10 +484,12 @@ class TestObjectStorageSettings:
             assert settings.s3_force_path_style is True
 
     def test_production_enabled_storage_requires_complete_settings(self):
+        env = {**PRODUCTION_ENV}
+        env.pop("S3_SECRET_ACCESS_KEY")
         with patch.dict(
             os.environ,
             {
-                **PRODUCTION_ENV,
+                **env,
                 "OBJECT_STORAGE_ENABLED": "true",
                 "S3_REGION": "auto",
                 "S3_BUCKET": "prod-bucket",
@@ -494,7 +502,7 @@ class TestObjectStorageSettings:
             with pytest.raises(ValueError, match="S3_SECRET_ACCESS_KEY"):
                 get_settings()
 
-    def test_production_enabled_storage_requires_r2_auto_region(self):
+    def test_production_enabled_storage_accepts_provider_region(self):
         with patch.dict(
             os.environ,
             {
@@ -509,5 +517,4 @@ class TestObjectStorageSettings:
             clear=True,
         ):
             reset_settings()
-            with pytest.raises(ValueError, match="S3_REGION=auto"):
-                get_settings()
+            assert get_settings().s3_region == "us-east-1"

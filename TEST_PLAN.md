@@ -167,6 +167,13 @@ curl http://localhost:3000/api/bookmarks
 - [ ] Environment variables documented
 - [ ] SSL/TLS certificate configured
 - [ ] Production PostgreSQL, distinct 32-byte secrets, secure cookies, host/origin allowlists, and enabled-storage readiness verified
+- [ ] `/livez` is used for process liveness and `/readyz` returns 200 only for the deployed migration head and healthy private object storage
+- [ ] PostgreSQL uses bounded pool settings and verified TLS; no database URL or secret is logged
+- [ ] Forwarded headers are trusted only from explicitly configured proxy CIDRs
+- [ ] Production logs are structured and redacted; application security headers are present without local-development HSTS
+- [ ] `S3_ENDPOINT_URL` is HTTPS, `S3_REGION` is explicit (`auto` is valid for R2), and application and backup buckets are separate private stores
+- [ ] Production Compose is digest-pinned, Caddy is the only host-published service, and runtime secrets are external `0600`/`0400` files
+- [ ] Production configuration validator, deployment smoke tests, and rollback checks pass using synthetic local values
 
 ### Infrastructure
 
@@ -189,9 +196,13 @@ curl http://localhost:3000/api/bookmarks
 ### Smoke Tests (Post-Deploy)
 
 ```bash
-# 1. API health
+# 1. API compatibility health
 curl https://example.com/api/health
 # Expected: {"status": "ok"}
+
+# Process liveness and dependency readiness
+curl https://example.com/api/livez
+curl https://example.com/api/readyz
 
 # 2. Web loads
 curl -I https://example.com

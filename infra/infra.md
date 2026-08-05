@@ -4,6 +4,11 @@ Local Docker Compose stack for development. Runs PostgreSQL, the FastAPI API,
 and the Next.js frontend. An optional MinIO profile provides local S3-compatible
 object storage.
 
+The production package is separate: use `docker-compose.production.yml` with
+external managed PostgreSQL and private HTTPS S3-compatible storage. Production
+Compose contains Caddy, web, API, and one-shot migration services only; it does
+not contain PostgreSQL or MinIO. See [`docs/production-deployment.md`](../docs/production-deployment.md).
+
 ## Prerequisites
 
 - Docker Engine ≥ 24 and Docker Compose v2
@@ -32,7 +37,9 @@ docker compose --profile storage run --rm minio-setup
 
 # 4. Check health
 docker compose ps                      # all services should be "Up" or "healthy"
-curl -s http://localhost:3000/api/health # should return {"status":"ok"}
+curl -s http://localhost:3000/api/health # compatibility check
+curl -s http://localhost:3000/api/livez   # process liveness
+curl -s http://localhost:3000/api/readyz  # dependency readiness
 # Web UI: http://localhost:3000
 
 # 5. Stop everything
@@ -98,18 +105,28 @@ docker buildx build --platform linux/arm64 \
   -f web/Dockerfile -t infinityscan-web:arm64 web
 ```
 
-## Health checks
+## Health and readiness checks
 
 Every service defines a Docker health check:
 
 | Service | Check method                     | Interval | Start period |
 |---------|----------------------------------|----------|--------------|
 | `db`    | `pg_isready`                     | 5s       | —            |
-| `api`   | `GET /health` via Python urllib  | 30s      | 10s          |
+| `api`   | `GET /readyz` via Python urllib  | 30s      | 10s          |
 | `web`   | `GET :3000` via Node.js          | 30s      | 15s          |
 
 Services that depend on another service wait for it to be **healthy**
 (not just started) before launching.
+
+The API keeps `/health` as a shallow compatibility endpoint. Orchestration and
+the future Caddy deployment must use `/livez` for process liveness and `/readyz`
+for database, migration-head, and enabled object-storage readiness. `/readyz`
+returns `503` with safe component states until every mandatory dependency is
+ready; it never returns credentials, URLs, object keys, or provider error bodies.
+
+Readiness uses bounded database and object-storage operations and a short cache
+to prevent a monitoring loop from amplifying provider failures. It does not
+create buckets, objects, or run integrity scans.
 
 ## Signal handling
 
@@ -138,6 +155,50 @@ The most important variables are:
 | `S3_*` | api, minio-setup | S3-compatible endpoint, credentials, bucket, timeouts, and presign settings. |
 | `STORAGE_PUBLIC_BASE_URL` | api | Optional CDN base URL; presigned delivery remains the default. |
 
+Secrets are `POSTGRES_PASSWORD` when Compose PostgreSQL is used,
+`JWT_SECRET_KEY`, `CSRF_SECRET_KEY`, `S3_ACCESS_KEY_ID`,
+`S3_SECRET_ACCESS_KEY`, and any backup-storage credentials. Keep them in the
+protected runtime secret source only. `DATABASE_URL` is also sensitive because
+it can contain a URL-encoded password and must never be logged. Hosts, bucket
+names, regions, pool bounds, proxy CIDRs, logging mode, endpoint URLs, and
+`MEDIA_CSP_ORIGINS` are non-secret configuration, although private endpoints
+and bucket names should still not be exposed unnecessarily.
+
+Application content storage and backup storage are separate private buckets.
+The API uses only the application bucket; backup tooling receives its distinct
+storage settings through its protected operator environment. No production
+bucket, credential, domain, or certificate is created by this repository task.
+
+### Database runtime settings
+
+`DB_POOL_SIZE`, `DB_MAX_OVERFLOW`, `DB_POOL_TIMEOUT_SECONDS`,
+`DB_POOL_RECYCLE_SECONDS`, `DB_CONNECT_TIMEOUT_SECONDS`, and
+`DB_STATEMENT_TIMEOUT_MS` bound each API process's PostgreSQL usage. The
+defaults are conservative for one small API container and must be included in
+the database connection budget before scaling the API.
+
+Production PostgreSQL requires `DB_SSLMODE=require`, `verify-ca`, or
+`verify-full`; `DB_SSLROOTCERT` is optional for providers that need an explicit
+CA path. SQLite tests and local development are not forced to use PostgreSQL
+TLS. Database URLs are never logged.
+
+### Proxy and logging settings
+
+Forwarded headers are ignored unless `TRUST_FORWARDED_HEADERS=true` and every
+immediate proxy CIDR is listed in `TRUSTED_PROXY_CIDRS`. The application parses
+the chain from right to left and selects the first untrusted address. It does
+not trust arbitrary client-supplied Cloudflare or `X-Forwarded-*` headers.
+
+`LOG_FORMAT=json` enables redacted structured production logs. The logger never
+emits cookies, authorization headers, JWTs, CSRF tokens, passwords, database
+URLs, storage credentials, age identities, or presigned URLs. `LOG_FORMAT=text`
+remains available for development.
+
+Rate limiting uses the validated request client identity. The current limiter
+is process-local and is valid only while one API process is deployed. Scaling
+the API requires a shared limiter backend or an enforced trusted edge limiter;
+that is a deployment invariant, not an application assumption.
+
 ### Production fail-fast checks
 
 With `APP_ENV=production`, startup requires a parseable PostgreSQL
@@ -148,9 +209,27 @@ distinct `JWT_SECRET_KEY` and `CSRF_SECRET_KEY` values of at least 32 bytes,
 for a same-origin deployment, set `CORS_ORIGINS=` explicitly.
 
 If `OBJECT_STORAGE_ENABLED=true`, all required S3 settings must be present and
-the configured bucket must pass its startup health check. Production R2 uses an
-explicit `S3_ENDPOINT_URL` and `S3_REGION=auto`. The API does not create a
-production bucket.
+the configured bucket must pass its startup health check. Production requires
+object storage to be enabled, uses an explicit HTTPS `S3_ENDPOINT_URL`, and
+requires an explicit `S3_REGION` (`auto` for R2; provider-specific elsewhere).
+Production endpoints cannot contain
+credentials, query strings, fragments, loopback hosts, or private IP literals.
+The API does not create a production bucket.
+
+### Same-origin production contract
+
+The public ingress exposes only the Next.js service:
+
+- `/` is served by Next.js.
+- `/api/*` is forwarded unchanged to Next.js.
+- Next.js rewrites `/api/*` to the private FastAPI origin and strips the prefix.
+- FastAPI is not directly public.
+- PostgreSQL and MinIO are not public; MinIO is local/test-only.
+
+The application adds API security headers and the Next.js server emits a
+configured CSP for same-origin resources and HTTPS media origins. It does not
+enable HSTS while local HTTP development is active. HSTS belongs at the future
+HTTPS Caddy layer.
 
 ### Immutable pins
 
@@ -170,6 +249,21 @@ python scripts/check-workflows.py
 actionlint .github/workflows/*.yml
 scripts/verify-phase5.sh
 ```
+
+## Production package
+
+Production images are supplied through `API_IMAGE`, `WEB_IMAGE`, and
+`CADDY_IMAGE`; each must be a GHCR reference with a full SHA-256 digest. The VM
+does not build images. Only Caddy publishes ports 80 and 443. Web and API use
+the internal `edge` and `backend` networks, and only the API/migration services
+receive secret-file mounts.
+
+Run `scripts/bootstrap-production-host.sh --dry-run` before host changes,
+`scripts/validate-production-config.sh` before rendering, and
+`scripts/smoke-deployment.sh` after promotion. Deployment and rollback use a
+lock and retain safe release metadata under `/var/lib/infinityscan/releases`.
+See [`docs/rollback.md`](../docs/rollback.md) and
+[`docs/operator-runbook.md`](../docs/operator-runbook.md).
 
 ## Troubleshooting
 

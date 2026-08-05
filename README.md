@@ -88,6 +88,24 @@ in a protected environment source before use; do not use it as credentials.
 | `OBJECT_STORAGE_ENABLED` | Enables private S3-compatible storage and startup readiness checks |
 | `S3_BUCKET` | Object-storage bucket used by the API |
 
+Production also requires bounded database runtime settings (`DB_POOL_SIZE`,
+`DB_MAX_OVERFLOW`, `DB_POOL_TIMEOUT_SECONDS`, `DB_POOL_RECYCLE_SECONDS`,
+`DB_CONNECT_TIMEOUT_SECONDS`, and `DB_STATEMENT_TIMEOUT_MS`), a TLS `DB_SSLMODE`,
+and `OBJECT_STORAGE_ENABLED=true` with an HTTPS S3-compatible endpoint.
+Production uses `/api/livez` for process liveness and `/api/readyz` for
+dependency readiness. `LOG_FORMAT=json` enables redacted structured logs.
+Forwarded headers remain ignored unless `TRUST_FORWARDED_HEADERS=true` and the
+immediate proxy network is explicitly listed in `TRUSTED_PROXY_CIDRS`. The
+process-local limiter is a single-API-process invariant; scale-out requires a
+shared limiter or enforced edge limiting. Configure `MEDIA_CSP_ORIGINS` with
+the exact HTTPS R2/S3 media origin(s) used by private redirects.
+
+The repository also contains a production-only deployment package using
+digest-pinned GHCR images, Caddy, external TLS PostgreSQL, private HTTPS S3
+storage, runtime secret files, and one-shot migrations. Start with
+[`docs/production-deployment.md`](docs/production-deployment.md); production
+Compose does not include PostgreSQL or MinIO.
+
 To run local object-storage integration, configure the `S3_*` variables in
 `infra/.env`, then run
 `docker compose --env-file infra/.env -f infra/docker-compose.yml --profile storage up -d minio`

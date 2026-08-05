@@ -12,19 +12,19 @@ maximum performance and no framework coupling.
 from __future__ import annotations
 
 import logging
+import time
 import uuid
 from urllib.parse import urlparse
 
 from settings import get_settings
+from proxy import resolve_client_ip, resolve_forwarded_scheme
+from request_context import client_ip_context, request_id_context
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
 from audit_events import validate_request_id
-from contextvars import ContextVar
-
 logger = logging.getLogger(__name__)
-request_id_context: ContextVar[str | None] = ContextVar("request_id", default=None)
 
 
 def _record_security_event(request, event_type: str, reason_code: str) -> None:
@@ -70,8 +70,17 @@ class RequestIDMiddleware:
         headers = {key.lower(): value for key, value in scope.get("headers", [])}
         supplied = headers.get(b"x-request-id", b"").decode("ascii", errors="ignore")
         request_id = validate_request_id(supplied) or uuid.uuid4().hex
-        scope.setdefault("state", {})["request_id"] = request_id
-        token = request_id_context.set(request_id)
+        settings = get_settings()
+        state = scope.setdefault("state", {})
+        state["request_id"] = request_id
+        peer = (scope.get("client") or (None, None))[0]
+        client_ip = resolve_client_ip(peer, headers, settings)
+        state["client_ip"] = client_ip
+        forwarded_scheme = resolve_forwarded_scheme(peer, headers, settings)
+        if forwarded_scheme:
+            scope["scheme"] = forwarded_scheme
+        request_token = request_id_context.set(request_id)
+        client_token = client_ip_context.set(client_ip)
 
         async def send_with_request_id(message):
             if message["type"] == "http.response.start":
@@ -83,7 +92,69 @@ class RequestIDMiddleware:
         try:
             await self.app(scope, receive, send_with_request_id)
         finally:
-            request_id_context.reset(token)
+            client_ip_context.reset(client_token)
+            request_id_context.reset(request_token)
+
+
+class RequestLoggingMiddleware:
+    """Emit one redacted request record after each HTTP request."""
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        started = time.perf_counter()
+        status_code = 500
+
+        async def send_with_status(message):
+            nonlocal status_code
+            if message["type"] == "http.response.start":
+                status_code = int(message["status"])
+            await send(message)
+
+        try:
+            await self.app(scope, receive, send_with_status)
+        finally:
+            state = scope.get("state", {})
+            path = scope.get("path", "")
+            route = getattr(scope.get("route"), "path", None) or path
+            duration_ms = round((time.perf_counter() - started) * 1000, 3)
+            log_level = logging.DEBUG if path in {"/health", "/livez", "/readyz"} else logging.INFO
+            logger.log(
+                log_level,
+                "request completed",
+                extra={
+                    "event_type": "http.request",
+                    "method": scope.get("method", ""),
+                    "route": route,
+                    "status_code": status_code,
+                    "duration_ms": duration_ms,
+                    "outcome": "success" if status_code < 400 else "error",
+                    "request_id": state.get("request_id"),
+                    "client_ip": state.get("client_ip"),
+                    "user_id": state.get("user_id"),
+                },
+            )
+
+
+class SecurityHeadersMiddleware(BaseHTTPMiddleware):
+    """Apply safe API response headers without enabling HSTS on HTTP."""
+
+    async def dispatch(self, request: Request, call_next):
+        response = await call_next(request)
+        response.headers.setdefault("X-Content-Type-Options", "nosniff")
+        response.headers.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
+        response.headers.setdefault(
+            "Permissions-Policy",
+            "camera=(), geolocation=(), microphone=(), payment=()",
+        )
+        response.headers.setdefault("X-Frame-Options", "DENY")
+        if request.url.path.startswith(("/auth/", "/admin/", "/livez", "/readyz")):
+            response.headers["Cache-Control"] = "no-store"
+        return response
 
 
 # ── Origin validation middleware ─────────────────────────────────────────────

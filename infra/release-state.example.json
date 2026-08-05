@@ -1,0 +1,12 @@
+{
+  "release_id": "<release-id>",
+  "git_commit_sha": "<40-character-sha>",
+  "api_image_digest": "ghcr.io/example/infinityscan-api@sha256:<64-hex-digest>",
+  "web_image_digest": "ghcr.io/example/infinityscan-web@sha256:<64-hex-digest>",
+  "deployed_at": "<UTC-RFC3339-timestamp>",
+  "migration_revision_before": "<alembic-revision>",
+  "migration_revision_after": "<alembic-revision>",
+  "previous_release_id": "<previous-release-or-null>",
+  "smoke_test": "passed",
+  "event": "deploy"
+}

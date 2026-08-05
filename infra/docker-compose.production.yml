@@ -1,0 +1,225 @@
+name: infinityscan
+
+services:
+  caddy:
+    image: ${CADDY_IMAGE:?CADDY_IMAGE must be an immutable digest}
+    environment:
+      APP_DOMAIN: ${APP_DOMAIN:?APP_DOMAIN is required}
+      ACME_EMAIL: ${ACME_EMAIL:-}
+      CADDY_UPSTREAM: ${CADDY_UPSTREAM:-web:3000}
+    ports:
+      - "80:8080"
+      - "443:8443"
+    volumes:
+      - ./reverse-proxy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    networks:
+      - edge
+    healthcheck:
+      test: ["CMD", "caddy", "validate", "--config", "/etc/caddy/Caddyfile", "--adapter", "caddyfile"]
+      interval: 30s
+      timeout: 5s
+      start_period: 10s
+      retries: 3
+    restart: unless-stopped
+    init: true
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,noexec,nosuid,nodev
+    cap_drop: ["ALL"]
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 384m
+    cpus: 1.0
+    pids_limit: 256
+    stop_grace_period: 20s
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "5"
+    depends_on:
+      web:
+        condition: service_healthy
+
+  migrate:
+    image: ${API_IMAGE:?API_IMAGE must be an immutable digest}
+    environment:
+      APP_ENV: production
+      DATABASE_URL_FILE: /run/secrets/database_url
+      DB_SSLMODE: ${DB_SSLMODE:-verify-full}
+      DB_SSLROOTCERT: ${DB_SSLROOTCERT:-}
+      DB_CONNECT_TIMEOUT_SECONDS: ${DB_CONNECT_TIMEOUT_SECONDS:-10}
+      DB_STATEMENT_TIMEOUT_MS: ${DB_STATEMENT_TIMEOUT_MS:-30000}
+    secrets:
+      - source: database_url
+        target: database_url
+        mode: 0400
+    networks:
+      - backend
+    restart: "no"
+    init: true
+    read_only: true
+    tmpfs:
+      - /tmp:size=32m,noexec,nosuid,nodev
+    cap_drop: ["ALL"]
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 256m
+    cpus: 0.5
+    pids_limit: 128
+    stop_grace_period: 60s
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
+
+  api:
+    image: ${API_IMAGE:?API_IMAGE must be an immutable digest}
+    environment:
+      APP_ENV: production
+      LOG_FORMAT: ${LOG_FORMAT:-json}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      READINESS_CACHE_SECONDS: ${READINESS_CACHE_SECONDS:-5}
+      DATABASE_URL_FILE: /run/secrets/database_url
+      JWT_SECRET_KEY_FILE: /run/secrets/jwt_secret_key
+      CSRF_SECRET_KEY_FILE: /run/secrets/csrf_secret_key
+      DB_POOL_SIZE: ${DB_POOL_SIZE:-5}
+      DB_MAX_OVERFLOW: ${DB_MAX_OVERFLOW:-5}
+      DB_POOL_TIMEOUT_SECONDS: ${DB_POOL_TIMEOUT_SECONDS:-10}
+      DB_POOL_RECYCLE_SECONDS: ${DB_POOL_RECYCLE_SECONDS:-1800}
+      DB_CONNECT_TIMEOUT_SECONDS: ${DB_CONNECT_TIMEOUT_SECONDS:-10}
+      DB_STATEMENT_TIMEOUT_MS: ${DB_STATEMENT_TIMEOUT_MS:-30000}
+      DB_SSLMODE: ${DB_SSLMODE:-verify-full}
+      DB_SSLROOTCERT: ${DB_SSLROOTCERT:-}
+      COOKIE_SECURE: "true"
+      COOKIE_SAME_SITE: ${COOKIE_SAME_SITE:-lax}
+      TRUSTED_HOSTS: ${TRUSTED_HOSTS:?TRUSTED_HOSTS is required}
+      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:?ALLOWED_ORIGINS is required}
+      CORS_ORIGINS: ${CORS_ORIGINS:-}
+      TRUST_FORWARDED_HEADERS: ${TRUST_FORWARDED_HEADERS:-true}
+      TRUSTED_PROXY_CIDRS: ${TRUSTED_PROXY_CIDRS:?TRUSTED_PROXY_CIDRS is required}
+      FORWARDED_HEADER_MAX_LENGTH: ${FORWARDED_HEADER_MAX_LENGTH:-2048}
+      FORWARDED_MAX_HOPS: ${FORWARDED_MAX_HOPS:-5}
+      OBJECT_STORAGE_ENABLED: "true"
+      S3_ENDPOINT_URL: ${S3_ENDPOINT_URL:?S3_ENDPOINT_URL is required}
+      S3_REGION: ${S3_REGION:?S3_REGION is required}
+      S3_BUCKET: ${S3_BUCKET:?S3_BUCKET is required}
+      S3_ACCESS_KEY_ID_FILE: /run/secrets/s3_access_key_id
+      S3_SECRET_ACCESS_KEY_FILE: /run/secrets/s3_secret_access_key
+      S3_FORCE_PATH_STYLE: ${S3_FORCE_PATH_STYLE:-false}
+      S3_CONNECT_TIMEOUT: ${S3_CONNECT_TIMEOUT:-5}
+      S3_READ_TIMEOUT: ${S3_READ_TIMEOUT:-30}
+      S3_MAX_RETRIES: ${S3_MAX_RETRIES:-4}
+      S3_PRESIGN_TTL_SECONDS: ${S3_PRESIGN_TTL_SECONDS:-300}
+      MEDIA_CSP_ORIGINS: ${MEDIA_CSP_ORIGINS:?MEDIA_CSP_ORIGINS is required}
+    secrets:
+      - source: database_url
+        target: database_url
+        mode: 0400
+      - source: jwt_secret_key
+        target: jwt_secret_key
+        mode: 0400
+      - source: csrf_secret_key
+        target: csrf_secret_key
+        mode: 0400
+      - source: s3_access_key_id
+        target: s3_access_key_id
+        mode: 0400
+      - source: s3_secret_access_key
+        target: s3_secret_access_key
+        mode: 0400
+    networks:
+      - backend
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/readyz', timeout=4)"]
+      interval: 15s
+      timeout: 6s
+      start_period: 20s
+      retries: 5
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    restart: unless-stopped
+    init: true
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,noexec,nosuid,nodev
+    cap_drop: ["ALL"]
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 768m
+    cpus: 1.5
+    pids_limit: 256
+    stop_grace_period: 45s
+    logging:
+      driver: json-file
+      options:
+        max-size: 20m
+        max-file: "5"
+
+  web:
+    image: ${WEB_IMAGE:?WEB_IMAGE must be an immutable digest}
+    environment:
+      APP_ENV: production
+      NODE_ENV: production
+      API_INTERNAL_URL: http://api:8000
+      NEXT_PUBLIC_API_URL: /api
+      MEDIA_CSP_ORIGINS: ${MEDIA_CSP_ORIGINS:?MEDIA_CSP_ORIGINS is required}
+    networks:
+      - edge
+      - backend
+    healthcheck:
+      test: ["CMD", "node", "-e", "require('http').get('http://localhost:3000/', r => r.statusCode === 200 ? process.exit(0) : process.exit(1)).on('error', () => process.exit(1))"]
+      interval: 15s
+      timeout: 5s
+      start_period: 20s
+      retries: 5
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: unless-stopped
+    init: true
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,noexec,nosuid,nodev
+    cap_drop: ["ALL"]
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 768m
+    cpus: 1.5
+    pids_limit: 256
+    stop_grace_period: 30s
+    logging:
+      driver: json-file
+      options:
+        max-size: 20m
+        max-file: "5"
+
+networks:
+  edge:
+    ipam:
+      config:
+        - subnet: 172.30.0.0/24
+  backend:
+    ipam:
+      config:
+        - subnet: 172.31.0.0/24
+
+volumes:
+  caddy_data:
+  caddy_config:
+
+secrets:
+  database_url:
+    file: ${DATABASE_URL_FILE:?DATABASE_URL_FILE is required}
+  jwt_secret_key:
+    file: ${JWT_SECRET_KEY_FILE:?JWT_SECRET_KEY_FILE is required}
+  csrf_secret_key:
+    file: ${CSRF_SECRET_KEY_FILE:?CSRF_SECRET_KEY_FILE is required}
+  s3_access_key_id:
+    file: ${S3_ACCESS_KEY_ID_FILE:?S3_ACCESS_KEY_ID_FILE is required}
+  s3_secret_access_key:
+    file: ${S3_SECRET_ACCESS_KEY_FILE:?S3_SECRET_ACCESS_KEY_FILE is required}

@@ -52,6 +52,7 @@ class S3StorageConfig:
     connect_timeout: float = 5.0
     read_timeout: float = 30.0
     max_retries: int = 4
+    public_endpoint_url: str | None = None
 
     @classmethod
     def from_settings(cls, settings: Settings) -> "S3StorageConfig":
@@ -59,6 +60,7 @@ class S3StorageConfig:
             raise StorageConfigurationError("Object storage is disabled")
         return cls(
             endpoint_url=settings.s3_endpoint_url,
+            public_endpoint_url=settings.s3_public_url or None,
             region=settings.s3_region,
             bucket=settings.s3_bucket,
             access_key_id=settings.s3_access_key_id,
@@ -133,8 +135,19 @@ class S3CompatibleStorage:
                 aws_secret_access_key=config.secret_access_key,
                 config=client_config,
             )
+            self._presign_client = self._client
+            if config.public_endpoint_url and config.public_endpoint_url != config.endpoint_url:
+                self._presign_client = boto3.client(
+                    "s3",
+                    endpoint_url=config.public_endpoint_url,
+                    region_name=region,
+                    aws_access_key_id=config.access_key_id,
+                    aws_secret_access_key=config.secret_access_key,
+                    config=client_config,
+                )
         else:
             self._client = client
+            self._presign_client = client
 
     @classmethod
     def from_settings(cls, settings: Settings) -> "S3CompatibleStorage":
@@ -177,14 +190,22 @@ class S3CompatibleStorage:
             ),
         )
 
-    def _call(self, operation: str, key: str | None, fn: Callable[[], Any]) -> Any:
-        for attempt in range(self._max_retries + 1):
+    def _call(
+        self,
+        operation: str,
+        key: str | None,
+        fn: Callable[[], Any],
+        *,
+        max_retries: int | None = None,
+    ) -> Any:
+        retry_limit = self._max_retries if max_retries is None else max_retries
+        for attempt in range(retry_limit + 1):
             try:
                 return fn()
             except (BotoCoreError, ClientError) as exc:
                 if isinstance(exc, ClientError) and self._is_missing(exc):
                     raise
-                if not self._is_retryable(exc) or attempt == self._max_retries:
+                if not self._is_retryable(exc) or attempt == retry_limit:
                     # Do not include endpoint URLs, credentials, or signed URLs
                     # in storage errors.
                     object_suffix = f" for object {key}" if key else ""
@@ -402,7 +423,7 @@ class S3CompatibleStorage:
         ttl = self.config.presign_ttl_seconds if expires_in is None else expires_in
         if ttl < 1 or ttl > 3600:
             raise ValueError("Presigned URL lifetime must be between 1 and 3600 seconds")
-        return self._client.generate_presigned_url(
+        return self._presign_client.generate_presigned_url(
             "get_object",
             Params={"Bucket": self.bucket, "Key": key},
             ExpiresIn=ttl,
@@ -506,6 +527,19 @@ class S3CompatibleStorage:
                 "head_bucket",
                 None,
                 lambda: self._client.head_bucket(Bucket=self.bucket),
+            )
+            return True
+        except (ClientError, StorageError):
+            return False
+
+    def readiness_check(self) -> bool:
+        """Perform one bounded bucket HEAD without retry amplification."""
+        try:
+            self._call(
+                "head_bucket",
+                None,
+                lambda: self._client.head_bucket(Bucket=self.bucket),
+                max_retries=0,
             )
             return True
         except (ClientError, StorageError):

@@ -45,7 +45,7 @@ services:
       migrate:
         condition: service_completed_successfully
     healthcheck:
-      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/health')\""]
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/readyz')\""]
       interval: 30s
       timeout: 5s
       start_period: 10s
@@ -57,10 +57,13 @@ services:
     build:
       context: ../web
       args:
+        APP_ENV: ${APP_ENV:-development}
         API_INTERNAL_URL: http://api:8000
+        MEDIA_CSP_ORIGINS: ${MEDIA_CSP_ORIGINS:-http://host.docker.internal:*,http://127.0.0.1:*,http://localhost:*}
     ports:
       - "127.0.0.1:${WEB_PORT:-3000}:3000"
     environment:
+      APP_ENV: ${APP_ENV:-development}
       API_INTERNAL_URL: http://api:8000
     depends_on:
       api:

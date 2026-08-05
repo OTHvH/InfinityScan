@@ -21,6 +21,9 @@ CORS_ORIGINS       comma-separated list of allowed origins (default: http://loca
 """
 
 import uuid
+import logging
+import threading
+from time import monotonic
 from contextlib import asynccontextmanager
 from decimal import Decimal
 from typing import Any
@@ -35,7 +38,7 @@ from sqlalchemy.orm import Session, joinedload
 from slowapi.errors import RateLimitExceeded
 from slowapi.middleware import SlowAPIMiddleware
 
-from database import get_db, is_database_ready
+from database import get_db, is_database_ready, is_database_revision_ready
 from deps import get_current_user, require_admin, require_csrf
 from limiter import limiter
 from middleware import (
@@ -43,6 +46,8 @@ from middleware import (
     OriginValidationMiddleware,
     RequestBodyLimitMiddleware,
     RequestIDMiddleware,
+    RequestLoggingMiddleware,
+    SecurityHeadersMiddleware,
 )
 from models import (
     AuditEventOutcome,
@@ -80,12 +85,16 @@ from schemas import (
 )
 from settings import get_settings
 from storage import ObjectStorage, StorageError, create_object_storage
+from logging_config import configure_logging, redact_text
 
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
 
 _cfg = get_settings()
+if _cfg.app_env in ("staging", "production"):
+    configure_logging(_cfg.log_level, _cfg.log_format)
+logger = logging.getLogger(__name__)
 
 S3_PUBLIC_URL: str = _cfg.s3_public_url
 _media_storage: ObjectStorage | None = create_object_storage(_cfg)
@@ -120,6 +129,8 @@ _local = LocalContentAdapter(
 # ---------------------------------------------------------------------------
 
 _http_client: httpx.AsyncClient | None = None
+_readiness_lock = threading.Lock()
+_readiness_cache: tuple[float, dict[str, object], bool] | None = None
 
 
 @asynccontextmanager
@@ -129,8 +140,9 @@ async def lifespan(_: Any):
         raise RuntimeError("DATABASE_URL readiness check failed")
     if _cfg.object_storage_enabled:
         try:
-            storage_ready = (
-                _media_storage is not None and _media_storage.health_check()
+            checker = getattr(_media_storage, "readiness_check", None)
+            storage_ready = _media_storage is not None and bool(
+                checker() if checker is not None else _media_storage.health_check()
             )
         except Exception:
             storage_ready = False
@@ -155,6 +167,15 @@ async def lifespan(_: Any):
 # ---------------------------------------------------------------------------
 
 app = FastAPI(title="InfinityScan API", version="0.2.0", lifespan=lifespan)
+
+
+@app.exception_handler(Exception)
+async def _unhandled_exception_handler(request: Request, exc: Exception) -> JSONResponse:
+    logger.exception(
+        "unhandled application error",
+        extra={"event_type": "http.exception", "error_code": type(exc).__name__},
+    )
+    return JSONResponse(status_code=500, content={"detail": "Internal server error"})
 
 # Rate limiter
 app.state.limiter = limiter
@@ -193,6 +214,8 @@ app.add_middleware(RequestIDMiddleware)
 app.add_middleware(NoCacheAuthMiddleware)
 app.add_middleware(RequestBodyLimitMiddleware)
 app.add_middleware(OriginValidationMiddleware)
+app.add_middleware(SecurityHeadersMiddleware)
+app.add_middleware(RequestLoggingMiddleware)
 
 
 # ---------------------------------------------------------------------------
@@ -270,13 +293,71 @@ def _presigned_redirect(
 
 
 # ---------------------------------------------------------------------------
-# Routes — health
+# Routes — health and readiness
 # ---------------------------------------------------------------------------
 
 
-@app.get("/health")
+@app.get(
+    "/health",
+    summary="Compatibility health check",
+    description="Shallow legacy endpoint. Use /livez and /readyz for orchestration.",
+)
 def health() -> dict:
     return {"status": "ok"}
+
+
+@app.get("/livez")
+def livez() -> dict[str, str]:
+    """Process-only liveness probe; never contacts external dependencies."""
+    return {"status": "alive"}
+
+
+def _storage_readiness() -> bool:
+    if not _cfg.object_storage_enabled:
+        return True
+    if _media_storage is None:
+        return False
+    checker = getattr(_media_storage, "readiness_check", None)
+    try:
+        return bool(checker() if checker is not None else _media_storage.health_check())
+    except Exception as exc:
+        logger.warning(
+            "object storage readiness failed",
+            extra={
+                "event_type": "readiness.storage",
+                "error_code": type(exc).__name__,
+                "error": redact_text(str(exc)),
+            },
+        )
+        return False
+
+
+def _readiness_result() -> tuple[dict[str, object], bool]:
+    global _readiness_cache
+    now = monotonic()
+    ttl = getattr(_cfg, "readiness_cache_seconds", 5.0)
+    with _readiness_lock:
+        if _readiness_cache is not None and now - _readiness_cache[0] < ttl:
+            return _readiness_cache[1], _readiness_cache[2]
+        database_ready = is_database_ready()
+        migration_ready = is_database_revision_ready() if database_ready else False
+        storage_ready = _storage_readiness()
+        checks = {
+            "database": "ready" if database_ready else "unavailable",
+            "migration": "ready" if migration_ready else "mismatch",
+            "storage": "ready" if storage_ready else "unavailable",
+        }
+        ready = database_ready and migration_ready and storage_ready
+        payload = {"status": "ready" if ready else "not_ready", "checks": checks}
+        _readiness_cache = (now, payload, ready)
+        return payload, ready
+
+
+@app.get("/readyz")
+def readyz() -> JSONResponse:
+    """Dependency-aware readiness probe with safe component states only."""
+    payload, ready = _readiness_result()
+    return JSONResponse(status_code=200 if ready else 503, content=payload)
 
 
 @app.get("/library/{slug}", response_model=LocalSeriesDetailOut, summary="Get local series by slug")

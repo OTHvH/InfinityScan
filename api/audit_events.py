@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import hmac
+import ipaddress
 import json
 import logging
 import re
@@ -29,6 +30,7 @@ EVENT_TYPES = frozenset({
 METADATA_KEYS = frozenset({
     "reason_code", "status", "item_count", "page_count", "session_count",
     "retention_days", "removed_count", "dry_run", "batch_size", "error_code",
+    "client_ip",
 })
 MAX_METADATA_KEYS = 16
 MAX_METADATA_BYTES = 2048
@@ -60,6 +62,13 @@ def _validate_metadata(metadata: dict[str, Any] | None) -> dict[str, Any]:
             clean[key] = value
         else:
             raise AuditValidationError("audit metadata contains an invalid value")
+        if key == "client_ip":
+            try:
+                if not isinstance(value, str):
+                    raise ValueError
+                ipaddress.ip_address(value)
+            except ValueError as exc:
+                raise AuditValidationError("audit metadata contains an invalid client IP") from exc
     encoded = json.dumps(clean, separators=(",", ":"), sort_keys=True).encode("utf-8")
     if len(encoded) > MAX_METADATA_BYTES:
         raise AuditValidationError("audit metadata is too large")
@@ -87,7 +96,7 @@ def record_event(
     explicit_request_id = request_id is not None
     if request_id is None:
         # Imported lazily to keep the request-boundary middleware independent.
-        from middleware import request_id_context
+        from request_context import request_id_context
 
         request_id = request_id_context.get()
     request_id = validate_request_id(request_id)
@@ -99,6 +108,18 @@ def record_event(
         raise AuditValidationError("invalid subject type")
     if subject_id is not None and len(subject_id) > 255:
         raise AuditValidationError("subject ID is too long")
+    clean_metadata = _validate_metadata(metadata)
+    if "client_ip" not in clean_metadata:
+        from request_context import client_ip_context
+
+        client_ip = client_ip_context.get()
+        if client_ip and client_ip != "unknown":
+            try:
+                ipaddress.ip_address(client_ip)
+            except ValueError:
+                pass
+            else:
+                clean_metadata["client_ip"] = client_ip
     event = AuditEvent(
         request_id=request_id,
         actor_user_id=actor_user_id,
@@ -106,7 +127,7 @@ def record_event(
         outcome=outcome,
         subject_type=subject_type,
         subject_id=subject_id,
-        event_metadata=_validate_metadata(metadata),
+        event_metadata=clean_metadata,
     )
     db.add(event)
     db.flush()

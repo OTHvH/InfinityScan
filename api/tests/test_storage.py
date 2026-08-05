@@ -233,6 +233,14 @@ def test_upload_bytes_sends_private_cacheable_metadata():
     assert result.etag == "fake-etag"
 
 
+def test_readiness_check_uses_one_bounded_bucket_probe():
+    client = FakeS3Client()
+    storage = S3CompatibleStorage(_config(), client=client)
+
+    assert storage.readiness_check() is True
+    assert [operation for operation, _ in client.calls] == ["head_bucket"]
+
+
 def test_upload_file_hashes_file_and_sends_metadata(tmp_path: Path):
     client = FakeS3Client()
     storage = S3CompatibleStorage(_config(), client=client)
