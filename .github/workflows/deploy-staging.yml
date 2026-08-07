@@ -1,0 +1,230 @@
+name: Deploy Immutable Release to Staging
+
+on:
+  workflow_dispatch:
+    inputs:
+      publication_run_id:
+        description: "Exact successful image-publication workflow run ID"
+        required: true
+        type: string
+      artifact_name:
+        description: "Exact immutable release artifact name"
+        required: true
+        type: string
+      expected_git_sha:
+        description: "Exact 40-character commit SHA"
+        required: true
+        type: string
+      release_id:
+        description: "Optional release ID assertion"
+        required: false
+        type: string
+      dry_run:
+        description: "Run authorization and preflight without deployment"
+        required: false
+        default: false
+        type: boolean
+      rollback_rehearsal:
+        description: "Run the controlled staging rollback rehearsal"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: staging-deployment
+  cancel-in-progress: false
+
+jobs:
+  authorize:
+    if: github.ref_name == 'phase-6-production-deployment'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.expected_git_sha }}
+          fetch-depth: 1
+      - name: Validate exact staging request
+        env:
+          EXPECTED_SHA: ${{ inputs.expected_git_sha }}
+          PUBLICATION_RUN_ID: ${{ inputs.publication_run_id }}
+          ARTIFACT_NAME: ${{ inputs.artifact_name }}
+        run: |
+          set -euo pipefail
+          [[ "$EXPECTED_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$PUBLICATION_RUN_ID" =~ ^[0-9]+$ ]]
+          [[ "$ARTIFACT_NAME" =~ ^[A-Za-z0-9._-]{1,128}$ ]]
+          test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
+
+  fetch-release-evidence:
+    needs: authorize
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.expected_git_sha }}
+      - name: Fetch and validate exact publication evidence
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          scripts/fetch-release-evidence.sh \
+            --repository "$GITHUB_REPOSITORY" \
+            --run-id "${{ inputs.publication_run_id }}" \
+            --artifact "${{ inputs.artifact_name }}" \
+            --expected-git-sha "${{ inputs.expected_git_sha }}" \
+            --destination "$RUNNER_TEMP/release-evidence"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: verified-staging-release-evidence-${{ inputs.expected_git_sha }}
+          path: ${{ runner.temp }}/release-evidence
+          retention-days: 14
+
+  verify-release-evidence:
+    needs: fetch-release-evidence
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      release_id: ${{ steps.manifest.outputs.release_id }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.expected_git_sha }}
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: verified-staging-release-evidence-${{ inputs.expected_git_sha }}
+          path: release-evidence
+      - name: Validate exact release selection
+        id: manifest
+        run: |
+          set -euo pipefail
+          python3 scripts/validate-staging-evidence.py \
+            --manifest release-evidence/release-manifest.json \
+            --evidence release-evidence/publication-evidence.json \
+            --repository "$GITHUB_REPOSITORY" \
+            --git-sha "${{ inputs.expected_git_sha }}"
+          release_id="$(jq -r '.release_id' release-evidence/release-manifest.json)"
+          if [[ -n "${{ inputs.release_id }}" && "$release_id" != "${{ inputs.release_id }}" ]]; then
+            printf 'requested release ID does not match manifest\n' >&2
+            exit 1
+          fi
+          printf 'release_id=%s\n' "$release_id" >> "$GITHUB_OUTPUT"
+      - name: Check workflow policy
+        run: python3 scripts/check-workflows.py
+
+  staging-preflight:
+    needs: verify-release-evidence
+    runs-on: ubuntu-24.04
+    environment: staging
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.expected_git_sha }}
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: verified-staging-release-evidence-${{ inputs.expected_git_sha }}
+          path: release-evidence
+      - name: Install evidence on the host and run preflight
+        env:
+          DEPLOY_HOST_TRANSPORT: ${{ vars.DEPLOY_HOST_TRANSPORT }}
+          DEPLOYMENT_HOST: ${{ vars.DEPLOYMENT_HOST }}
+          DEPLOYMENT_USER: ${{ vars.DEPLOYMENT_USER }}
+          DEPLOYMENT_KNOWN_HOSTS_FILE: ${{ vars.DEPLOYMENT_KNOWN_HOSTS_FILE }}
+          DEPLOYMENT_SSH_KEY_FILE: ${{ secrets.DEPLOYMENT_SSH_KEY_FILE }}
+        run: |
+          set -euo pipefail
+          scripts/run-on-deployment-host.sh install-evidence \
+            release-evidence/release-manifest.json release-evidence/publication-evidence.json
+          scripts/run-on-deployment-host.sh preflight \
+            --manifest "${{ vars.DEPLOYMENT_REMOTE_EVIDENCE_DIR }}/release-manifest.json" \
+            --evidence "${{ vars.DEPLOYMENT_REMOTE_EVIDENCE_DIR }}/publication-evidence.json"
+
+  deploy-staging:
+    needs: staging-preflight
+    if: inputs.dry_run == false
+    runs-on: ubuntu-24.04
+    environment: staging
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.expected_git_sha }}
+      - name: Deploy exact digest release
+        env:
+          DEPLOY_HOST_TRANSPORT: ${{ vars.DEPLOY_HOST_TRANSPORT }}
+          DEPLOYMENT_HOST: ${{ vars.DEPLOYMENT_HOST }}
+          DEPLOYMENT_USER: ${{ vars.DEPLOYMENT_USER }}
+          DEPLOYMENT_KNOWN_HOSTS_FILE: ${{ vars.DEPLOYMENT_KNOWN_HOSTS_FILE }}
+          DEPLOYMENT_SSH_KEY_FILE: ${{ secrets.DEPLOYMENT_SSH_KEY_FILE }}
+        run: |
+          set -euo pipefail
+          scripts/run-on-deployment-host.sh deploy \
+            --release-manifest "${{ vars.DEPLOYMENT_REMOTE_EVIDENCE_DIR }}/release-manifest.json" \
+            --release-evidence "${{ vars.DEPLOYMENT_REMOTE_EVIDENCE_DIR }}/publication-evidence.json" \
+            --synthetic-staging-backup-bypass
+
+  smoke-staging:
+    needs: deploy-staging
+    runs-on: ubuntu-24.04
+    environment: staging
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Run same-origin staging smoke tests
+        env:
+          SMOKE_MODE: staging
+          SMOKE_USERNAME: ${{ secrets.STAGING_SMOKE_USERNAME }}
+          SMOKE_PASSWORD: ${{ secrets.STAGING_SMOKE_PASSWORD }}
+          SMOKE_SERIES_SLUG: ${{ vars.STAGING_SMOKE_SERIES_SLUG }}
+          SMOKE_MEDIA_PATH: ${{ vars.STAGING_SMOKE_MEDIA_PATH }}
+          DIRECT_API_URL: ${{ vars.DIRECT_API_URL }}
+        run: scripts/smoke-deployment.sh "${{ vars.STAGING_URL }}"
+
+  rollback-rehearsal:
+    needs: smoke-staging
+    if: inputs.rollback_rehearsal == true
+    runs-on: ubuntu-24.04
+    environment: staging
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Run controlled staging rollback rehearsal
+        run: scripts/rehearse-staging-rollback.sh --fake-host
+
+  publish-staging-evidence:
+    needs: [verify-release-evidence, staging-preflight, deploy-staging, smoke-staging, rollback-rehearsal]
+    if: always() && (inputs.dry_run == true || needs.smoke-staging.result == 'success')
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - name: Write bounded staging result
+        run: |
+          set -euo pipefail
+          mkdir -p staging-evidence
+          jq -n \
+            --arg environment staging \
+            --arg release_id "${{ needs.verify-release-evidence.outputs.release_id }}" \
+            --arg git_sha "${{ inputs.expected_git_sha }}" \
+            --arg run_id "${{ inputs.publication_run_id }}" \
+            --arg smoke "${{ needs.smoke-staging.result }}" \
+            --arg rollback "${{ needs.rollback-rehearsal.result }}" \
+            '{schema_version:1,environment:$environment,release_id:$release_id,git_sha:$git_sha,publication_run_id:$run_id,smoke:$smoke,rollback_rehearsal:$rollback}' > staging-evidence/result.json
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: staging-deployment-result-${{ inputs.expected_git_sha }}
+          path: staging-evidence/result.json
+          retention-days: 14

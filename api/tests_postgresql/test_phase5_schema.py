@@ -247,7 +247,7 @@ def _assert_constraint_failure(engine, statement: str, expected_constraint: str)
 def test_clean_upgrade_downgrade_and_reupgrade(engine):
     config = _alembic_config()
     scripts = ScriptDirectory.from_config(config)
-    assert scripts.get_current_head() == "0008"
+    assert scripts.get_current_head() == "0009"
 
     command.upgrade(config, "0006")
     assert _current_revision(engine) == "0006"
@@ -262,7 +262,7 @@ def test_clean_upgrade_downgrade_and_reupgrade(engine):
     assert "ck_pages_verified_requirements" in _constraint_names(engine)
 
     command.upgrade(config, "head")
-    assert _current_revision(engine) == "0008"
+    assert _current_revision(engine) == "0009"
     assert PHASE5_CONSTRAINTS <= _constraint_names(engine)
     command.check(config)
 
@@ -270,7 +270,7 @@ def test_clean_upgrade_downgrade_and_reupgrade(engine):
 def test_import_recovery_migration_is_reversible(engine):
     config = _alembic_config()
     command.upgrade(config, "head")
-    assert _current_revision(engine) == "0008"
+    assert _current_revision(engine) == "0009"
     assert RECOVERY_CONSTRAINTS <= _constraint_names(engine)
     assert {
         "ix_import_jobs_heartbeat_at",
@@ -297,7 +297,7 @@ def test_import_recovery_migration_is_reversible(engine):
             )
         ) == 0
     command.upgrade(config, "head")
-    assert _current_revision(engine) == "0008"
+    assert _current_revision(engine) == "0009"
 
 
 def test_import_recovery_constraints_reject_invalid_state(engine):

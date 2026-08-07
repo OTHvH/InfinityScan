@@ -92,3 +92,12 @@ scripts/deploy-production.sh <release-id>
 ```
 
 The manifest is validated before its API and web digest references are used.
+
+## Staging
+
+Staging is a separate disposable environment using the same production-like
+Compose, migration, health, smoke, and rollback paths. It has separate host
+paths, runtime secret files, PostgreSQL database, object-storage buckets,
+backup metadata, and protected GitHub `staging` environment. See
+[`staging-deployment.md`](staging-deployment.md) for the dispatch workflow,
+synthetic fixture, preflight, evidence, and rollback rehearsal.

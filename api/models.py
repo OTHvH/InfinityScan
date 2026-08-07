@@ -40,6 +40,16 @@ class Base(DeclarativeBase):
     pass
 
 
+class DeploymentEnvironment(Base):
+    """Explicit environment marker used by disposable staging fixtures."""
+
+    __tablename__ = "deployment_environment"
+
+    environment: Mapped[str] = mapped_column(String(32), primary_key=True)
+    fixture_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
 # ---------------------------------------------------------------------------
 # Enums
 # ---------------------------------------------------------------------------

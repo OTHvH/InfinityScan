@@ -50,6 +50,12 @@
       "revision": "0008",
       "down_revision": "0007",
       "sha256": "dae62a0327ef4acecfd0c081b01f488de584cf3880105ecf5b2874a0a3662f76"
+    },
+    {
+      "filename": "alembic/versions/0009_deployment_environment_marker.py",
+      "revision": "0009",
+      "down_revision": "0008",
+      "sha256": "7fd336bcf8c58b841147a7ad27d7236da95d13f3bc39e3e6b9d6d05e4f7fcc98"
     }
   ]
 }

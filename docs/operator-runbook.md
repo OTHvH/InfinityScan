@@ -42,3 +42,23 @@ credentials in the Git checkout.
 Do not expose API or web host ports, add a Docker socket mount, enable debug
 servers, provision cloud resources, or edit historical Alembic migrations as an
 incident response shortcut.
+
+## Staging Operations
+
+Run the dispatch-only staging workflow with an exact publication run ID,
+artifact name, and commit SHA. Use the protected staging environment, never
+production credentials or buckets. Host preflight requires the staging marker,
+isolated secret directory, HTTPS object storage, staging-named buckets, and
+the exact publication evidence artifact.
+
+The staging fixture is synthetic and deterministic:
+
+```bash
+(cd api && .venv/bin/python -m tools.staging_fixture seed --confirm-staging)
+(cd api && .venv/bin/python -m tools.staging_fixture cleanup --confirm-staging)
+```
+
+Run `scripts/rehearse-staging-rollback.sh --fake-host` before exercising a
+staging rollback. Collect only the redacted output from
+`staging-status.py` and `collect-staging-evidence.sh`; never archive secret
+files, environment files, cookies, tokens, signed URLs, or object contents.

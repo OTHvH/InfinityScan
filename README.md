@@ -106,6 +106,12 @@ storage, runtime secret files, and one-shot migrations. Start with
 [`docs/production-deployment.md`](docs/production-deployment.md); production
 Compose does not include PostgreSQL or MinIO.
 
+Staging is documented in [`docs/staging-deployment.md`](docs/staging-deployment.md).
+Its dispatch-only workflow consumes exact publication evidence and commit
+digests, uses isolated synthetic data and infrastructure, and includes a
+fake-host rollback rehearsal. It does not publish images or provision cloud
+resources.
+
 To run local object-storage integration, configure the `S3_*` variables in
 `infra/.env`, then run
 `docker compose --env-file infra/.env -f infra/docker-compose.yml --profile storage up -d minio`

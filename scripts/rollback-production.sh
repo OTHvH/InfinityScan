@@ -1,20 +1,41 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
+ROOT_DIR="$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)"
 # shellcheck source=scripts/lib/production.sh
 source "$ROOT_DIR/scripts/lib/production.sh"
 
-TARGET="${1:-previous}"
+TARGET="previous"
 ENV_FILE="${PRODUCTION_ENV_FILE:-/etc/infinityscan/production.env}"
 STATE_DIR="${DEPLOYMENT_STATE_DIR:-/var/lib/infinityscan/releases}"
 DEPLOY_DIR="${DEPLOYMENT_DIR:-/opt/infinityscan}"
 LOCK_FILE="${DEPLOYMENT_LOCK_FILE:-/var/lib/infinityscan/deploy.lock}"
+ENVIRONMENT="${DEPLOYMENT_ENVIRONMENT:-production}"
+RELEASE_MANIFEST_FILE="${RELEASE_MANIFEST_FILE:-}"
+RELEASE_EVIDENCE_FILE="${RELEASE_EVIDENCE_FILE:-}"
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --environment) ENVIRONMENT="$2"; shift 2 ;;
+    --release-manifest) RELEASE_MANIFEST_FILE="$2"; shift 2 ;;
+    --release-evidence) RELEASE_EVIDENCE_FILE="$2"; shift 2 ;;
+    previous) TARGET=previous; shift ;;
+    --*) production_die "unknown rollback option: $1" ;;
+    *) TARGET="$1"; shift ;;
+  esac
+done
+
+if [[ "$ENVIRONMENT" == staging ]]; then
+  ENV_FILE="${STAGING_ENV_FILE:-${PRODUCTION_ENV_FILE:-/etc/infinityscan/staging.env}}"
+  STATE_DIR="${STAGING_DEPLOYMENT_STATE_DIR:-${DEPLOYMENT_STATE_DIR:-/var/lib/infinityscan/staging/releases}}"
+  DEPLOY_DIR="${STAGING_DEPLOYMENT_DIR:-${DEPLOYMENT_DIR:-/opt/infinityscan}}"
+  LOCK_FILE="${STAGING_DEPLOYMENT_LOCK_FILE:-${DEPLOYMENT_LOCK_FILE:-/var/lib/infinityscan/staging/deploy.lock}}"
+fi
 
 production_require_linux
 production_require_command docker
 production_require_command python3
 [[ -f "$ENV_FILE" ]] || production_die "production environment file is missing"
+[[ "$(production_env_value DEPLOYMENT_ENVIRONMENT "$ENV_FILE")" == "$ENVIRONMENT" ]] || production_die "deployment environment does not match the environment file"
 [[ -d "$STATE_DIR" ]] || production_die "release state directory is missing"
 exec 9>"$LOCK_FILE"
 flock -n 9 || production_die "another deployment is already running"
@@ -43,6 +64,12 @@ metadata="$STATE_DIR/$TARGET.json"
 api_image="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["api_image_digest"])' "$metadata")"
 web_image="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["web_image_digest"])' "$metadata")"
 target_revision="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("migration_revision_after", ""))' "$metadata")"
+if [[ "$ENVIRONMENT" == staging && -n "$RELEASE_MANIFEST_FILE" && -n "$RELEASE_EVIDENCE_FILE" ]]; then
+  manifest_repository="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["repository"])' "$RELEASE_MANIFEST_FILE")"
+  manifest_sha="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["git_sha"])' "$RELEASE_MANIFEST_FILE")"
+  python3 "$ROOT_DIR/scripts/validate-staging-evidence.py" --manifest "$RELEASE_MANIFEST_FILE" \
+    --evidence "$RELEASE_EVIDENCE_FILE" --repository "$manifest_repository" --git-sha "$manifest_sha" >/dev/null
+fi
 if [[ -n "${CURRENT_MIGRATION_REVISION:-}" && "$CURRENT_MIGRATION_REVISION" != "$target_revision" ]]; then
   production_die "target release does not declare support for the current database revision"
 fi
@@ -115,6 +142,7 @@ import json, pathlib, sys
 path = pathlib.Path(sys.argv[1])
 data = json.loads(path.read_text())
 data["event"] = "rollback"
+data["environment"] = data.get("environment", "production")
 path.with_name(path.stem + "-rollback.json").write_text(json.dumps(data, indent=2) + "\n")
 PY
 printf 'rollback prepared for release %s; database was not downgraded\n' "$TARGET"

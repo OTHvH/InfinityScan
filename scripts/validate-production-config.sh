@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
+ROOT_DIR="$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)"
 # shellcheck source=scripts/lib/production.sh
 source "$ROOT_DIR/scripts/lib/production.sh"
 
@@ -94,6 +94,20 @@ with open(env_file, encoding="utf-8") as stream:
     env = dict(line.rstrip("\n").split("=", 1) for line in stream if "=" in line and not line.lstrip().startswith("#"))
 if env.get("APP_ENV") != "production":
     raise SystemExit("APP_ENV=production is required")
+deployment_environment = env.get("DEPLOYMENT_ENVIRONMENT", "production")
+synthetic_bypass = env.get("ALLOW_SYNTHETIC_STAGING_BACKUP_BYPASS", "false")
+if deployment_environment == "production" and synthetic_bypass.lower() == "true":
+    raise SystemExit("synthetic staging backup bypass is forbidden in production")
+if deployment_environment == "staging":
+    domain = env.get("APP_DOMAIN", "").lower()
+    if not domain or "production" in domain or domain == "app.example.com":
+        raise SystemExit("staging must use a staging-only domain")
+    if "staging" not in env.get("S3_BUCKET", "").lower():
+        raise SystemExit("staging S3_BUCKET must be explicitly staging-named")
+    if "staging" not in env.get("BACKUP_BUCKET", "").lower():
+        raise SystemExit("staging BACKUP_BUCKET must be explicitly staging-named")
+    if "minio" in env.get("S3_ENDPOINT_URL", "").lower():
+        raise SystemExit("MinIO is allowed only in local staging rehearsal")
 if not env.get("S3_ENDPOINT_URL", "").startswith("https://"):
     raise SystemExit("S3_ENDPOINT_URL must use HTTPS")
 for name in ("DATABASE_URL_FILE", "JWT_SECRET_KEY_FILE", "CSRF_SECRET_KEY_FILE", "S3_ACCESS_KEY_ID_FILE", "S3_SECRET_ACCESS_KEY_FILE"):

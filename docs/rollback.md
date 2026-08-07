@@ -30,3 +30,21 @@ downgraded.
 Keep failed releases until the observation and forensic-retention policy has
 expired. Remove only release directories and metadata that are no longer
 needed, never the Caddy certificate data volume or application backup data.
+
+## Staging Rollback
+
+Use the staging host wrapper so the environment-specific lock, state directory,
+and evidence checks are applied:
+
+```bash
+scripts/run-on-deployment-host.sh rollback previous
+```
+
+Before a change, run the disposable fake-host rehearsal:
+
+```bash
+scripts/rehearse-staging-rollback.sh --fake-host
+```
+
+The rehearsal creates only temporary synthetic files and cannot contact a live
+host or cloud service.

@@ -175,6 +175,18 @@ curl http://localhost:3000/api/bookmarks
 - [ ] Production Compose is digest-pinned, Caddy is the only host-published service, and runtime secrets are external `0600`/`0400` files
 - [ ] Production configuration validator, deployment smoke tests, and rollback checks pass using synthetic local values
 
+### Staging Deployment Checks
+
+- [ ] Dispatch accepts only an exact successful publication run, artifact, and commit SHA
+- [ ] Publication evidence binds to the release manifest and both image digests
+- [ ] Staging preflight rejects production domains, buckets, markers, credentials, and symlinked secrets
+- [ ] Staging uses separate PostgreSQL, object-storage, backup, host, lock, and state paths
+- [ ] Synthetic fixture seed and cleanup are idempotent and refuse production environment values
+- [ ] `/livez`, `/readyz`, same-origin authentication, media delivery, cookie flags, and security headers pass
+- [ ] Failed staging smoke automatically restores the previous traffic slot
+- [ ] `scripts/rehearse-staging-rollback.sh --fake-host` passes without contacting a live host or cloud service
+- [ ] Only redacted staging evidence is retained; secrets, cookies, tokens, signed URLs, and object contents are excluded
+
 ### Infrastructure
 
 | Check | Command |

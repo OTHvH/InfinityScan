@@ -83,7 +83,7 @@ const contentSecurityPolicy = [
   "style-src 'self' 'unsafe-inline'",
   "font-src 'self' data:",
   `img-src 'self' data: blob: ${mediaCspOrigins.join(" ")}`,
-  "connect-src 'self'",
+  `connect-src 'self' ${mediaCspOrigins.join(" ")}`,
 ].join("; ");
 
 const nextConfig: NextConfig = {

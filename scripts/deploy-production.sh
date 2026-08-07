@@ -1,15 +1,16 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
+ROOT_DIR="$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)"
 # shellcheck source=scripts/lib/production.sh
 source "$ROOT_DIR/scripts/lib/production.sh"
 
-RELEASE_ID="${1:-}"
+RELEASE_ID=""
 API_IMAGE="${API_IMAGE:-}"
 WEB_IMAGE="${WEB_IMAGE:-}"
 CADDY_IMAGE="${CADDY_IMAGE:-}"
 RELEASE_MANIFEST_FILE="${RELEASE_MANIFEST_FILE:-}"
+RELEASE_EVIDENCE_FILE="${RELEASE_EVIDENCE_FILE:-}"
 ENV_FILE="${PRODUCTION_ENV_FILE:-/etc/infinityscan/production.env}"
 SECRET_DIR="${PRODUCTION_SECRET_DIR:-/etc/infinityscan/secrets}"
 DEPLOY_DIR="${DEPLOYMENT_DIR:-/opt/infinityscan}"
@@ -19,6 +20,29 @@ STAGING_MODE="${STAGING_MODE:-false}"
 DRY_RUN="${DRY_RUN:-false}"
 BACKUP_METADATA_FILE="${BACKUP_METADATA_FILE:-}"
 BACKUP_MAX_AGE_SECONDS="${BACKUP_MAX_AGE_SECONDS:-86400}"
+DEPLOYMENT_ENVIRONMENT="${DEPLOYMENT_ENVIRONMENT:-production}"
+SYNTHETIC_STAGING_BACKUP_BYPASS=false
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --environment) DEPLOYMENT_ENVIRONMENT="$2"; shift 2 ;;
+    --release-manifest) RELEASE_MANIFEST_FILE="$2"; shift 2 ;;
+    --release-evidence) RELEASE_EVIDENCE_FILE="$2"; shift 2 ;;
+    --synthetic-staging-backup-bypass) SYNTHETIC_STAGING_BACKUP_BYPASS=true; shift ;;
+    --dry-run) DRY_RUN=true; shift ;;
+    --*) production_die "unknown deployment option: $1" ;;
+    *) [[ -z "$RELEASE_ID" ]] || production_die "only one release ID is allowed"; RELEASE_ID="$1"; shift ;;
+  esac
+done
+
+if [[ "$DEPLOYMENT_ENVIRONMENT" == staging ]]; then
+  STAGING_MODE=true
+  ENV_FILE="${STAGING_ENV_FILE:-${PRODUCTION_ENV_FILE:-/etc/infinityscan/staging.env}}"
+  SECRET_DIR="${STAGING_SECRET_DIR:-${PRODUCTION_SECRET_DIR:-/etc/infinityscan/staging-secrets}}"
+  DEPLOY_DIR="${STAGING_DEPLOYMENT_DIR:-${DEPLOYMENT_DIR:-/opt/infinityscan}}"
+  STATE_DIR="${STAGING_DEPLOYMENT_STATE_DIR:-${DEPLOYMENT_STATE_DIR:-/var/lib/infinityscan/staging/releases}}"
+  LOCK_FILE="${STAGING_DEPLOYMENT_LOCK_FILE:-${DEPLOYMENT_LOCK_FILE:-/var/lib/infinityscan/staging/deploy.lock}}"
+fi
 
 production_require_linux
 production_require_command docker
@@ -26,6 +50,7 @@ production_require_command python3
 production_require_command flock
 [[ -f "$ENV_FILE" ]] || production_die "production environment file is missing"
 [[ "$(production_env_value APP_ENV "$ENV_FILE")" == production ]] || production_die "APP_ENV must be production"
+[[ "$(production_env_value DEPLOYMENT_ENVIRONMENT "$ENV_FILE")" == "$DEPLOYMENT_ENVIRONMENT" ]] || production_die "deployment environment does not match the environment file"
 if [[ -n "$RELEASE_MANIFEST_FILE" ]]; then
   [[ -f "$RELEASE_MANIFEST_FILE" ]] || production_die "release manifest is missing"
   read -r manifest_release manifest_api manifest_web < <(
@@ -42,6 +67,20 @@ PY
   API_IMAGE="${API_IMAGE:-$manifest_api}"
   WEB_IMAGE="${WEB_IMAGE:-$manifest_web}"
 fi
+if [[ "$DEPLOYMENT_ENVIRONMENT" == staging ]]; then
+  [[ -n "$RELEASE_MANIFEST_FILE" && -f "$RELEASE_MANIFEST_FILE" ]] || production_die "staging requires an exact release manifest"
+  [[ -n "$RELEASE_EVIDENCE_FILE" && -f "$RELEASE_EVIDENCE_FILE" ]] || production_die "staging requires publication evidence"
+  manifest_repository="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["repository"])' "$RELEASE_MANIFEST_FILE")"
+  manifest_sha="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["git_sha"])' "$RELEASE_MANIFEST_FILE")"
+  python3 "$ROOT_DIR/scripts/validate-staging-evidence.py" \
+    --manifest "$RELEASE_MANIFEST_FILE" --evidence "$RELEASE_EVIDENCE_FILE" \
+    --repository "$manifest_repository" --git-sha "$manifest_sha" >/dev/null
+  if [[ "$SYNTHETIC_STAGING_BACKUP_BYPASS" == true && "$(production_env_value ALLOW_SYNTHETIC_STAGING_BACKUP_BYPASS "$ENV_FILE")" == true ]]; then
+    printf 'staging-only synthetic backup bypass is enabled\n'
+  else
+    SYNTHETIC_STAGING_BACKUP_BYPASS=false
+  fi
+fi
 [[ -n "$RELEASE_ID" && "$RELEASE_ID" != *"/"* && "$RELEASE_ID" != *".."* ]] || production_die "a safe release ID is required"
 API_IMAGE="${API_IMAGE:-$(production_env_value API_IMAGE "$ENV_FILE")}"; WEB_IMAGE="${WEB_IMAGE:-$(production_env_value WEB_IMAGE "$ENV_FILE")}";
 CADDY_IMAGE="${CADDY_IMAGE:-$(production_env_value CADDY_IMAGE "$ENV_FILE")}";
@@ -57,13 +96,13 @@ for pair in \
   "S3_ACCESS_KEY_ID_FILE:$(production_env_value S3_ACCESS_KEY_ID_FILE "$ENV_FILE")" \
   "S3_SECRET_ACCESS_KEY_FILE:$(production_env_value S3_SECRET_ACCESS_KEY_FILE "$ENV_FILE")"; do
   name="${pair%%:*}"; path="${pair#*:}"
-  [[ "$(CDPATH= cd -- "$(dirname -- "$path")" && pwd)" == "$(CDPATH= cd -- "$SECRET_DIR" && pwd)" ]] || production_die "$name must be inside the configured secret directory"
+  [[ "$(CDPATH='' cd -- "$(dirname -- "$path")" && pwd)" == "$(CDPATH='' cd -- "$SECRET_DIR" && pwd)" ]] || production_die "$name must be inside the configured secret directory"
   production_validate_secret_file "$name" "$path"
 done
 [[ "$(production_env_value S3_ENDPOINT_URL "$ENV_FILE")" == https://* ]] || production_die "S3_ENDPOINT_URL must use HTTPS"
 [[ "$(production_env_value DATABASE_URL_FILE "$ENV_FILE")" != *"/infra/.env"* ]] || production_die "database secret must be outside the checkout"
 
-if [[ "$STAGING_MODE" != true ]]; then
+if [[ "$STAGING_MODE" != true || "$SYNTHETIC_STAGING_BACKUP_BYPASS" != true ]]; then
   [[ -n "$BACKUP_METADATA_FILE" && -f "$BACKUP_METADATA_FILE" ]] || production_die "a recent verified backup metadata file is required"
   backup_age=$(( $(date +%s) - $(stat -c '%Y' "$BACKUP_METADATA_FILE") ))
   (( backup_age >= 0 && backup_age <= BACKUP_MAX_AGE_SECONDS )) || production_die "backup metadata is stale"
@@ -75,6 +114,13 @@ available_kb="$(df -Pk "$DEPLOY_DIR" 2>/dev/null | awk 'NR==2 {print $4}')"
 [[ "$available_kb" =~ ^[0-9]+$ && "$available_kb" -ge 1048576 ]] || production_die "at least 1 GiB of free disk is required"
 
 mkdir -p "$STATE_DIR"
+if [[ "$DEPLOYMENT_ENVIRONMENT" == staging ]]; then
+  preflight_args=(--manifest "$RELEASE_MANIFEST_FILE" --evidence "$RELEASE_EVIDENCE_FILE" \
+    --env-file "$ENV_FILE" --compose-file "$ROOT_DIR/infra/docker-compose.production.yml" \
+    --secret-dir "$SECRET_DIR" --host-root "$DEPLOY_DIR")
+  [[ "${STAGING_INITIALIZE_MARKER:-false}" == true ]] && preflight_args+=(--initialize-marker)
+  "$ROOT_DIR/scripts/preflight-staging.sh" "${preflight_args[@]}" >/dev/null
+fi
 exec 9>"$LOCK_FILE"
 flock -n 9 || production_die "another deployment is already running"
 if [[ "$DRY_RUN" == true ]]; then
@@ -180,19 +226,29 @@ if [[ -n "${DEPLOY_SMOKE_URL:-}" ]]; then
   fi
 fi
 
-python3 - "$STATE_DIR/$RELEASE_ID.json" "$RELEASE_ID" "$API_IMAGE" "$WEB_IMAGE" "$migration_before" "$migration_after" "$previous_release" <<'PY'
+python3 - "$STATE_DIR/$RELEASE_ID.json" "$RELEASE_ID" "$API_IMAGE" "$WEB_IMAGE" "$migration_before" "$migration_after" "$previous_release" "$DEPLOYMENT_ENVIRONMENT" "$RELEASE_EVIDENCE_FILE" <<'PY'
 import json, pathlib, sys
 path = pathlib.Path(sys.argv[1])
-release, api, web, before, after, previous = sys.argv[2:]
+release, api, web, before, after, previous, environment, evidence = sys.argv[2:]
+manifest_sha = "unknown"
+publication_run_id = None
+if evidence:
+    evidence_data = json.loads(pathlib.Path(evidence).read_text(encoding="utf-8"))
+    manifest_sha = evidence_data["git_sha"]
+    publication_run_id = evidence_data["run_id"]
 data = {
+    "schema_version": 1,
+    "environment": environment,
     "release_id": release,
-    "git_commit_sha": "unknown",
+    "git_commit_sha": manifest_sha,
     "api_image_digest": api,
     "web_image_digest": web,
     "deployed_at": __import__("datetime").datetime.now(__import__("datetime").timezone.utc).isoformat(),
     "migration_revision_before": before,
     "migration_revision_after": after,
     "previous_release_id": previous or None,
+    "active_slot": f"slot-{release}",
+    "publication_run_id": publication_run_id,
     "smoke_test": "passed" if __import__("os").environ.get("DEPLOY_SMOKE_URL") else "not-run",
     "event": "deploy",
 }

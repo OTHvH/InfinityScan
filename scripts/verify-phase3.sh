@@ -110,6 +110,8 @@ services:
     ports: !override
       - "0.0.0.0::9000"
       - "0.0.0.0::9001"
+    environment:
+      MINIO_API_CORS_ALLOW_ORIGIN: "*"
 OVERRIDE
 COMPOSE=()
 compose() { "${COMPOSE[@]}" "$@"; }
@@ -322,11 +324,14 @@ services:
     ports: !override
       - "0.0.0.0::9000"
       - "0.0.0.0::9001"
+    environment:
+      MINIO_API_CORS_ALLOW_ORIGIN: "*"
   api:
     extra_hosts:
       - "host.docker.internal:host-gateway"
     environment:
       S3_ENDPOINT_URL: "http://host.docker.internal:${MINIO_HOST_PORT}"
+      S3_PUBLIC_URL: "http://127.0.0.1:${MINIO_HOST_PORT}"
 OVERRIDE
 
 DB_READY=false

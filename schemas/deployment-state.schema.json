@@ -1,0 +1,24 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://infinityscan.example/schemas/deployment-state.schema.json",
+  "title": "InfinityScan deployment state",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "environment", "release_id", "git_commit_sha", "api_image_digest", "web_image_digest", "event"],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "environment": { "enum": ["production", "staging"] },
+    "release_id": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$" },
+    "git_commit_sha": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+    "api_image_digest": { "type": "string", "pattern": "^ghcr\\.io/[^/@\\s]+/[^/@\\s]+@sha256:[0-9a-f]{64}$" },
+    "web_image_digest": { "type": "string", "pattern": "^ghcr\\.io/[^/@\\s]+/[^/@\\s]+@sha256:[0-9a-f]{64}$" },
+    "deployed_at": { "type": "string", "format": "date-time" },
+    "migration_revision_before": { "type": "string" },
+    "migration_revision_after": { "type": "string" },
+    "previous_release_id": { "type": ["string", "null"] },
+    "active_slot": { "type": "string", "pattern": "^[A-Za-z0-9._-]{1,64}$" },
+    "smoke_test": { "enum": ["passed", "rolled_back", "not-run"] },
+    "event": { "enum": ["deploy", "rollback", "failed"] },
+    "publication_run_id": { "type": ["string", "null" ] }
+  }
+}

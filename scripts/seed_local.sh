@@ -20,11 +20,12 @@ fi
 
 echo "Seeding InfinityScan with manga from: $MANGA_PATH"
 
-cd "$(dirname "$0")/../api"
+cd "$(dirname "$0")/../api" || exit 1
 
 # Set environment variables and run seed
 export DATABASE_URL="sqlite:///./infinityscan.db"
 export MANGA_LOCAL_PATH="$MANGA_PATH"
 
+# shellcheck source=/dev/null
 source .venv/bin/activate
 python seed.py

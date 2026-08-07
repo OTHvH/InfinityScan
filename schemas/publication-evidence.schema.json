@@ -1,0 +1,45 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://infinityscan.example/schemas/publication-evidence.schema.json",
+  "title": "InfinityScan immutable publication evidence",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "workflow", "run_id", "repository", "git_sha", "release_id", "images"],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "workflow": { "const": ".github/workflows/publish-images.yml" },
+    "run_id": { "type": "string", "pattern": "^[0-9]+$" },
+    "repository": { "type": "string", "pattern": "^[^/\\s]+/[^/\\s]+$" },
+    "git_sha": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+    "release_id": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$" },
+    "images": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["api", "web"],
+      "properties": {
+        "api": { "$ref": "#/$defs/image" },
+        "web": { "$ref": "#/$defs/image" }
+      }
+    }
+  },
+  "$defs": {
+    "image": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["reference", "digest", "platforms", "signature_verified", "provenance_verified", "sbom_file", "scan_file", "scan_passed"],
+      "properties": {
+        "reference": { "type": "string", "pattern": "^ghcr\\.io/[^/@\\s]+/[^/@\\s]+@sha256:[0-9a-f]{64}$" },
+        "digest": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+        "platforms": {
+          "type": "array",
+          "const": ["linux/amd64", "linux/arm64"]
+        },
+        "signature_verified": { "const": true },
+        "provenance_verified": { "const": true },
+        "sbom_file": { "type": "string", "pattern": "^[A-Za-z0-9._-]+$" },
+        "scan_file": { "type": "string", "pattern": "^[A-Za-z0-9._-]+$" },
+        "scan_passed": { "const": true }
+      }
+    }
+  }
+}

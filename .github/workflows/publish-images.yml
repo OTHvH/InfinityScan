@@ -355,8 +355,42 @@ jobs:
       - name: Bundle safe release artifact
         run: |
           set -euo pipefail
+          python3 - "$GITHUB_RUN_ID" "$GITHUB_REPOSITORY" "${{ needs.verify.outputs.verified_sha }}" "${{ inputs.release_id }}" <<'PY'
+          import json
+          import os
+          import sys
+          from datetime import datetime, timezone
+
+          run_id, repository, git_sha, requested_release_id = sys.argv[1:]
+          manifest = json.load(open("release-manifest.json", encoding="utf-8"))
+          identity = f"https://github.com/{repository}/.github/workflows/publish-images.yml@refs/heads/phase-6-production-deployment"
+          evidence = {
+              "schema_version": 1,
+              "workflow": ".github/workflows/publish-images.yml",
+              "run_id": run_id,
+              "repository": repository,
+              "git_sha": git_sha,
+              "release_id": manifest["release_id"],
+              "images": {},
+          }
+          for component in ("api", "web"):
+              image = manifest["images"][component]
+              evidence["images"][component] = {
+                  "reference": image["reference"],
+                  "digest": f"sha256:{image['digest']}",
+                  "platforms": image["platforms"],
+                  "signature_verified": True,
+                  "provenance_verified": True,
+                  "sbom_file": f"{component}-sbom.spdx.json",
+                  "scan_file": f"{component}-trivy.json",
+                  "scan_passed": True,
+              }
+          with open("publication-evidence.json", "w", encoding="utf-8") as stream:
+              json.dump(evidence, stream, indent=2)
+              stream.write("\n")
+          PY
           mkdir -p release-artifact
-          cp release-manifest.json api-sbom.spdx.json web-sbom.spdx.json \
+          cp release-manifest.json publication-evidence.json api-sbom.spdx.json web-sbom.spdx.json \
             api-trivy.json web-trivy.json api-trivy.txt web-trivy.txt \
             scan-summary.json release-artifact/
           sha256sum api-sbom.spdx.json web-sbom.spdx.json > release-artifact/sbom-checksums.txt
@@ -366,6 +400,9 @@ jobs:
           printf 'provenance=github-attest-build-provenance\n' > release-artifact/provenance-reference.txt
           printf 'signature_verification=cosign-keyless-oidc\n' > release-artifact/signature-verification.txt
           python3 scripts/validate-release-manifest.py release-artifact/release-manifest.json
+          python3 scripts/validate-publication-evidence.py release-artifact/publication-evidence.json \
+            --expected-repository "$GITHUB_REPOSITORY" \
+            --expected-git-sha "${{ needs.verify.outputs.verified_sha }}"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: immutable-release-${{ needs.verify.outputs.verified_sha }}

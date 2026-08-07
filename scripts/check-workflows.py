@@ -41,6 +41,7 @@ PUBLISH_JOB_PERMISSIONS = {
     "attestations": "write",
 }
 PUBLISH_VERIFY_PERMISSIONS = {"contents": "read", "actions": "read"}
+STAGING_FETCH_PERMISSIONS = {"contents": "read", "actions": "read"}
 
 
 class PolicyError(ValueError):
@@ -177,6 +178,8 @@ def _validate_job_permissions(
     codeql: bool,
     publication_job: bool = False,
     publication_verify: bool = False,
+    staging_fetch: bool = False,
+    staging_artifact_read: bool = False,
 ) -> None:
     if value is None:
         return
@@ -188,6 +191,8 @@ def _validate_job_permissions(
         raise PolicyError(f"{location}: publication permissions are broader or narrower than policy")
     if publication_verify and dict(value) != PUBLISH_VERIFY_PERMISSIONS:
         raise PolicyError(f"{location}: verification permissions are broader or narrower than policy")
+    if staging_fetch and dict(value) != STAGING_FETCH_PERMISSIONS:
+        raise PolicyError(f"{location}: staging evidence fetch permissions are broader or narrower than policy")
     for scope, level in value.items():
         if (
             not isinstance(scope, str)
@@ -196,6 +201,8 @@ def _validate_job_permissions(
         ):
             raise PolicyError(f"{location}: malformed permission {scope!r}: {level!r}")
         if level == "none" or (scope == "contents" and level == "read"):
+            continue
+        if (staging_fetch or staging_artifact_read) and scope == "actions" and level == "read":
             continue
         if codeql and scope == "security-events" and level == "write":
             continue
@@ -231,10 +238,15 @@ def validate_workflow(path: Path) -> None:
         raise PolicyError(f"{path}: pull_request_target is forbidden")
     _validate_top_permissions(data.get("permissions"), path)
     publication_workflow = path.name == PUBLISH_WORKFLOW
+    staging_workflow = path.name == "deploy-staging.yml"
     if publication_workflow and "workflow_dispatch" not in triggers:
         raise PolicyError(f"{path}: publication workflow must support workflow_dispatch")
     if publication_workflow and ({"pull_request", "pull_request_target"} & triggers):
         raise PolicyError(f"{path}: publication workflow must not run for pull requests")
+    if staging_workflow and triggers != {"workflow_dispatch"}:
+        raise PolicyError(f"{path}: staging deployment must use workflow_dispatch only")
+    if staging_workflow and "staging" not in data.get("concurrency", {}).get("group", ""):
+        raise PolicyError(f"{path}: staging concurrency group is required")
 
     jobs = data.get("jobs")
     if not isinstance(jobs, Mapping) or not jobs:
@@ -256,6 +268,11 @@ def validate_workflow(path: Path) -> None:
                 raise PolicyError(f"{location}: protected publication environment is required")
             if job.get("needs") != "verify":
                 raise PolicyError(f"{location}: publication must depend on the verification job")
+        if staging_workflow and job_name in {
+            "authorize", "fetch-release-evidence", "verify-release-evidence", "staging-preflight",
+            "deploy-staging", "smoke-staging", "rollback-rehearsal", "publish-staging-evidence",
+        } and job.get("environment") not in (None, "staging"):
+            raise PolicyError(f"{location}: staging jobs may only use the staging environment")
         if pull_request and job.get("secrets") == "inherit":
             raise PolicyError(f"{location}: secrets: inherit is unsafe for pull requests")
 
@@ -285,6 +302,8 @@ def validate_workflow(path: Path) -> None:
             codeql=codeql,
             publication_job=publication_workflow and job_name == "publish",
             publication_verify=publication_workflow and job_name == "verify",
+            staging_fetch=staging_workflow and job_name == "fetch-release-evidence",
+            staging_artifact_read=staging_workflow and job_name == "verify-release-evidence",
         )
         _validate_workflow_containers(job, location)
 

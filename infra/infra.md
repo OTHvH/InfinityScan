@@ -9,6 +9,12 @@ external managed PostgreSQL and private HTTPS S3-compatible storage. Production
 Compose contains Caddy, web, API, and one-shot migration services only; it does
 not contain PostgreSQL or MinIO. See [`docs/production-deployment.md`](../docs/production-deployment.md).
 
+The staging package uses the same production Compose file with
+[`infra/.env.staging.example`](.env.staging.example) as a placeholder-only
+checklist. Staging requires separate host paths, secret files, PostgreSQL,
+private buckets, domain, and deployment state; it does not reuse production
+values or local MinIO.
+
 ## Prerequisites
 
 - Docker Engine ≥ 24 and Docker Compose v2
